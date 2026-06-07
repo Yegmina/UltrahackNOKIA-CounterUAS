@@ -11,3 +11,8 @@ Suggested structure once implementation starts:
 
 Keep large datasets out of git unless explicitly needed.
 
+## Current Sensor Tests
+
+- [thermal_stream_test.md](thermal_stream_test.md) tests live thermal app screen capture and thermal screenshots over ADB.
+- [phone_sensor_smoke_test.md](phone_sensor_smoke_test.md) tests RGB and audio streaming through IP Webcam.
+- [phone_sensor_test_report.md](phone_sensor_test_report.md) summarizes the measured phone sensor results.

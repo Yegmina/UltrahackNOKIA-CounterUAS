@@ -473,6 +473,41 @@ def command_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_benchmark(args: argparse.Namespace) -> int:
+    adb = find_adb(args.adb)
+    serial = select_device(adb, args.serial)
+    crop = parse_crop(args.crop)
+    times: list[float] = []
+    sizes: list[int] = []
+    last_image: Image.Image | None = None
+
+    for _ in range(args.frames):
+        started = time.perf_counter()
+        image = decode_png(screencap_png(adb, serial, timeout=args.capture_timeout))
+        image = crop_image(image, crop)
+        elapsed = time.perf_counter() - started
+        times.append(elapsed)
+        sizes.append(image.width * image.height)
+        last_image = image
+
+    total = sum(times)
+    fps = args.frames / total if total > 0 else 0.0
+    print(f"Device: {serial}")
+    print(f"Frames: {args.frames}")
+    print(f"Total capture time: {total:.2f}s")
+    print(f"Average capture FPS: {fps:.2f}")
+    print(f"Average frame latency: {(total / args.frames) * 1000:.1f} ms")
+    print(f"Fastest/slowest frame: {min(times) * 1000:.1f}/{max(times) * 1000:.1f} ms")
+    if last_image is not None:
+        print(f"Frame size: {last_image.width}x{last_image.height}")
+        if args.output:
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            last_image.save(output)
+            print(f"Saved last frame: {output}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Thermal phone stream tests over ADB")
     parser.add_argument("--adb", help="Path to adb.exe")
@@ -510,6 +545,13 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--hotspot-min-pixels", type=int, default=30)
     snapshot.add_argument("--output", default="prototype/logs/thermal_snapshot.png")
     snapshot.set_defaults(func=command_snapshot)
+
+    benchmark = subparsers.add_parser("benchmark", help="Benchmark ADB screenshot capture speed")
+    benchmark.add_argument("--frames", type=int, default=20)
+    benchmark.add_argument("--capture-timeout", type=float, default=5.0, help="Seconds before screencap timeout")
+    benchmark.add_argument("--crop", help="Crop screen to x,y,width,height")
+    benchmark.add_argument("--output", default="prototype/logs/thermal_benchmark_last.png")
+    benchmark.set_defaults(func=command_benchmark)
 
     return parser
 
