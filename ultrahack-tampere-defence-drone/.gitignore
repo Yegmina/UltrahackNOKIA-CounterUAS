@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Local data and generated assets
+prototype/data/raw/
+prototype/data/private/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
