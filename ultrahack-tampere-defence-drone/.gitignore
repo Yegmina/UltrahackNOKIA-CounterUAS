@@ -11,8 +11,13 @@ build/
 
 # Local data and generated assets
 prototype/logs/
+prototype/apk_inspect/
+prototype/android_sensor_probe/build/
 prototype/data/raw/
 prototype/data/private/
+*.apk
+*.keystore
+*.dex
 *.mp4
 *.mov
 *.avi

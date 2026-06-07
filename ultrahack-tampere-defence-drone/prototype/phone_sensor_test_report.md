@@ -267,3 +267,15 @@ thermal_stream_test.py screen-stream --hotspots
 
 or recorded MP4 clips from the thermal app.
 
+## Direct Thermal Sensor Follow-Up
+
+I also tested whether the thermal sensor is exposed directly through normal Android app APIs.
+
+Result: it is not exposed through the tested public surfaces:
+
+- Android `SensorManager`
+- Android `UsbManager`
+- Android Camera2 camera IDs
+- unprivileged `/dev/video*` or USB device-node access
+
+See [direct_thermal_sensor_attempt.md](direct_thermal_sensor_attempt.md) for details.
