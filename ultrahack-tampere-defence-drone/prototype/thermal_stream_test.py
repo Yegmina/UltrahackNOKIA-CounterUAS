@@ -287,6 +287,10 @@ def screencap_png(adb: str, serial: str, timeout: float = 5) -> bytes:
         stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr)
         raise RuntimeError(stderr.strip() or "adb screencap failed")
     data = result.stdout if isinstance(result.stdout, bytes) else result.stdout.encode()
+    png_start = data.find(b"\x89PNG")
+    if png_start > 0:
+        # Some Android builds print a multi-display warning before the image bytes.
+        data = data[png_start:]
     if not data.startswith(b"\x89PNG"):
         # Defensive fallback for environments that still CRLF-mangle screencap output.
         data = data.replace(b"\r\n", b"\n")
@@ -444,6 +448,31 @@ def command_screen_stream(args: argparse.Namespace) -> int:
     return ScreenStreamApp(args).run()
 
 
+def command_snapshot(args: argparse.Namespace) -> int:
+    adb = find_adb(args.adb)
+    serial = select_device(adb, args.serial)
+    crop = parse_crop(args.crop)
+    image = decode_png(screencap_png(adb, serial, timeout=args.capture_timeout))
+    image = crop_image(image, crop)
+    status = None
+    if args.hotspots:
+        image, status = draw_hotspot_overlay(
+            image,
+            percentile=args.hotspot_percentile,
+            min_pixels=args.hotspot_min_pixels,
+        )
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output)
+    print(f"Saved snapshot: {output}")
+    print(f"Device: {serial}")
+    print(f"Size: {image.width}x{image.height}")
+    if status:
+        print(status)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Thermal phone stream tests over ADB")
     parser.add_argument("--adb", help="Path to adb.exe")
@@ -472,6 +501,15 @@ def build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--save-dir", help="Optional directory to save sampled frames")
     stream.add_argument("--save-every", type=int, default=0, help="Save every Nth frame when --save-dir is set")
     stream.set_defaults(func=command_screen_stream)
+
+    snapshot = subparsers.add_parser("snapshot", help="Save one phone screen frame")
+    snapshot.add_argument("--capture-timeout", type=float, default=5.0, help="Seconds before screencap timeout")
+    snapshot.add_argument("--crop", help="Crop screen to x,y,width,height")
+    snapshot.add_argument("--hotspots", action="store_true", help="Draw a simple bright-region hotspot box")
+    snapshot.add_argument("--hotspot-percentile", type=float, default=99.6)
+    snapshot.add_argument("--hotspot-min-pixels", type=int, default=30)
+    snapshot.add_argument("--output", default="prototype/logs/thermal_snapshot.png")
+    snapshot.set_defaults(func=command_snapshot)
 
     return parser
 
