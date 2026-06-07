@@ -18,3 +18,4 @@ Keep large datasets out of git unless explicitly needed.
 - [phone_sensor_test_report.md](phone_sensor_test_report.md) summarizes the measured phone sensor results.
 - [direct_thermal_sensor_attempt.md](direct_thermal_sensor_attempt.md) documents the direct Android sensor/USB/Camera2 access attempt.
 - [thermovue_reverse_engineering.md](thermovue_reverse_engineering.md) maps ThermoVue's internal thermal USB/native pipeline and likely raw frame layout.
+- [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
