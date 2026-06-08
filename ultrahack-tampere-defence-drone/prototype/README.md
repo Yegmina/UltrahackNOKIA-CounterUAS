@@ -88,6 +88,14 @@ For a headless/demo smoke test:
 py -3 prototype\counter_uas_fusion_node.py --demo --no-window --max-frames 30
 ```
 
+Validate that logs or saved frames prove real thermal data:
+
+```powershell
+py -3 prototype\thermal_frame_evidence_validator.py --bridge-log prototype\logs\thermovue_bridge_watch\RUN.log
+py -3 prototype\thermal_frame_evidence_validator.py --npy prototype\logs\thermal_udp_frames\thermal_1.npy
+py -3 prototype\thermal_frame_evidence_validator.py --self-test
+```
+
 Pan/tilt command scaffold:
 
 ```powershell

@@ -261,6 +261,7 @@ Current code pieces:
 - `prototype/android_thermovue_bridge_probe/`: Android bridge probe that loads ThermoVue SDK classes and can UDP-stream raw temp frames when `keepStreaming` is enabled.
 - `prototype/android_usb_shell_helper/`: shell UID helper for `IUsbManager` fixed-handler and thermal-device permission grants.
 - `prototype/thermal_udp_receiver.py`: laptop/Jetson thermal UDP receiver and heatmap visualizer.
+- `prototype/thermal_frame_evidence_validator.py`: pass/fail validator for bridge logs, raw frame dumps, and UDP receiver `.npy` frames.
 - `prototype/counter_uas_fusion_node.py`: first combined RGB + thermal UDP fusion/dashboard node, with demo mode and simple heuristic scoring.
 - `prototype/pan_tilt_controller.py`: hardware-agnostic pixel-error to pan/tilt command scaffold for a programmable phone stand.
 
