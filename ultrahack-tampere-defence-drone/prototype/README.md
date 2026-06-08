@@ -21,6 +21,13 @@ Keep large datasets out of git unless explicitly needed.
 - [thermovue_reverse_engineering.md](thermovue_reverse_engineering.md) maps ThermoVue's internal thermal USB/native pipeline and likely raw frame layout.
 - [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
+- [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
+
+Install prototype dependencies:
+
+```powershell
+py -3 -m pip install -r prototype\requirements-counter-uas.txt
+```
 
 ## Native ThermoVue Bridge
 
