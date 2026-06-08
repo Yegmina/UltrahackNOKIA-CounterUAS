@@ -508,6 +508,27 @@ This avoids launching our Activity and may avoid foreground/lifecycle conflicts
 with ThermoVue. It still needs ThermoVue or a privileged actor to power the Tiny2C
 module first.
 
+## Public Research Hints
+
+Public information found so far matches the local reverse-engineering result:
+
+- Ulefone markets the phone as using ThermoVue T2 with 25 Hz thermal imaging and
+  AI/sharpened output rather than a normal Android camera stream:
+  <https://www.ulefone.com/products/armor-28-ultra-thermal-version>
+- Another developer reported the same public-API symptom: the Armor 28 Ultra
+  thermal camera does not appear in Camera2, and no public answer pointed to a
+  standard Android API:
+  <https://stackoverflow.com/questions/79608212/how-to-access-thermal-camera-data-on-ulefone-armor-28-ultra-in-a-custom-android>
+- A public Tiny2C module specification lists a 256x192 VOx detector, 25 Hz frame
+  rate, USB video interface, and USB/IIC/UART control options. This is consistent
+  with our local 256x192 raw plane and internal USB VID/PID path:
+  <https://ae-pic-a1.aliexpress-media.com/kf/S71f62d8424a4474194f4099e48f020bea.pdf>
+- Jetson/Linux Python packages for external USB thermal cameras exist, but they
+  assume the thermal camera is directly visible on USB with host permissions.
+  They do not solve the phone-side Android permission/power-mux problem:
+  <https://pypi.org/project/pythermal/0.2.2/> and
+  <https://pypi.org/project/tiny-thermal-camera/>
+
 ## Practical Next Steps
 
 Best clean route:
