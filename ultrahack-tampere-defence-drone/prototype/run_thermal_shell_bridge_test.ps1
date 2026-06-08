@@ -78,6 +78,15 @@ Invoke-Adb pull "$LatestDir/thermovue_shell_bridge.log" $LocalLog
 Write-Host "Log saved to $LocalLog"
 Select-String -Path $LocalLog -Pattern "classLoad|shellGrant|Shell USB state|initHandleEngine|Tiny2C poll|streamTiny2c|udpThermalFrame|FAIL|Exception|FATAL"
 
+$Validator = Join-Path $RepoRoot "prototype\thermal_frame_evidence_validator.py"
+if (Test-Path $Validator) {
+    Write-Host "Validating thermal frame evidence..."
+    & py -3 $Validator --bridge-log $LocalLog
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Thermal evidence validator did not pass for $LocalLog"
+    }
+}
+
 Write-Host "Saving focused logcat..."
 $LocalLogcat = Join-Path $LocalLogDir ((Split-Path -Leaf $LatestDir) + ".logcat.txt")
 Invoke-Adb logcat -d -v time | Out-File -FilePath $LocalLogcat -Encoding utf8

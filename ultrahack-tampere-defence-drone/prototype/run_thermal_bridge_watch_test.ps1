@@ -109,6 +109,15 @@ Invoke-Adb pull "/sdcard/Android/data/com.yegmina.thermovuebridgeprobe/files/$La
 Write-Host "Log saved to $LocalLog"
 Select-String -Path $LocalLog -Pattern "USB grant watch ready|DeviceControl initHandleEngine|DeviceControl USB state|Tiny2C poll|frameDump|rawTemp=len|remapTemp=len|FAIL|FATAL"
 
+$Validator = Join-Path $RepoRoot "prototype\thermal_frame_evidence_validator.py"
+if (Test-Path $Validator) {
+    Write-Host "Validating thermal frame evidence..."
+    & py -3 $Validator --bridge-log $LocalLog
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Thermal evidence validator did not pass for $LocalLog"
+    }
+}
+
 Write-Host "Saving focused logcat..."
 $LocalLogcat = Join-Path $LocalLogDir "$LatestDir.logcat.txt"
 Invoke-Adb logcat -d -v time | Out-File -FilePath $LocalLogcat -Encoding utf8

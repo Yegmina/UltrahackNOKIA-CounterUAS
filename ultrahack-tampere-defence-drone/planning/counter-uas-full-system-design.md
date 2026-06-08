@@ -1,6 +1,6 @@
 # Counter-UAS Phone + Jetson System Design
 
-Updated: 2026-06-08
+Updated: 2026-06-09
 
 ## Goal
 
@@ -34,6 +34,19 @@ Operator display
   bearing / tracking state
   latency + sensor health
 ```
+
+## Runtime Modes
+
+Use modes so the demo keeps working even when one sensor path fails:
+
+- `demo`: synthetic RGB/audio plus optional replay files, used for table testing.
+- `rgb_audio_live`: IP Webcam RGB + microphone into Jetson, used as the first live detector.
+- `thermal_fallback`: ThermoVue screen capture or screenrecord, used for visual thermal proof.
+- `native_thermal`: ThermoVue bridge UDP raw frames into Jetson, used when native access validates.
+- `full_tracking`: RGB + thermal + audio fusion with pan/tilt commands enabled.
+
+The operator UI should show the active mode and sensor health so a missing
+thermal stream does not look like a detector failure.
 
 ## MVP Decision
 
@@ -97,14 +110,15 @@ Raw thermal frame target:
 First route:
 
 ```text
-Phone microphone -> Android app/audio stream -> Jetson
+Phone microphone -> IP Webcam /audio.wav -> USB tether or ADB forward -> Jetson
 ```
 
 Processing:
 
 - 16 kHz mono is enough for first prototype.
 - Sliding windows of 0.5-2.0 seconds.
-- Features: log-mel spectrogram or lightweight FFT bands.
+- Current prototype: lightweight RMS + FFT band-energy score.
+- Later: log-mel spectrogram classifier.
 - Classifier output: drone-like / not-drone-like confidence.
 
 Audio is a confidence side-channel, not the primary detector.
@@ -138,6 +152,24 @@ AudioWindow {
   samples
   sample_rate
 }
+```
+
+Current prototype transport contracts:
+
+```text
+RGB: OpenCV VideoCapture source
+  Examples: camera index, video file, http://127.0.0.1:8080/video
+
+Thermal: UDP datagrams
+  Magic: YEGMINA_THERMAL_RAW_V1
+  Payload: little-endian uint16, default 256x192
+
+Audio: HTTP WAV stream
+  Example: http://127.0.0.1:8080/audio.wav
+  Prototype score: RMS + 80-1200 Hz band-energy confidence
+
+Mount: UDP or serial ASCII line
+  PT pan=<speed> tilt=<speed> reason=<track|scan|hold|centered>
 ```
 
 ### Detection
@@ -247,11 +279,12 @@ Keep a replay mode so the demo works even if venue RF, USB, or drone availabilit
 1. Jetson receives live RGB from phone.
 2. Jetson runs drone detector on live RGB.
 3. Dashboard shows boxes, confidence, FPS, latency.
-4. Add audio recording/streaming and a simple audio confidence.
-5. Add thermal fallback by screen capture or native bridge.
-6. Add thermal confidence into fusion.
-7. Add pan/tilt mount control.
-8. Record a reliable demo replay.
+4. Add audio streaming and a simple audio confidence.
+5. Add thermal fallback by screen capture.
+6. Add native thermal bridge when frame evidence validator passes.
+7. Add thermal confidence into fusion.
+8. Add pan/tilt mount control.
+9. Record a reliable demo replay.
 
 ## Runnable Prototype Artifacts
 
@@ -262,8 +295,21 @@ Current code pieces:
 - `prototype/android_usb_shell_helper/`: shell UID helper for `IUsbManager` fixed-handler and thermal-device permission grants.
 - `prototype/thermal_udp_receiver.py`: laptop/Jetson thermal UDP receiver and heatmap visualizer.
 - `prototype/thermal_frame_evidence_validator.py`: pass/fail validator for bridge logs, raw frame dumps, and UDP receiver `.npy` frames.
-- `prototype/counter_uas_fusion_node.py`: first combined RGB + thermal UDP fusion/dashboard node, with demo mode and simple heuristic scoring.
+- `prototype/counter_uas_fusion_node.py`: first combined RGB + thermal UDP + audio fusion/dashboard node, with demo mode and simple heuristic scoring.
 - `prototype/pan_tilt_controller.py`: hardware-agnostic pixel-error to pan/tilt command scaffold for a programmable phone stand.
+
+Runnable full-loop demo without the phone:
+
+```text
+py -3 prototype/counter_uas_fusion_node.py --demo --audio-demo --no-window --max-frames 90
+```
+
+Runnable live RGB/audio path once IP Webcam is active:
+
+```text
+adb forward tcp:8080 tcp:8080
+py -3 prototype/counter_uas_fusion_node.py --rgb-source http://127.0.0.1:8080/video --audio-wav-url http://127.0.0.1:8080/audio.wav
+```
 
 ## Native Thermal Bridge Status
 
@@ -280,6 +326,7 @@ What is already proven:
 Current missing piece:
 
 - Raw frame counters still stay at zero until the bridge exactly matches ThermoVue's `initHandleEngine` / `startPreview` sequence.
+- Live tests require the phone to be ADB-authorized; when Android reports the device as `unauthorized`, all on-device retry paths are blocked before they reach ThermoVue.
 
 Next thermal test:
 

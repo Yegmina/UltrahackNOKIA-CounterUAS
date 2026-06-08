@@ -12,6 +12,7 @@ import queue
 import socket
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,15 @@ class ThermalFrame:
     frame_id: str
     timestamp: float
     image: np.ndarray
+
+
+@dataclass
+class AudioScore:
+    timestamp: float
+    score: float
+    rms: float
+    peak_hz: float
+    band_ratio: float
 
 
 @dataclass
@@ -118,6 +128,84 @@ class ThermalUdpThread(threading.Thread):
             del self.partials[frame_id]
 
 
+class AudioWavThread(threading.Thread):
+    def __init__(
+        self,
+        url: str,
+        out_queue: "queue.Queue[AudioScore]",
+        stop_event: threading.Event,
+        chunk_bytes: int = 8192,
+        reconnect_delay: float = 1.0,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.url = url
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+        self.chunk_bytes = chunk_bytes
+        self.reconnect_delay = reconnect_delay
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                with urllib.request.urlopen(self.url, timeout=5) as response:
+                    stream_info, pending = read_wav_stream_header(response)
+                    if stream_info is None:
+                        time.sleep(self.reconnect_delay)
+                        continue
+                    sample_rate, channels, bits_per_sample = stream_info
+                    if bits_per_sample != 16:
+                        print(f"audio: unsupported wav bits_per_sample={bits_per_sample}")
+                        return
+                    buffer = bytearray(pending)
+                    while not self.stop_event.is_set():
+                        if len(buffer) < self.chunk_bytes:
+                            chunk = response.read(self.chunk_bytes - len(buffer))
+                            if not chunk:
+                                break
+                            buffer.extend(chunk)
+                            continue
+                        payload = bytes(buffer[: self.chunk_bytes])
+                        del buffer[: self.chunk_bytes]
+                        score = score_pcm16_audio(payload, sample_rate, channels)
+                        put_latest(self.out_queue, score)
+            except Exception as exc:
+                print(f"audio: reconnect after {type(exc).__name__}: {exc}")
+                time.sleep(self.reconnect_delay)
+
+
+class DemoAudioThread(threading.Thread):
+    def __init__(
+        self,
+        out_queue: "queue.Queue[AudioScore]",
+        stop_event: threading.Event,
+        sample_rate: int = 16000,
+        chunk_samples: int = 2048,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+        self.sample_rate = sample_rate
+        self.chunk_samples = chunk_samples
+        self.index = 0
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            t = (np.arange(self.chunk_samples) + self.index) / self.sample_rate
+            envelope = 0.35 + 0.15 * np.sin(self.index / self.sample_rate)
+            signal = (
+                envelope * np.sin(2 * np.pi * 220.0 * t)
+                + 0.18 * np.sin(2 * np.pi * 440.0 * t)
+                + 0.08 * np.sin(2 * np.pi * 660.0 * t)
+            )
+            pcm = np.clip(signal * 32767.0, -32768, 32767).astype("<i2")
+            put_latest(
+                self.out_queue,
+                score_pcm16_audio(pcm.tobytes(), self.sample_rate, channels=1),
+            )
+            self.index += self.chunk_samples
+            time.sleep(self.chunk_samples / self.sample_rate)
+
+
 def parse_thermal_packet(packet: bytes) -> tuple[str, int, int, int, int, bytes] | None:
     if not packet.startswith(MAGIC):
         return None
@@ -160,6 +248,63 @@ def read_latest(in_queue: "queue.Queue[Any]", fallback: Any) -> Any:
             value = in_queue.get_nowait()
         except queue.Empty:
             return value
+
+
+def read_wav_stream_header(response: Any) -> tuple[tuple[int, int, int] | None, bytes]:
+    header = bytearray()
+    while len(header) < 16384:
+        chunk = response.read(1024)
+        if not chunk:
+            return None, b""
+        header.extend(chunk)
+        fmt_idx = header.find(b"fmt ")
+        data_idx = header.find(b"data")
+        if fmt_idx < 0 or data_idx < 0 or len(header) < data_idx + 8:
+            continue
+        if len(header) < fmt_idx + 24:
+            continue
+        fmt_size = int.from_bytes(header[fmt_idx + 4 : fmt_idx + 8], "little")
+        fmt_start = fmt_idx + 8
+        fmt_end = fmt_start + fmt_size
+        if len(header) < fmt_end:
+            continue
+        fmt_data = header[fmt_start:fmt_end]
+        if len(fmt_data) < 16:
+            return None, b""
+        audio_format = int.from_bytes(fmt_data[0:2], "little")
+        channels = int.from_bytes(fmt_data[2:4], "little")
+        sample_rate = int.from_bytes(fmt_data[4:8], "little")
+        bits_per_sample = int.from_bytes(fmt_data[14:16], "little")
+        if audio_format != 1 or channels <= 0 or sample_rate <= 0:
+            return None, b""
+        payload_start = data_idx + 8
+        return (sample_rate, channels, bits_per_sample), bytes(header[payload_start:])
+    return None, b""
+
+
+def score_pcm16_audio(payload: bytes, sample_rate: int, channels: int) -> AudioScore:
+    usable = len(payload) - (len(payload) % (2 * channels))
+    if usable <= 0:
+        return AudioScore(time.time(), 0.0, 0.0, 0.0, 0.0)
+    samples = np.frombuffer(payload[:usable], dtype="<i2").astype(np.float32)
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    if samples.size < 128:
+        rms = float(np.sqrt(np.mean(samples * samples)) / 32768.0)
+        return AudioScore(time.time(), min(1.0, rms * 4.0), rms, 0.0, 0.0)
+
+    samples = samples - float(np.mean(samples))
+    rms = float(np.sqrt(np.mean(samples * samples)) / 32768.0)
+    windowed = samples * np.hanning(samples.size)
+    spectrum = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / sample_rate)
+    total_energy = float(np.sum(spectrum) + 1e-9)
+    band_mask = (freqs >= 80.0) & (freqs <= 1200.0)
+    band_ratio = float(np.sum(spectrum[band_mask]) / total_energy)
+    peak_hz = float(freqs[int(np.argmax(spectrum))])
+    peak_bonus = 0.15 if 80.0 <= peak_hz <= 1200.0 else 0.0
+    score = float(np.clip((rms * 3.5) + (band_ratio * 0.65) + peak_bonus, 0.0, 1.0))
+    return AudioScore(time.time(), score, rms, peak_hz, band_ratio)
 
 
 def normalize_u16(image: np.ndarray) -> np.ndarray:
@@ -324,6 +469,7 @@ def make_dashboard(
 
 def run(args: argparse.Namespace) -> None:
     thermal_queue: "queue.Queue[ThermalFrame]" = queue.Queue(maxsize=1)
+    audio_queue: "queue.Queue[AudioScore]" = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     thermal_thread = ThermalUdpThread(
         args.thermal_host,
@@ -334,6 +480,18 @@ def run(args: argparse.Namespace) -> None:
         stop_event,
     )
     thermal_thread.start()
+    audio_thread: threading.Thread | None = None
+    if args.audio_wav_url:
+        audio_thread = AudioWavThread(
+            args.audio_wav_url,
+            audio_queue,
+            stop_event,
+            chunk_bytes=args.audio_chunk_bytes,
+        )
+    elif args.audio_demo:
+        audio_thread = DemoAudioThread(audio_queue, stop_event)
+    if audio_thread is not None:
+        audio_thread.start()
 
     capture = open_rgb_source(args.rgb_source) if args.rgb_source else None
     mount_controller = PixelTrackerController(deadband_px=args.mount_deadband_px)
@@ -344,6 +502,7 @@ def run(args: argparse.Namespace) -> None:
         mount_client = SerialMountClient(args.mount_serial_port, args.mount_serial_baud)
     previous_gray: np.ndarray | None = None
     latest_thermal: ThermalFrame | None = None
+    latest_audio: AudioScore | None = None
     frame_index = 0
     save_dir = Path(args.save_dir) if args.save_dir else None
     if save_dir:
@@ -363,9 +522,15 @@ def run(args: argparse.Namespace) -> None:
                     time.sleep(0.05)
 
             latest_thermal = read_latest(thermal_queue, latest_thermal)
+            latest_audio = read_latest(audio_queue, latest_audio)
             thermal_score, thermal_xy, thermal_radius = detect_thermal_candidate(latest_thermal)
             rgb_score, rgb_xy, rgb_radius, previous_gray = detect_rgb_motion(rgb, previous_gray)
-            audio_score = 0.0
+            audio_age = None if latest_audio is None else time.time() - latest_audio.timestamp
+            audio_score = (
+                0.0
+                if latest_audio is None or audio_age is None or audio_age > args.audio_stale_seconds
+                else latest_audio.score
+            )
             fused_score = fuse(rgb_score, thermal_score, audio_score)
             target_xy = rgb_xy
             target_radius = rgb_radius
@@ -391,10 +556,18 @@ def run(args: argparse.Namespace) -> None:
             dashboard = make_dashboard(rgb, latest_thermal, state, args.no_window)
             if frame_index % 30 == 0:
                 thermal_age = None if latest_thermal is None else time.time() - latest_thermal.timestamp
+                audio_text = (
+                    "none"
+                    if latest_audio is None
+                    else (
+                        f"score={latest_audio.score:.2f} rms={latest_audio.rms:.3f} "
+                        f"peak={latest_audio.peak_hz:.0f}Hz age={audio_age:.2f}s"
+                    )
+                )
                 print(
                     f"frame={frame_index} fused={fused_score:.2f} "
                     f"rgb={rgb_score:.2f} thermal={thermal_score:.2f} "
-                    f"thermal_age={thermal_age}"
+                    f"thermal_age={thermal_age} audio={audio_text}"
                 )
             if save_dir and dashboard is not None and frame_index % args.save_every == 0:
                 try:
@@ -419,6 +592,10 @@ def main() -> None:
     parser.add_argument("--thermal-port", type=int, default=25000)
     parser.add_argument("--thermal-width", type=int, default=256)
     parser.add_argument("--thermal-height", type=int, default=192)
+    parser.add_argument("--audio-wav-url", help="Streaming WAV URL, for example IP Webcam /audio.wav")
+    parser.add_argument("--audio-chunk-bytes", type=int, default=8192)
+    parser.add_argument("--audio-stale-seconds", type=float, default=2.0)
+    parser.add_argument("--audio-demo", action="store_true", help="Use synthetic drone-like audio score.")
     parser.add_argument("--alert-threshold", type=float, default=0.55)
     parser.add_argument("--demo", action="store_true", help="Use synthetic RGB when no source is provided.")
     parser.add_argument("--demo-fps", type=float, default=15.0)

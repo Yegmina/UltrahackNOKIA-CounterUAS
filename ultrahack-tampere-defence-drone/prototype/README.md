@@ -37,6 +37,10 @@ Run the diagnostic watch/grant test after the phone is authorized in ADB:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_bridge_watch_test.ps1
 ```
 
+The watch and shell bridge runners invoke `thermal_frame_evidence_validator.py`
+after pulling their logs, so a real run reports whether the saved output proves
+live, non-empty thermal frames.
+
 To test Android's fixed-handler grant path without bringing the bridge UI forward:
 
 ```powershell
@@ -74,6 +78,19 @@ Or run the combined Counter-UAS fusion node:
 
 ```powershell
 py -3 prototype\counter_uas_fusion_node.py --rgb-source 0 --thermal-port 25000
+```
+
+Add phone microphone confidence from IP Webcam's WAV stream:
+
+```powershell
+adb forward tcp:8080 tcp:8080
+py -3 prototype\counter_uas_fusion_node.py --rgb-source http://127.0.0.1:8080/video --audio-wav-url http://127.0.0.1:8080/audio.wav
+```
+
+Run the full fusion loop without the phone:
+
+```powershell
+py -3 prototype\counter_uas_fusion_node.py --demo --audio-demo --no-window --max-frames 90
 ```
 
 With a programmable stand controller listening over UDP:
