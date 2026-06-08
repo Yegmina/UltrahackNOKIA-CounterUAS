@@ -47,6 +47,7 @@ public final class ThermoVueShellBridge {
     private int udpSentFrames;
     private File runDir;
     private File logFile;
+    private File shellDataDir;
 
     private ThermoVueShellBridge() {
     }
@@ -61,6 +62,9 @@ public final class ThermoVueShellBridge {
         //noinspection ResultOfMethodCallIgnored
         runDir.mkdirs();
         logFile = new File(runDir, "thermovue_shell_bridge.log");
+        shellDataDir = new File("/data/local/tmp/thermovue_shell_data");
+        //noinspection ResultOfMethodCallIgnored
+        shellDataDir.mkdirs();
 
         append("uid=" + Process.myUid() + " pid=" + Process.myPid());
         append("jetsonUdp=" + (jetsonHost == null ? "disabled" : jetsonHost + ":" + jetsonPort));
@@ -117,9 +121,10 @@ public final class ThermoVueShellBridge {
         }
         Context systemContext =
                 (Context) activityThreadClass.getMethod("getSystemContext").invoke(activityThread);
-        return systemContext.createPackageContext(
+        Context shellContext = systemContext.createPackageContext(
                 SHELL_PACKAGE,
                 Context.CONTEXT_IGNORE_SECURITY);
+        return new LocalTmpContext(shellContext, shellDataDir);
     }
 
     private ApplicationInfo getApplicationInfo(String packageName) throws Exception {
@@ -206,7 +211,7 @@ public final class ThermoVueShellBridge {
             attachBaseContext.setAccessible(true);
             attachBaseContext.invoke(rxApp, context);
 
-            File baseDir = new File("/data/local/tmp/thermovue_shell_data");
+            File baseDir = shellDataDir;
             File docs = new File(baseDir, "Documents");
             File pictures = new File(baseDir, "Pictures");
             File dcim = new File(baseDir, "DCIM");
@@ -796,6 +801,41 @@ public final class ThermoVueShellBridge {
             } catch (IOException e) {
                 System.out.println("log write failed " + e);
             }
+        }
+    }
+
+    private static final class LocalTmpContext extends ContextWrapper {
+        private final File baseDir;
+
+        private LocalTmpContext(Context base, File baseDir) {
+            super(base);
+            this.baseDir = baseDir;
+        }
+
+        @Override
+        public File getExternalFilesDir(String type) {
+            File dir = type == null ? new File(baseDir, "files") : new File(baseDir, type);
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            return dir;
+        }
+
+        @Override
+        public File[] getExternalFilesDirs(String type) {
+            return new File[]{getExternalFilesDir(type)};
+        }
+
+        @Override
+        public File getExternalCacheDir() {
+            File dir = new File(baseDir, "cache");
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            return dir;
+        }
+
+        @Override
+        public File[] getExternalCacheDirs() {
+            return new File[]{getExternalCacheDir()};
         }
     }
 }

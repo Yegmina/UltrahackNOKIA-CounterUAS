@@ -41,6 +41,9 @@ if ($Line -match "unauthorized") {
 Write-Host "Pushing USB shell helper..."
 Invoke-Adb push $HelperDex /data/local/tmp/usb-shell-helper.dex
 
+Write-Host "Clearing logcat..."
+Invoke-Adb logcat -c
+
 Write-Host "Clearing old shell bridge temp dirs..."
 Invoke-Shell "rm -rf /data/local/tmp/thermovue_shell_bridge_* /data/local/tmp/thermovue_shell_libs /data/local/tmp/thermovue_shell_dex"
 
@@ -74,3 +77,9 @@ Invoke-Adb pull "$LatestDir/thermovue_shell_bridge.log" $LocalLog
 
 Write-Host "Log saved to $LocalLog"
 Select-String -Path $LocalLog -Pattern "classLoad|shellGrant|Shell USB state|initHandleEngine|Tiny2C poll|streamTiny2c|udpThermalFrame|FAIL|Exception|FATAL"
+
+Write-Host "Saving focused logcat..."
+$LocalLogcat = Join-Path $LocalLogDir ((Split-Path -Leaf $LatestDir) + ".logcat.txt")
+Invoke-Adb logcat -d -v time | Out-File -FilePath $LocalLogcat -Encoding utf8
+Write-Host "Logcat saved to $LocalLogcat"
+Select-String -Path $LocalLogcat -Pattern "ThermoVueShellBridge|TINY2C_STEP|UvcNativeCamDualFusionPreviewManager|StartPreviewTask|USBMonitorManager|IrcamEngine|startPreview result|initHandleEngine|Exception|Fatal|FATAL" | Select-Object -Last 120
