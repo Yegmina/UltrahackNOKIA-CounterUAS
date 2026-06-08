@@ -2,6 +2,11 @@ package com.yegmina.sensorprobe;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
 import android.hardware.Sensor;
@@ -14,9 +19,16 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.MediaRecorder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -47,9 +59,10 @@ import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final String TAG = "SensorProbe";
-    private static final int REQ_CAMERA = 1001;
+    private static final int REQ_PERMISSIONS = 1001;
     private static final int FRAMES_PER_FORMAT = 3;
     private static final int FORMAT_Y16 = 0x20363159;
+    private static final String ACTION_USB_PERMISSION = "com.yegmina.sensorprobe.USB_PERMISSION";
 
     private TextView text;
     private HandlerThread cameraThread;
@@ -77,8 +90,9 @@ public class MainActivity extends Activity {
         outDir.mkdirs();
         logFile = new File(outDir, "sensor_probe.log");
 
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+        if (!hasRuntimePermission(Manifest.permission.CAMERA) ||
+                !hasRuntimePermission(Manifest.permission.RECORD_AUDIO)) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, REQ_PERMISSIONS);
         } else {
             startProbe();
         }
@@ -87,10 +101,12 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(requestCode, permissions, grants);
-        if (requestCode == REQ_CAMERA && grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == REQ_PERMISSIONS &&
+                hasRuntimePermission(Manifest.permission.CAMERA) &&
+                hasRuntimePermission(Manifest.permission.RECORD_AUDIO)) {
             startProbe();
         } else {
-            append("CAMERA permission denied");
+            append("CAMERA or RECORD_AUDIO permission denied");
         }
     }
 
@@ -100,6 +116,10 @@ public class MainActivity extends Activity {
         if (cameraThread != null) {
             cameraThread.quitSafely();
         }
+    }
+
+    private boolean hasRuntimePermission(String permission) {
+        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
     }
 
     private void startProbe() {
@@ -124,6 +144,12 @@ public class MainActivity extends Activity {
         for (String id : ids) {
             CameraCharacteristics cc = manager.getCameraCharacteristics(id);
             describeCamera(id, cc);
+        }
+
+        describeConcurrentCameraSupport(manager);
+        probeAudio();
+        if (ids.length > 0) {
+            probeAudioWithCamera(manager, ids[0]);
         }
 
         for (String id : ids) {
@@ -203,7 +229,163 @@ public class MainActivity extends Activity {
                     " protocol=" + device.getDeviceProtocol() +
                     " interfaceCount=" + device.getInterfaceCount() +
                     " manufacturer=\"" + safeUsbText(() -> device.getManufacturerName()) + "\"" +
-                    " product=\"" + safeUsbText(() -> device.getProductName()) + "\"");
+                    " product=\"" + safeUsbText(() -> device.getProductName()) + "\"" +
+                    " hasPermission=" + manager.hasPermission(device));
+            if (device.getVendorId() == 0x3474 && device.getProductId() == 0x4321) {
+                probeThermalUsbDevice(manager, device);
+            }
+        }
+    }
+
+    private void probeThermalUsbDevice(UsbManager manager, UsbDevice device) {
+        append("THERMAL_USB candidate found. Requesting/opening direct USB access.");
+        boolean permitted = manager.hasPermission(device);
+        if (!permitted) {
+            permitted = requestUsbPermissionAndWait(manager, device);
+        }
+        append("THERMAL_USB permissionAfterRequest=" + permitted);
+        if (!permitted) {
+            return;
+        }
+
+        UsbDeviceConnection connection = manager.openDevice(device);
+        if (connection == null) {
+            append("THERMAL_USB openDevice=null");
+            return;
+        }
+        try {
+            byte[] raw = connection.getRawDescriptors();
+            append("THERMAL_USB rawDescriptors bytes=" + (raw == null ? 0 : raw.length) +
+                    " head=" + sampleHex(raw, 48));
+            for (int i = 0; i < device.getInterfaceCount(); i++) {
+                UsbInterface iface = device.getInterface(i);
+                append("THERMAL_USB interface " + i +
+                        " class=" + iface.getInterfaceClass() +
+                        " subclass=" + iface.getInterfaceSubclass() +
+                        " protocol=" + iface.getInterfaceProtocol() +
+                        " endpoints=" + iface.getEndpointCount());
+                boolean claimed = false;
+                try {
+                    claimed = connection.claimInterface(iface, true);
+                } catch (Throwable t) {
+                    append("THERMAL_USB claim interface " + i + " threw " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
+                append("THERMAL_USB claim interface " + i + "=" + claimed);
+                for (int j = 0; j < iface.getEndpointCount(); j++) {
+                    UsbEndpoint ep = iface.getEndpoint(j);
+                    append("THERMAL_USB endpoint i=" + i + " e=" + j +
+                            " address=0x" + Integer.toHexString(ep.getAddress()) +
+                            " direction=" + ep.getDirection() +
+                            " type=" + ep.getType() +
+                            " maxPacket=" + ep.getMaxPacketSize() +
+                            " interval=" + ep.getInterval());
+                }
+                if (claimed) {
+                    try {
+                        connection.releaseInterface(iface);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } finally {
+            connection.close();
+        }
+    }
+
+    private boolean requestUsbPermissionAndWait(UsbManager manager, UsbDevice device) {
+        CountDownLatch latch = new CountDownLatch(1);
+        final boolean[] granted = new boolean[]{false};
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                append("THERMAL_USB permission broadcast action=" + intent.getAction());
+                if (ACTION_USB_PERMISSION.equals(intent.getAction())) {
+                    UsbDevice received = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    append("THERMAL_USB permission broadcast device=" +
+                            (received == null ? "null" : received.getDeviceName()) +
+                            " granted=" + intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false));
+                    if (received != null && received.getDeviceId() == device.getDeviceId()) {
+                        granted[0] = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+                        latch.countDown();
+                    }
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(receiver, filter);
+        }
+        try {
+            Intent intent = new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName());
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                    this,
+                    device.getDeviceId(),
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+            manager.requestPermission(device, pendingIntent);
+            append("THERMAL_USB waiting for permission response...");
+            if (!latch.await(60, TimeUnit.SECONDS)) {
+                append("THERMAL_USB permission wait timed out");
+            }
+            return granted[0] || manager.hasPermission(device);
+        } catch (Throwable t) {
+            append("THERMAL_USB permission request failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            return manager.hasPermission(device);
+        } finally {
+            try {
+                unregisterReceiver(receiver);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void describeConcurrentCameraSupport(CameraManager manager) {
+        append("");
+        append("===== CONCURRENT CAMERA SUPPORT =====");
+        if (Build.VERSION.SDK_INT < 30) {
+            append("getConcurrentCameraIds unavailable before Android 11");
+            return;
+        }
+        try {
+            append("concurrentCameraIdSets=" + manager.getConcurrentCameraIds());
+        } catch (Throwable t) {
+            append("concurrentCameraIdSets failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    private void probeAudio() {
+        append("");
+        append("===== AUDIO RECORD =====");
+        try {
+            AudioProbeResult result = recordMicForMs(1200);
+            append("AUDIO OK " + result.summary);
+        } catch (Throwable t) {
+            append("AUDIO FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    private void probeAudioWithCamera(CameraManager manager, String id) {
+        append("");
+        append("===== AUDIO + CAMERA " + id + " =====");
+        AudioRecord recorder = null;
+        try {
+            recorder = createAudioRecord();
+            recorder.startRecording();
+            ProbeResult result = captureSmallYuvFrames(manager, id);
+            AudioProbeResult audioResult = readMic(recorder, 1200);
+            append("AUDIO_CAMERA OK " + result.summary + " audio=" + audioResult.summary);
+        } catch (Throwable t) {
+            append("AUDIO_CAMERA FAIL " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        } finally {
+            if (recorder != null) {
+                try {
+                    recorder.stop();
+                } catch (Throwable ignored) {
+                }
+                recorder.release();
+            }
         }
     }
 
@@ -270,6 +452,19 @@ public class MainActivity extends Activity {
             }
         }
         return new ArrayList<>(wanted);
+    }
+
+    private ProbeResult captureSmallYuvFrames(CameraManager manager, String id) throws Exception {
+        CameraCharacteristics cc = manager.getCameraCharacteristics(id);
+        StreamConfigurationMap map = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (map == null) {
+            throw new RuntimeException("camera " + id + " has no stream configuration map");
+        }
+        Size size = pickSmallUsefulSize(map.getOutputSizes(ImageFormat.YUV_420_888));
+        if (size == null) {
+            throw new RuntimeException("camera " + id + " has no YUV_420_888 output size");
+        }
+        return captureFrames(manager, id, ImageFormat.YUV_420_888, size);
     }
 
     private ProbeResult captureFrames(CameraManager manager, String id, int format, Size size) throws Exception {
@@ -369,6 +564,71 @@ public class MainActivity extends Activity {
                 " gotFrames=" + (FRAMES_PER_FORMAT - frameLatch.getCount()) + "/" + FRAMES_PER_FORMAT +
                 " complete=" + gotFrames + " firstSummaries=" + frameSummaries;
         return new ProbeResult(summary);
+    }
+
+    private AudioProbeResult recordMicForMs(int durationMs) {
+        AudioRecord recorder = createAudioRecord();
+        try {
+            recorder.startRecording();
+            return readMic(recorder, durationMs);
+        } finally {
+            try {
+                recorder.stop();
+            } catch (Throwable ignored) {
+            }
+            recorder.release();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private AudioRecord createAudioRecord() {
+        int sampleRate = 16000;
+        int minBuffer = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        if (minBuffer <= 0) {
+            throw new RuntimeException("AudioRecord minBuffer=" + minBuffer);
+        }
+        int bufferSize = Math.max(minBuffer * 2, sampleRate);
+        AudioRecord recorder = new AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize);
+        if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
+            recorder.release();
+            throw new RuntimeException("AudioRecord not initialized");
+        }
+        return recorder;
+    }
+
+    private AudioProbeResult readMic(AudioRecord recorder, int durationMs) {
+        byte[] buffer = new byte[4096];
+        long deadline = System.currentTimeMillis() + durationMs;
+        int reads = 0;
+        int bytes = 0;
+        int nonZero = 0;
+        int maxAbs = 0;
+        while (System.currentTimeMillis() < deadline) {
+            int n = recorder.read(buffer, 0, buffer.length);
+            if (n <= 0) {
+                continue;
+            }
+            reads++;
+            bytes += n;
+            for (int i = 0; i + 1 < n; i += 2) {
+                int sample = (short) ((buffer[i] & 0xff) | (buffer[i + 1] << 8));
+                int abs = Math.abs(sample);
+                if (abs > 0) {
+                    nonZero++;
+                }
+                maxAbs = Math.max(maxAbs, abs);
+            }
+        }
+        return new AudioProbeResult("reads=" + reads + " bytes=" + bytes +
+                " nonZeroSamples=" + nonZero + " maxAbs=" + maxAbs);
     }
 
     private String summarizeImage(Image image) {
@@ -543,6 +803,22 @@ public class MainActivity extends Activity {
         return String.format(Locale.US, "0x%04x", value);
     }
 
+    private String sampleHex(byte[] bytes, int limit) {
+        if (bytes == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = Math.min(bytes.length, limit);
+        for (int i = 0; i < count; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format(Locale.US, "%02x", bytes[i] & 0xff));
+        }
+        if (bytes.length > count) {
+            sb.append(" ...");
+        }
+        return sb.toString();
+    }
+
     private interface UsbTextSupplier {
         String get();
     }
@@ -577,6 +853,13 @@ public class MainActivity extends Activity {
     private static class ProbeResult {
         final String summary;
         ProbeResult(String summary) {
+            this.summary = summary;
+        }
+    }
+
+    private static class AudioProbeResult {
+        final String summary;
+        AudioProbeResult(String summary) {
             this.summary = summary;
         }
     }

@@ -17,6 +17,7 @@ Keep large datasets out of git unless explicitly needed.
 - [phone_sensor_smoke_test.md](phone_sensor_smoke_test.md) tests RGB and audio streaming through IP Webcam.
 - [phone_sensor_test_report.md](phone_sensor_test_report.md) summarizes the measured phone sensor results.
 - [direct_thermal_sensor_attempt.md](direct_thermal_sensor_attempt.md) documents the direct Android sensor/USB/Camera2 access attempt.
+- [phone_sensor_capability_20260608.md](phone_sensor_capability_20260608.md) records the latest sound/camera/thermal simultaneity test on the connected phone.
 - [thermovue_reverse_engineering.md](thermovue_reverse_engineering.md) maps ThermoVue's internal thermal USB/native pipeline and likely raw frame layout.
 - [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
