@@ -481,6 +481,22 @@ buffers, and only then falls back to explicit `initData`, `initHandleEngine`, an
 raw temp frames to the Jetson/laptop over UDP using the
 `YEGMINA_THERMAL_RAW_V1` chunk protocol consumed by `thermal_udp_receiver.py`.
 
+Second experimental path:
+
+```text
+ThermoVueShellBridge via app_process
+  runs as UID 2000 / com.android.shell context
+  loads ThermoVue APK classes with DexClassLoader
+  extracts ThermoVue native libraries to /data/local/tmp
+  bootstraps RXBaseApplication paths under /data/local/tmp
+  grants thermal USB to UID 2000
+  calls the same USBMonitorManager + Tiny2CDualFusionProxy path
+```
+
+This avoids launching our Activity and may avoid foreground/lifecycle conflicts
+with ThermoVue. It still needs ThermoVue or a privileged actor to power the Tiny2C
+module first.
+
 ## Practical Next Steps
 
 Best clean route:

@@ -941,10 +941,13 @@ public class MainActivity extends Activity {
                         " firstFrame=" + firstFrame +
                         " rawTemp=" + describeBytes(rawTemp) +
                         " remapTemp=" + describeBytes(remapTemp));
-                sawFrame = sawFrame || hasFrame(frameCount, rawTemp, remapTemp);
-                maybeDumpFrame("raw_temp", rawTemp);
-                maybeDumpFrame("remap_temp", remapTemp);
-                maybeSendThermalUdp(frameCount, rawTemp);
+                boolean hasFrame = hasFrame(frameCount, firstFrame, rawTemp, remapTemp);
+                sawFrame = sawFrame || hasFrame;
+                if (hasFrame) {
+                    maybeDumpFrame("raw_temp", rawTemp);
+                    maybeDumpFrame("remap_temp", remapTemp);
+                    maybeSendThermalUdp(frameCount, rawTemp);
+                }
             } catch (Throwable t) {
                 append("Tiny2C poll FAIL " + formatThrowable(t));
                 return sawFrame;
@@ -1195,7 +1198,7 @@ public class MainActivity extends Activity {
                 Object firstFrame = invoke(proxy, "getFirstFrameFlag");
                 String frameId = String.valueOf(frameCount);
                 boolean freshFrame = !frameId.equals(lastFrameId) || frameCount == null;
-                if (hasFrame(frameCount, rawTemp, remapTemp) && freshFrame) {
+                if (hasFrame(frameCount, firstFrame, rawTemp, remapTemp) && freshFrame) {
                     append("streamTiny2c frame poll=" + polls +
                             " frameCount=" + frameCount +
                             " firstFrame=" + firstFrame +
@@ -1407,24 +1410,44 @@ public class MainActivity extends Activity {
         }
     }
 
-    private boolean hasFrame(Object frameCount, byte[] rawTemp, byte[] remapTemp) {
-        if (rawTemp != null && rawTemp.length > 0) {
-            return true;
-        }
-        if (remapTemp != null && remapTemp.length > 0) {
-            return true;
-        }
+    private boolean hasFrame(
+            Object frameCount,
+            Object firstFrame,
+            byte[] rawTemp,
+            byte[] remapTemp) {
         if (frameCount instanceof Number) {
-            return ((Number) frameCount).longValue() > 0;
+            if (((Number) frameCount).longValue() > 0) {
+                return true;
+            }
         }
         if (frameCount != null) {
             try {
-                return Long.parseLong(String.valueOf(frameCount)) > 0;
+                if (Long.parseLong(String.valueOf(frameCount)) > 0) {
+                    return true;
+                }
             } catch (NumberFormatException ignored) {
-                return false;
+                // Continue with first-frame/temp checks.
             }
         }
-        return false;
+        if (firstFrame instanceof Number && ((Number) firstFrame).longValue() > 0) {
+            return true;
+        }
+        if (firstFrame instanceof Boolean && ((Boolean) firstFrame)) {
+            return true;
+        }
+        boolean rawLooksReal = rawTemp != null && rawTemp.length > 0 && checksum(rawTemp, 1024) != 0;
+        boolean remapLooksReal =
+                remapTemp != null && remapTemp.length > 0 && checksum(remapTemp, 1024) != 0;
+        return rawLooksReal || remapLooksReal;
+    }
+
+    private int checksum(byte[] bytes, int limitBytes) {
+        int checksum = 0;
+        int limit = Math.min(bytes.length, limitBytes);
+        for (int i = 0; i < limit; i++) {
+            checksum = (checksum + (bytes[i] & 0xff)) & 0xffff;
+        }
+        return checksum;
     }
 
     private boolean isThermalDevice(UsbDevice device) {

@@ -37,6 +37,24 @@ Run the diagnostic watch/grant test after the phone is authorized in ADB:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_bridge_watch_test.ps1
 ```
 
+Experimental shell-side bridge path, without launching our Android Activity:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_usb_shell_helper.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_shell_bridge_test.ps1
+```
+
+This runs `ThermoVueShellBridge` through Android `app_process` as the shell UID,
+loads ThermoVue's APK/classes/native libraries, grants the thermal USB device to
+UID 2000, and tries the same Tiny2C startup sequence.
+
+To wait for the phone authorization prompt and automatically run a test:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_run_thermal_test.ps1 -Mode watch
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_run_thermal_test.ps1 -Mode shell
+```
+
 For live thermal UDP forwarding to a Jetson/laptop, start the receiver first:
 
 ```powershell
