@@ -46,7 +46,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_shell_
 
 This runs `ThermoVueShellBridge` through Android `app_process` as the shell UID,
 loads ThermoVue's APK/classes/native libraries, grants the thermal USB device to
-UID 2000, and tries the same Tiny2C startup sequence.
+UID 2000, optionally tries shell-side Tiny2C sysfs power writes, and tries the
+same Tiny2C startup sequence. Use `-NoSysfsPower` if ThermoVue should be the only
+process touching the power path during a test.
 
 To wait for the phone authorization prompt and automatically run a test:
 

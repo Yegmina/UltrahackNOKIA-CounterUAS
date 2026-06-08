@@ -4,7 +4,8 @@ param(
     [string]$JetsonHost = "",
     [int]$JetsonPort = 25000,
     [int]$StreamSeconds = 120,
-    [int]$UdpMaxFrames = 25
+    [int]$UdpMaxFrames = 25,
+    [switch]$NoSysfsPower
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +52,9 @@ Start-Sleep -Seconds $WaitBeforeBridgeSeconds
 $ArgsText = "--stream-seconds $StreamSeconds --udp-max-frames $UdpMaxFrames"
 if ($JetsonHost) {
     $ArgsText += " --jetson-host $JetsonHost --jetson-port $JetsonPort"
+}
+if ($NoSysfsPower) {
+    $ArgsText += " --no-sysfs-power"
 }
 
 Write-Host "Running shell-side ThermoVue bridge..."

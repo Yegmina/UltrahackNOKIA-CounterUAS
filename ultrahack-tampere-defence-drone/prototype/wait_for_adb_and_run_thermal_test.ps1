@@ -8,7 +8,8 @@ param(
     [int]$JetsonPort = 25000,
     [switch]$KeepStreaming,
     [int]$StreamSeconds = 3600,
-    [int]$UdpMaxFrames = 25
+    [int]$UdpMaxFrames = 25,
+    [switch]$NoSysfsPower
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +39,9 @@ while ((Get-Date) -lt $Deadline) {
             )
             if ($JetsonHost) {
                 $ArgsList += @("-JetsonHost", $JetsonHost)
+            }
+            if ($NoSysfsPower) {
+                $ArgsList += @("-NoSysfsPower")
             }
             & powershell @ArgsList
         } else {

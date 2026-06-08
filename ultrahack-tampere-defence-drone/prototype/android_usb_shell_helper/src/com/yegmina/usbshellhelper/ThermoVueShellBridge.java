@@ -34,11 +34,16 @@ public final class ThermoVueShellBridge {
     private static final String SHELL_PACKAGE = "com.android.shell";
     private static final int THERMAL_VENDOR_ID = 0x3474;
     private static final int THERMAL_PRODUCT_ID = 0x4321;
+    private static final String TINY2C_USB_MODE_PATH =
+            "/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode";
+    private static final String TINY2C_EXTCON_MODE_PATH =
+            "/sys/class/yft_extcon/tiny2c_mode";
 
     private String jetsonHost;
     private int jetsonPort = 25000;
     private int udpMaxFrames = 25;
     private int streamSeconds = 120;
+    private boolean trySysfsPower = true;
     private int udpSentFrames;
     private File runDir;
     private File logFile;
@@ -61,6 +66,7 @@ public final class ThermoVueShellBridge {
         append("jetsonUdp=" + (jetsonHost == null ? "disabled" : jetsonHost + ":" + jetsonPort));
         append("udpMaxFrames=" + (udpMaxFrames <= 0 ? "unlimited" : String.valueOf(udpMaxFrames)));
         append("streamSeconds=" + streamSeconds);
+        append("trySysfsPower=" + trySysfsPower);
 
         Context context = createShellContext();
         append("contextPackage=" + context.getPackageName());
@@ -75,6 +81,9 @@ public final class ThermoVueShellBridge {
         initializeRxBaseApplication(loader, context);
         probeClassLoading(loader);
 
+        if (trySysfsPower) {
+            powerThermalModuleViaSysfs();
+        }
         waitForThermalUsbAndGrantSelf(20000);
         runTiny2cDeviceControlPath(loader, context);
     }
@@ -90,6 +99,8 @@ public final class ThermoVueShellBridge {
                 udpMaxFrames = Integer.parseInt(args[++i]);
             } else if ("--stream-seconds".equals(arg) && i + 1 < args.length) {
                 streamSeconds = Integer.parseInt(args[++i]);
+            } else if ("--no-sysfs-power".equals(arg)) {
+                trySysfsPower = false;
             } else {
                 throw new IllegalArgumentException("Unknown/incomplete arg: " + arg);
             }
@@ -98,7 +109,12 @@ public final class ThermoVueShellBridge {
 
     private Context createShellContext() throws Exception {
         Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-        Object activityThread = activityThreadClass.getMethod("systemMain").invoke(null);
+        Object activityThread = activityThreadClass
+                .getMethod("currentActivityThread")
+                .invoke(null);
+        if (activityThread == null) {
+            activityThread = activityThreadClass.getMethod("systemMain").invoke(null);
+        }
         Context systemContext =
                 (Context) activityThreadClass.getMethod("getSystemContext").invoke(activityThread);
         return systemContext.createPackageContext(
@@ -269,10 +285,56 @@ public final class ThermoVueShellBridge {
             }
             Method grant = findMethod(usbProxy.getClass(), "grantDevicePermission", 2);
             grant.invoke(usbProxy, device, Process.myUid());
-            append("shellGrant OK uid=" + Process.myUid() + " device=" + describeUsbDevice(device));
+            append("shellGrant OK uid=" + Process.myUid() + " device=" + describeUsbDevice(device) +
+                    " hasPermission=" + hasDevicePermission(usbProxy, device));
         } catch (Throwable t) {
             append("shellGrant FAIL " + formatThrowable(t));
         }
+    }
+
+    private void powerThermalModuleViaSysfs() {
+        append("===== Shell sysfs thermal power attempt =====");
+        writeSysfs(TINY2C_USB_MODE_PATH, "1\n");
+        writeSysfs(TINY2C_EXTCON_MODE_PATH, "1\n");
+    }
+
+    private void writeSysfs(String path, String value) {
+        try (FileWriter writer = new FileWriter(path)) {
+            writer.write(value);
+            append("sysfsWrite OK path=" + path + " value=" + value.trim());
+        } catch (Throwable t) {
+            append("sysfsWrite FAIL path=" + path + " value=" + value.trim() +
+                    " " + formatThrowable(t));
+        }
+    }
+
+    private String hasDevicePermission(Object usbProxy, UsbDevice device) {
+        for (Method method : usbProxy.getClass().getMethods()) {
+            if (!method.getName().toLowerCase(Locale.US).contains("permission")) {
+                continue;
+            }
+            Class<?>[] types = method.getParameterTypes();
+            try {
+                if (types.length == 2 && types[0] == UsbDevice.class &&
+                        types[1] == String.class) {
+                    Object result = method.invoke(usbProxy, device, SHELL_PACKAGE);
+                    return method.getName() + "=" + result;
+                }
+                if (types.length == 2 && types[0] == UsbDevice.class &&
+                        types[1] == int.class) {
+                    Object result = method.invoke(usbProxy, device, Process.myUid());
+                    return method.getName() + "=" + result;
+                }
+                if (types.length == 1 && types[0] == UsbDevice.class &&
+                        method.getReturnType() == boolean.class) {
+                    Object result = method.invoke(usbProxy, device);
+                    return method.getName() + "=" + result;
+                }
+            } catch (Throwable ignored) {
+                // Try the next permission-like method.
+            }
+        }
+        return "unknown";
     }
 
     private UsbDevice waitForThermalUsb(Object usbProxy, long timeoutMs) throws Exception {
