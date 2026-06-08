@@ -266,13 +266,17 @@ public final class ThermoVueShellBridge {
                 "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
                 "com.energy.dualmodule.sdk.uvc.USBMonitorManager",
                 "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager",
+                "com.energy.dualmodule.sdk.service.task.DualPreviewMode",
                 "com.energy.ac020library.IrcamEngine",
-                "com.energy.iruvccamera.usb.USBMonitor"
+                "com.energy.iruvccamera.usb.USBMonitor",
+                "com.energy.ac020library.bean.IIrFrameCallback"
         };
         for (String name : classes) {
             try {
-                Class.forName(name, false, loader);
+                Class<?> loaded = Class.forName(name, false, loader);
                 append("classLoad OK " + name);
+                dumpClassShape(loaded);
             } catch (Throwable t) {
                 append("classLoad FAIL " + name + " " + formatThrowable(t));
             }
@@ -687,6 +691,49 @@ public final class ThermoVueShellBridge {
             }
         }
         throw new NoSuchMethodException(owner.getName() + "." + name);
+    }
+
+    private String describeMethod(Method method) {
+        StringBuilder builder = new StringBuilder(method.getReturnType().getName())
+                .append(' ')
+                .append(method.getName())
+                .append('(');
+        Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(types[i].getName());
+        }
+        return builder.append(')').toString();
+    }
+
+    private String describeField(Field field) {
+        return field.getType().getName() + " " + field.getName();
+    }
+
+    private void dumpClassShape(Class<?> cls) {
+        append("classShape " + cls.getName() +
+                " methods=" + cls.getDeclaredMethods().length +
+                " fields=" + cls.getDeclaredFields().length);
+        int methodCount = 0;
+        for (Method method : cls.getDeclaredMethods()) {
+            append("classMethod " + cls.getName() + " " + describeMethod(method));
+            methodCount++;
+            if (methodCount >= 80) {
+                append("classMethod " + cls.getName() + " truncated");
+                break;
+            }
+        }
+        int fieldCount = 0;
+        for (Field field : cls.getDeclaredFields()) {
+            append("classField " + cls.getName() + " " + describeField(field));
+            fieldCount++;
+            if (fieldCount >= 80) {
+                append("classField " + cls.getName() + " truncated");
+                break;
+            }
+        }
     }
 
     private void setStaticField(Class<?> owner, String name, Object value) throws Exception {
