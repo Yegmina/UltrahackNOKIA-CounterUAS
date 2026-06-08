@@ -68,6 +68,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_r
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_run_thermal_test.ps1 -Mode shell
 ```
 
+If the phone stays `unauthorized`, force a fresh USB debugging trust prompt:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_run_thermal_test.ps1 -Mode shell -ResetHostKey
+```
+
 For live thermal UDP forwarding to a Jetson/laptop, start the receiver first:
 
 ```powershell

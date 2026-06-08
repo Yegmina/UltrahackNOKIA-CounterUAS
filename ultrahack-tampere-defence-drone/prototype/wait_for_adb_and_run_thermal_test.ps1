@@ -11,13 +11,29 @@ param(
     [int]$UdpMaxFrames = 25,
     [switch]$NoSysfsPower,
     [switch]$UseHeadlessFixedHandler,
-    [switch]$SkipManualGrant
+    [switch]$SkipManualGrant,
+    [switch]$ResetHostKey
 )
 
 $ErrorActionPreference = "Stop"
 
 $Adb = Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe"
 $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+if ($ResetHostKey) {
+    $AndroidDir = Join-Path $env:USERPROFILE ".android"
+    $BackupDir = Join-Path $AndroidDir ("adbkey_backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+    foreach ($Name in @("adbkey", "adbkey.pub")) {
+        $Path = Join-Path $AndroidDir $Name
+        if (Test-Path $Path) {
+            Move-Item -LiteralPath $Path -Destination (Join-Path $BackupDir $Name)
+        }
+    }
+    Write-Host "Backed up ADB host keys to $BackupDir"
+    & $Adb kill-server
+    & $Adb start-server
+}
 
 Write-Host "Waiting for ADB device $Serial to become authorized..."
 while ((Get-Date) -lt $Deadline) {
