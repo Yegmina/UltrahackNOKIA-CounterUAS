@@ -1,2 +1,4 @@
 frida
 frida-tools
+numpy
+opencv-python

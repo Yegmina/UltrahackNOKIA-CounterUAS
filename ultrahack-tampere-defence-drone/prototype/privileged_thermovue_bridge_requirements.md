@@ -1,0 +1,129 @@
+# Privileged ThermoVue Bridge Requirements
+
+Date: 2026-06-08
+
+Goal: run our own Android bridge that powers the Ulefone Armor 28 Ultra Thermal
+Tiny2C module, opens the internal UVC thermal USB device, receives the same
+thermal frames ThermoVue receives, and streams them to the Jetson.
+
+## What The Stock Phone Blocks
+
+The internal thermal module appears as USB device `0x3474:0x4321` only after
+ThermoVue powers it.
+
+Normal side-loaded apps cannot:
+
+- write the Tiny2C power/mux sysfs nodes;
+- call `UsbManager.grantPermission(...)`;
+- keep the thermal USB device alive while asking Android's USB permission UI;
+- instrument ThermoVue, because target-package instrumentation requires a
+  matching signature;
+- use `run-as`, because ThermoVue is not debuggable.
+
+## Minimum Ulefone/InfiSense Help Needed
+
+One of these would unblock the direct bridge path:
+
+1. A Ulefone/InfiSense SDK sample app that exposes the Tiny2C thermal frame
+   callback to third-party code.
+2. A platform-signed APK build of our bridge, installed with the same effective
+   privilege class as ThermoVue.
+3. A temporary engineering firmware or device policy that lets our bridge run as
+   a privileged/system app for the hackathon.
+
+The bridge needs:
+
+```text
+android.permission.MANAGE_USB
+SELinux/domain ability equivalent to ThermoVue's u:r:platform_app:s0
+access to /sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode
+access to /sys/class/yft_extcon/tiny2c_mode
+USB access to VID:PID 3474:4321
+```
+
+Additional USB framework detail found in `services.jar`:
+
+- normal USB activity matching is ignored for product ID `17185` / `0x4321`;
+- the log line is `yft ignore YF USB attach notification ---`;
+- this happens before Android grants permission to a matched static USB handler;
+- the fixed-handler path `deviceAttachedForFixedHandler(...)` grants permission
+  before launching the handler and bypasses this ignore branch.
+
+So a good vendor-side path is one of:
+
+```text
+UsbService.setUsbDeviceConnectionHandler(
+  ComponentName("com.yegmina.thermovuebridgeprobe", "com.yegmina.thermovuebridgeprobe.MainActivity")
+)
+```
+
+or a firmware default/fixed USB host connection handler pointing to:
+
+```text
+com.yegmina.thermovuebridgeprobe/.MainActivity
+```
+
+The bridge now attempts this fixed-handler setup in privileged mode. On the
+stock side-loaded build, the app cannot complete it, but the system/framework
+path is confirmed by decompilation.
+
+## Validation Command Sequence
+
+After Ulefone provides a privileged/signed route, validate with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_thermovue_bridge_probe.ps1
+adb install -r prototype\android_thermovue_bridge_probe\build\thermovue-bridge-probe.apk
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true
+adb shell cat /sdcard/Android/data/com.yegmina.thermovuebridgeprobe/files/*/thermovue_bridge_probe.log
+```
+
+To stream frames to the Jetson/laptop receiver, start the receiver first:
+
+```powershell
+py -3 prototype\thermal_udp_receiver.py --host 0.0.0.0 --port 25000 --save-dir prototype\data\raw\thermal_udp
+```
+
+Then launch the bridge with the receiver IP:
+
+```powershell
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true --es jetsonHost <JETSON_OR_LAPTOP_IP> --ei jetsonPort 25000
+```
+
+Success criteria:
+
+```text
+fixedUsbHandlerBinder OK component=com.yegmina.thermovuebridgeprobe/.MainActivity
+sysfsWrite OK path=/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode value=1
+sysfsWrite OK path=/sys/class/yft_extcon/tiny2c_mode value=1
+GPIOUtils.powerUpControl invoked
+waitForThermalUsb found /dev/bus/usb/001/002 vendor=0x3474 product=0x4321
+hiddenUsbGrant ... hasPermission=true
+USBMonitor hasPermissionAfterRequest=true
+USBMonitor openDevice result=<non-null control block>
+Tiny2C poll frameCount increases
+getRawTempData returns non-null 256x192 thermal data
+frameDump raw_temp path=...
+udpThermalFrame sent ... chunks=...
+```
+
+On the stock side-loaded phone build, the expected failure is:
+
+```text
+sysfsWrite FAIL ... EACCES (Permission denied)
+waitForThermalUsb timeout
+privileged bridge FAIL thermal USB did not appear after power-up
+Tiny2C poll 0 frameCount=0 ... rawTemp=null
+```
+
+That failure is useful: it proves the bridge is testing the same privilege gates
+that a Ulefone-signed/system build must pass.
+
+SELinux package-name shortcut check:
+
+- `/system/etc/selinux/plat_seapp_contexts` has the normal `seinfo=platform`
+  route to `platform_app`, but no special `com.energy.*` package-name rule.
+- `/vendor/etc/selinux/vendor_seapp_contexts` only showed an unrelated Trustonic
+  app rule.
+- Therefore installing our app under an unused Energy-like package name, such as
+  `com.energy.ac020`, is unlikely to gain the ThermoVue privilege domain.

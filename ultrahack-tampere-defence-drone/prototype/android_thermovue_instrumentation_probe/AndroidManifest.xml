@@ -1,0 +1,18 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.yegmina.thermovueinstrumentationprobe">
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="35" />
+
+    <instrumentation
+        android:name=".ThermoVueInstrumentation"
+        android:handleProfiling="false"
+        android:functionalTest="true"
+        android:label="ThermoVueInstrumentation"
+        android:targetPackage="com.energy.tc2c" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:label="ThermoVueInstrumentation" />
+</manifest>

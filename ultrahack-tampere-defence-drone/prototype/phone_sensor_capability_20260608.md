@@ -106,7 +106,76 @@ For the hackathon MVP on this phone state:
   - vendor SDK/API access;
   - root/system privileges;
   - a privileged bridge app;
-  - successful instrumentation of ThermoVue's `IIrFrameCallback`.
+  - successful platform-signed/root instrumentation of ThermoVue's
+    `IIrFrameCallback`.
 
 The currently connected phone is locked production Android, so root/sysfs/direct
 USB access and Frida injection are blocked.
+
+## Follow-Up Probe Results
+
+A debug-signed instrumentation APK was built and installed to test whether we
+could run inside ThermoVue's target package context. Android rejected it:
+
+```text
+Permission Denial: starting instrumentation ... not allowed because package
+com.yegmina.thermovueinstrumentationprobe does not have a signature matching
+the target com.energy.tc2c
+```
+
+ThermoVue itself runs as:
+
+```text
+u:r:platform_app:s0:c512,c768 ... com.energy.tc2c
+```
+
+ADB root is unavailable and `su` is not installed:
+
+```text
+adbd cannot run as root in production builds
+/system/bin/sh: su: inaccessible or not found
+run-as: package not debuggable: com.energy.tc2c
+```
+
+So the realistic direct-sensor route on this exact phone is now narrowed to a
+Ulefone/InfiSense SDK or a Ulefone-signed/platform/privileged helper. A normal
+side-loaded APK can still be useful for RGB/audio and Jetson streaming, but not
+for powering/opening the thermal module directly.
+
+## USB Handler Follow-Up
+
+The bridge was updated to register a static USB device filter for the thermal
+module (`0x3474:0x4321`). Android lists it in `dumpsys usb`, but this still does
+not grant access.
+
+Runtime reflection found:
+
+```text
+UsbManager.grantPermission(UsbDevice, String)
+```
+
+Calling it from our side-loaded app fails with:
+
+```text
+SecurityException: Access denied, requires: android.permission.MANAGE_USB
+```
+
+`pm grant` also rejects `MANAGE_USB` because it is not runtime-changeable.
+
+The ordinary USB permission UI opens, but the internal thermal USB device is
+removed while the dialog is active, so the permission broadcast returns
+`granted=false`. This confirms that the next real raw-thermal step needs vendor
+privilege/signing, not just more UI automation.
+
+Decompiled firmware USB code confirms an OEM rule:
+
+```text
+if (usbDevice != null && usbDevice.getProductId() == 17185) {
+    Log.d(TAG, "yft ignore YF USB attach notification ---");
+    return;
+}
+```
+
+So static USB activity filters are intentionally ignored for the thermal module
+product ID `0x4321`. A Ulefone-side fixed USB host connection handler can bypass
+that path because it grants permission before launching the component.

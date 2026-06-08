@@ -12,7 +12,11 @@ build/
 # Local data and generated assets
 prototype/logs/
 prototype/apk_inspect/
+prototype/android_framework/
 prototype/android_sensor_probe/build/
+prototype/android_thermovue_bridge_probe/build/
+prototype/android_thermovue_instrumentation_probe/build/
+prototype/android_usb_shell_helper/build/
 prototype/data/raw/
 prototype/data/private/
 *.apk

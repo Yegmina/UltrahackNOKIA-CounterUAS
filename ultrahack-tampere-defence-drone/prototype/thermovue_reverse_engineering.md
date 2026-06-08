@@ -71,6 +71,191 @@ After launching ThermoVue, Android's USB host manager reported an internal devic
 
 Before ThermoVue starts, this internal USB camera is not reliably visible to a normal app. After ThermoVue starts, the device node appears, but ThermoVue owns the stream.
 
+## 2026-06-08 Connected Phone Access Tests
+
+Device under test:
+
+- Ulefone Armor 28 Ultra Thermal
+- ADB serial: `5011AF1010013479`
+- Android SDK: 35
+
+ThermoVue is installed as a system app:
+
+```text
+codePath=/system/app/M190infisens
+versionName=1.1.0
+signatures=PackageSignatures{..., signatures:[b9e56080], ...}
+pkgFlags=[ SYSTEM HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP LARGE_HEAP ]
+appId=10080
+```
+
+When ThermoVue is running, its process context is:
+
+```text
+u:r:platform_app:s0:c512,c768  u0_a80  ...  com.energy.tc2c
+```
+
+This matters because our side-loaded probes run outside that platform-app SELinux domain.
+
+ADB root is not available:
+
+```text
+adbd cannot run as root in production builds
+/system/bin/sh: su: inaccessible or not found
+```
+
+The app is not debuggable, so `run-as` is also unavailable:
+
+```text
+run-as: package not debuggable: com.energy.tc2c
+```
+
+Direct instrumentation into ThermoVue was tested with `prototype/android_thermovue_instrumentation_probe`. The APK builds and installs, but Android refuses to run it against ThermoVue because it is not signed with the same key:
+
+```text
+Permission Denial: starting instrumentation ... not allowed because package
+com.yegmina.thermovueinstrumentationprobe does not have a signature matching
+the target com.energy.tc2c
+```
+
+So normal debug instrumentation cannot hook ThermoVue on this production phone.
+
+The bridge probe can load many ThermoVue Java classes and native libraries, but it still cannot perform the privileged power step. Calling ThermoVue's `GPIOUtils.powerUpControl()` from our app fails internally with `EACCES` on:
+
+```text
+/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode
+/sys/class/yft_extcon/tiny2c_mode
+```
+
+When ThermoVue itself powers the module, the device nodes are:
+
+```text
+crw-rw---- 1 root  usb    u:object_r:usb_device:s0  189, 1 /dev/bus/usb/001/002
+crw-rw---- 1 media system u:object_r:video_device:s0 81, 137 /dev/video0
+crw-rw---- 1 media system u:object_r:video_device:s0 81, 138 /dev/video1
+```
+
+The USB node is visible only after ThermoVue powers the module. Shell cannot inspect enough sysfs metadata to confirm a usable public V4L2 path, and Android Camera2 still does not advertise a thermal camera.
+
+### USB Permission Handler Test
+
+The bridge probe now registers as a static USB handler for the thermal device:
+
+```text
+vendor_id=13428
+product_id=17185
+```
+
+`dumpsys usb` confirms Android sees the handler:
+
+```text
+package_name=com.yegmina.thermovuebridgeprobe
+class_name=com.yegmina.thermovuebridgeprobe.MainActivity
+filters={ vendor_id=13428 product_id=17185 ... }
+```
+
+This does not grant access on the production phone. The framework exposes:
+
+```text
+UsbManager method grantPermission(android.hardware.usb.UsbDevice,java.lang.String)
+```
+
+but calling it from the side-loaded bridge fails:
+
+```text
+java.lang.SecurityException: Access denied, requires: android.permission.MANAGE_USB
+```
+
+`pm grant` cannot grant `MANAGE_USB` either:
+
+```text
+Permission android.permission.MANAGE_USB ... is not a changeable permission type
+```
+
+The normal USB permission dialog also fails in practice. SystemUI starts `UsbPermissionActivity`, but the internal thermal USB device is removed while the dialog is up, then Android sends our pending intent with:
+
+```text
+EXTRA_PERMISSION_GRANTED=false
+```
+
+This likely happens because ThermoVue is paused/interrupted by the permission UI and powers down or cycles the internal module. Static USB filters therefore do not solve the side-loaded bridge case.
+
+### OEM USB Framework Finding
+
+Decompiling `services.jar` shows why static USB handler registration cannot work for this module on stock firmware:
+
+```text
+UsbProfileGroupSettingsManager.resolveActivity(...)
+if (usbDevice != null && usbDevice.getProductId() == 17185) {
+    Log.d(TAG, "yft ignore YF USB attach notification ---");
+    return;
+}
+```
+
+`17185` decimal is `0x4321`, the thermal module product ID. That branch returns before Android grants permission to the matched USB activity.
+
+There is a separate fixed-handler path:
+
+```text
+UsbHostManager:
+if (mUsbDeviceConnectionHandler == null) {
+    currentSettings.deviceAttached(device);
+} else {
+    currentSettings.deviceAttachedForFixedHandler(device, mUsbDeviceConnectionHandler);
+}
+
+UsbProfileGroupSettingsManager.deviceAttachedForFixedHandler(...):
+grantDevicePermission(usbDevice, applicationInfo.uid)
+startActivityAsUser(intent.setComponent(componentName), ...)
+```
+
+This fixed-handler path grants USB permission before starting the component and bypasses the product-ID ignore branch. `UsbService.setUsbDeviceConnectionHandler(ComponentName)` exists, but it is protected by `MANAGE_USB`. The bridge now attempts this in privileged mode; from a side-loaded app it cannot complete.
+
+Practical ask for Ulefone/InfiSense: either sign/privilege the bridge so it can call `setUsbDeviceConnectionHandler(...)`, or set the default/fixed USB host connection handler in firmware to:
+
+```text
+com.yegmina.thermovuebridgeprobe/.MainActivity
+```
+
+The bridge uses `singleTop` and logs USB attach intents, so this path should immediately show whether Android granted the internal thermal USB device to our process.
+
+### Privileged Bridge Candidate
+
+`prototype/android_thermovue_bridge_probe` now has a dedicated privileged mode:
+
+```text
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true
+```
+
+This mode does not launch ThermoVue. It tries to behave like the future vendor-signed bridge:
+
+1. load ThermoVue SDK classes and native libraries;
+2. initialize MMKV, Blankj Utils, and the vendor application singletons;
+3. write the Tiny2C power sysfs nodes directly;
+4. register itself as the fixed USB host connection handler if framework privilege allows it;
+5. call ThermoVue `GPIOUtils.powerUpControl()`;
+6. wait for USB VID/PID `0x3474:0x4321`;
+7. call the framework USB grant method if available;
+8. start the vendor Tiny2C preview path;
+9. dump `raw_temp_*.bin` / `remap_temp_*.bin` if thermal bytes appear;
+10. optionally send raw thermal frames over UDP with `--es jetsonHost <ip> --ei jetsonPort 25000`.
+
+On the stock side-loaded build this now fails at the precise expected gate:
+
+```text
+sysfsWrite FAIL path=/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode value=1 ... EACCES
+sysfsWrite FAIL path=/sys/class/yft_extcon/tiny2c_mode value=1 ... EACCES
+waitForThermalUsb timeout afterMs=10000
+privileged bridge FAIL thermal USB did not appear after power-up
+Tiny2C poll 0 frameCount=0 ... rawTemp=null remapTemp=null
+```
+
+The matching receiver is:
+
+```text
+py -3 prototype\thermal_udp_receiver.py --host 0.0.0.0 --port 25000 --save-dir prototype\data\raw\thermal_udp
+```
+
 ## Key Java Classes
 
 Primary app:
@@ -230,6 +415,72 @@ Our probe app saw normal phone cameras and sensors, but no public thermal camera
 - ThermoVue opens the internal USB camera through its own `USBMonitor` and native `AC020sdk`;
 - frames arrive through a vendor JNI callback, not Camera2.
 
+## Current Bridge Strategy
+
+The active non-root prototype keeps ThermoVue in the foreground so it powers the
+internal Tiny2C thermal USB module, then uses the Android shell UID to grant our
+bridge app permission to the already-attached USB device.
+
+Important Android framework finding:
+
+```text
+UsbProfileGroupSettingsManager.resolveActivity(...)
+  if productId == 17185:
+    "yft ignore YF USB attach notification"
+    return
+```
+
+That means normal USB attach activity matching is intentionally skipped for the
+thermal module. The fixed-handler framework path can bypass this, but launching
+our activity as the fixed handler steals foreground from ThermoVue and the module
+detaches quickly. The better test path is:
+
+```text
+clear fixed USB handler
+start bridge watcher in background/behind ThermoVue
+launch ThermoVue
+wait for VID 0x3474 / PID 0x4321
+shell helper calls IUsbManager.grantDevicePermission(device, bridgeUid)
+bridge initializes vendor USBMonitorManager and Tiny2CDualFusionProxy
+```
+
+Smali-confirmed vendor startup sequence:
+
+```text
+StartPreviewTask.run(MODE_DUAL_FUSION)
+  Tiny2CDualFusionProxy.startRestartTimer()
+  GPIOUtils.powerUpControl()
+  wait until USBMonitorManager.isDeviceConnected()
+  MImageUtils model init
+  Tiny2CDualFusionProxy.initData()
+  Tiny2CDualFusionProxy.initHandleEngine(USBMonitorManager.getCtrlBlock(), true)
+
+UvcNativeCamDualFusionPreviewManager.initHandleEngine(ctrlBlock, true)
+  DualUvcHandleParam.setCtrlBlock(ctrlBlock)
+  IrcamEngine.Builder()
+    .setStreamWidth(256)
+    .setStreamHeight(192)
+    .setDriverType(USB_DUAL_NATIVE_CAM)
+    .setDualUvcHandleParam(...)
+    .build()
+  IrcamEngine.initHandle(callback)
+  callback.onSuccess(...)
+    handleDualCalFileRead()
+    TempCompensation.getNucTData()
+    startPreview()
+
+UvcNativeCamDualFusionPreviewManager.startPreview()
+  IrcamEngine.setIrFrameCallback(mIrFrameCallback)
+  IrcamEngine.startVideoStream()
+  startFrameDataCheck()
+```
+
+The bridge now tries the vendor worker path first, polls frame counters/temp
+buffers, and only then falls back to explicit `initData`, `initHandleEngine`, and
+`startPreview` calls. When `keepStreaming` is enabled and frames appear, it sends
+raw temp frames to the Jetson/laptop over UDP using the
+`YEGMINA_THERMAL_RAW_V1` chunk protocol consumed by `thermal_udp_receiver.py`.
+
 ## Practical Next Steps
 
 Best clean route:
@@ -240,10 +491,16 @@ Best clean route:
    - `Tiny2CDualFusionProxy`
    - `IrcamEngine`
    - `IIrFrameCallback`
+2. Ask specifically for either:
+   - a signed/platform bridge APK template that can run in the same privilege class as ThermoVue; or
+   - permission and instructions to install our own app as a privileged system app during the hackathon.
+3. Required bridge privileges seen so far:
+   - `android.permission.MANAGE_USB` to call `UsbManager.grantPermission(...)`;
+   - a platform/system app SELinux domain comparable to ThermoVue's `u:r:platform_app:s0` so `GPIOUtils`/Tiny2C sysfs power control can work.
 
 Fastest technical proof route:
 
-1. Use Frida/Xposed/root instrumentation to hook:
+1. Use Frida/Xposed/root/platform-signed instrumentation to hook:
 
    ```text
    com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager$3.onFrame(byte[], int)
@@ -268,6 +525,7 @@ Most robust product route:
 Risky/less likely route:
 
 - A normal app loading ThermoVue's APK classes with `PathClassLoader`. Android native linker namespaces, app-private libraries, sysfs permissions, and USB ownership make this unlikely to work without privileged install/root.
+- Plain Android instrumentation from a debug-signed APK. This is now tested and blocked by target-package signature mismatch.
 
 ## Counter-UAV Prototype Implication
 
