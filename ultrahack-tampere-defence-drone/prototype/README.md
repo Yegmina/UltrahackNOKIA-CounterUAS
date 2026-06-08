@@ -37,6 +37,13 @@ Run the diagnostic watch/grant test after the phone is authorized in ADB:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_bridge_watch_test.ps1
 ```
 
+To test Android's fixed-handler grant path without bringing the bridge UI forward:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_bridge_watch_test.ps1 -UseHeadlessFixedHandler -SkipManualGrant
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\wait_for_adb_and_run_thermal_test.ps1 -Mode watch -UseHeadlessFixedHandler -SkipManualGrant
+```
+
 Experimental shell-side bridge path, without launching our Android Activity:
 
 ```powershell

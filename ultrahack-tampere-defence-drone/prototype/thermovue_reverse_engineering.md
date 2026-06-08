@@ -444,6 +444,17 @@ shell helper calls IUsbManager.grantDevicePermission(device, bridgeUid)
 bridge initializes vendor USBMonitorManager and Tiny2CDualFusionProxy
 ```
 
+The bridge now also has a no-display fixed-handler component:
+
+```text
+com.yegmina.thermovuebridgeprobe/.HeadlessUsbAttachActivity
+```
+
+This component is intended only to receive Android's package-level USB permission
+grant and immediately finish. A separate watcher bridge can remain running and
+observe whether the permission appeared without interrupting ThermoVue's preview
+lifecycle.
+
 Smali-confirmed vendor startup sequence:
 
 ```text

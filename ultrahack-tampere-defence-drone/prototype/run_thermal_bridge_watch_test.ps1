@@ -6,7 +6,9 @@ param(
     [int]$JetsonPort = 25000,
     [switch]$KeepStreaming,
     [int]$StreamSeconds = 3600,
-    [int]$UdpMaxFrames = 25
+    [int]$UdpMaxFrames = 25,
+    [switch]$UseHeadlessFixedHandler,
+    [switch]$SkipManualGrant
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,8 +58,13 @@ Invoke-Adb push $HelperDex /data/local/tmp/usb-shell-helper.dex
 Write-Host "Clearing logcat..."
 Invoke-Adb logcat -c
 
-Write-Host "Clearing fixed USB handler so ThermoVue can remain foreground..."
-Invoke-Shell "CLASSPATH=/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper clear-fixed-handler"
+if ($UseHeadlessFixedHandler) {
+    Write-Host "Setting headless fixed USB handler for package-level USB grant..."
+    Invoke-Shell "CLASSPATH=/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper set-fixed-handler"
+} else {
+    Write-Host "Clearing fixed USB handler so ThermoVue can remain foreground..."
+    Invoke-Shell "CLASSPATH=/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper clear-fixed-handler"
+}
 
 Write-Host "Restarting apps..."
 Invoke-Shell "am force-stop com.energy.tc2c"
@@ -77,8 +84,12 @@ Invoke-Shell $BridgeStart
 Write-Host "Launching ThermoVue..."
 Invoke-Shell "am start -n com.energy.tc2c/com.energy.usbCamera.ui.splash.SplashActivity"
 
-Write-Host "Granting thermal USB to bridge..."
-Invoke-Shell "CLASSPATH=/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper grant-thermal com.yegmina.thermovuebridgeprobe $GrantTimeoutMs"
+if ($SkipManualGrant) {
+    Write-Host "Skipping manual thermal USB grant; relying on fixed-handler/package permission."
+} else {
+    Write-Host "Granting thermal USB to bridge..."
+    Invoke-Shell "CLASSPATH=/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper grant-thermal com.yegmina.thermovuebridgeprobe $GrantTimeoutMs"
+}
 
 Write-Host "Waiting $WaitAfterGrantSeconds seconds for frame polling..."
 Start-Sleep -Seconds $WaitAfterGrantSeconds

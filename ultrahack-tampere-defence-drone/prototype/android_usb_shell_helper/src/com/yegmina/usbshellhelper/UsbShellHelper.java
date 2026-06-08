@@ -12,7 +12,7 @@ import java.lang.reflect.Method;
 public final class UsbShellHelper {
     private static final String DESCRIPTOR = "android.hardware.usb.IUsbManager";
     private static final String BRIDGE_COMPONENT =
-            "com.yegmina.thermovuebridgeprobe/.MainActivity";
+            "com.yegmina.thermovuebridgeprobe/.HeadlessUsbAttachActivity";
     private static final String BRIDGE_PACKAGE = "com.yegmina.thermovuebridgeprobe";
     private static final int THERMAL_VENDOR_ID = 0x3474;
     private static final int THERMAL_PRODUCT_ID = 0x4321;

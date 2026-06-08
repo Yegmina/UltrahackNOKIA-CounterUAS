@@ -9,7 +9,9 @@ param(
     [switch]$KeepStreaming,
     [int]$StreamSeconds = 3600,
     [int]$UdpMaxFrames = 25,
-    [switch]$NoSysfsPower
+    [switch]$NoSysfsPower,
+    [switch]$UseHeadlessFixedHandler,
+    [switch]$SkipManualGrant
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +60,12 @@ while ((Get-Date) -lt $Deadline) {
             }
             if ($KeepStreaming) {
                 $ArgsList += @("-KeepStreaming", "-StreamSeconds", $StreamSeconds)
+            }
+            if ($UseHeadlessFixedHandler) {
+                $ArgsList += @("-UseHeadlessFixedHandler")
+            }
+            if ($SkipManualGrant) {
+                $ArgsList += @("-SkipManualGrant")
             }
             & powershell @ArgsList
         }
