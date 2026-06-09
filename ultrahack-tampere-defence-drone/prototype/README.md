@@ -20,6 +20,7 @@ Keep large datasets out of git unless explicitly needed.
 - [phone_sensor_capability_20260608.md](phone_sensor_capability_20260608.md) records the latest sound/camera/thermal simultaneity test on the connected phone.
 - [thermovue_reverse_engineering.md](thermovue_reverse_engineering.md) maps ThermoVue's internal thermal USB/native pipeline and likely raw frame layout.
 - [thermovue_ijpeg_extraction.md](thermovue_ijpeg_extraction.md) documents the confirmed ThermoVue IJPEG raw thermal extraction path.
+- [thermovue_native_live_map.md](thermovue_native_live_map.md) maps the ThermoVue Java/JNI/native live-stream startup path and remaining privilege boundary.
 - [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
 - [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
@@ -182,6 +183,12 @@ Inspect pulled ThermoVue APK/native-library dumps:
 
 ```powershell
 py -3 prototype\inspect_vendor_dump.py prototype\mtp_pulled_logs --out prototype\logs\vendor_dump_report.md
+```
+
+Generate a native ELF/string report for ThermoVue libraries without NDK tools:
+
+```powershell
+py -3 prototype\native_elf_report.py prototype\logs\thermal_live_debug_20260609_111936\vendor_dump\thermovue_pro\base.apk --out prototype\logs\native_libs\thermovue_native_elf_report.md
 ```
 
 Extract real raw thermal frames from a ThermoVue IJPEG photo:
