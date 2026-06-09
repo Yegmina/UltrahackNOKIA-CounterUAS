@@ -14,10 +14,13 @@ live thermal frames into its own UI.
 1. Install and open `Thermal Live Debug`.
 2. Tap `Self Test` to confirm the preview renderer works.
 3. Tap `Scan` to list Camera2 IDs, USB devices, and ThermoVue package status.
-4. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
-5. Tap `Request USB` if USB VID `0x3474`, PID `0x4321` appears.
-6. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
-7. Tap `Start SDK`.
+4. Tap `USB Probe` to log USB descriptors, interfaces, endpoints, and short
+   read attempts from readable IN endpoints.
+5. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
+6. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
+   appears.
+7. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
+8. Tap `Start SDK`.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
 foreground, use `TVue FG Test` instead of `Launch TVue` + `Start SDK`. It starts
@@ -33,6 +36,9 @@ screen. This is real ThermoVue display capture, not raw sensor bytes.
 For native/full-clone reverse engineering, use `Native Auto`. It runs a matrix
 of ThermoVue-like startup sequences:
 
+- direct USB endpoint descriptor/read probing;
+- relevant ThermoVue DEX class index logging;
+- attempted `IIrFrameCallback` registration on known SDK singletons;
 - multiple visible camera IDs (`0`, `1`, `2`, `3`, and empty);
 - `UvcNativeCamDualDeviceControlManager.handleStartPreview(...)`;
 - `Tiny2CDualFusionProxy.handleStartPreview(...)`;

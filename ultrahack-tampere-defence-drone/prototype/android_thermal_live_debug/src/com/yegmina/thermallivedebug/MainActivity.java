@@ -19,7 +19,10 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
+import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.media.projection.MediaProjectionManager;
@@ -44,19 +47,24 @@ import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import dalvik.system.DexClassLoader;
+import dalvik.system.DexFile;
 
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
@@ -129,6 +137,7 @@ public class MainActivity extends Activity {
         buttons.setPadding(dp(6), dp(6), dp(6), dp(6));
         buttons.addView(button("Self Test", view -> showSyntheticFrame()));
         buttons.addView(button("Scan", view -> scanAll()));
+        buttons.addView(button("USB Probe", view -> startThread(this::probeThermalUsbEndpoints)));
         buttons.addView(button("Dump Classes", view -> startThread(this::dumpClassesOnly)));
         buttons.addView(button("Request USB", view -> requestThermalUsb()));
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
@@ -286,6 +295,13 @@ public class MainActivity extends Activity {
                             " subclass=" + iface.getInterfaceSubclass() +
                             " protocol=" + iface.getInterfaceProtocol() +
                             " endpoints=" + iface.getEndpointCount());
+                    for (int endpointIndex = 0;
+                         endpointIndex < iface.getEndpointCount();
+                         endpointIndex++) {
+                        append("usbEndpoint iface=" + i +
+                                " endpoint=" + endpointIndex +
+                                " " + describeUsbEndpoint(iface.getEndpoint(endpointIndex)));
+                    }
                 }
                 if (isThermal) {
                     thermal = device;
@@ -295,6 +311,155 @@ public class MainActivity extends Activity {
             append("usb scan FAIL " + formatThrowable(t));
         }
         return thermal;
+    }
+
+    private boolean probeThermalUsbEndpoints() {
+        append("===== direct USB endpoint probe =====");
+        UsbDevice thermal = inspectUsb();
+        if (thermal == null) {
+            append("USB probe: no candidate thermal USB device visible");
+            setStatus("USB probe no device");
+            return false;
+        }
+        UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+        try {
+            attemptHiddenUsbGrant(manager, thermal);
+        } catch (Throwable t) {
+            append("USB probe hidden grant attempt FAIL " + formatThrowable(t));
+        }
+        if (!manager.hasPermission(thermal)) {
+            append("USB probe requesting permission for " + describeUsbDevice(thermal));
+            requestUsbPermissionAndWait(manager, thermal);
+        }
+        append("USB probe hasPermission=" + manager.hasPermission(thermal));
+        if (!manager.hasPermission(thermal)) {
+            append("USB probe cannot continue without Android USB permission");
+            setStatus("USB probe no permission");
+            return false;
+        }
+
+        boolean sawBytes = false;
+        UsbDeviceConnection connection = null;
+        try {
+            connection = manager.openDevice(thermal);
+            if (connection == null) {
+                append("USB probe openDevice returned null");
+                setStatus("USB probe open failed");
+                return false;
+            }
+            byte[] rawDescriptors = connection.getRawDescriptors();
+            append("USB probe rawDescriptors " + describeBytes(rawDescriptors) +
+                    " head=" + hexPrefix(rawDescriptors, 96));
+
+            for (int i = 0; i < thermal.getInterfaceCount(); i++) {
+                UsbInterface iface = thermal.getInterface(i);
+                append("USB probe interface=" + i +
+                        " class=" + iface.getInterfaceClass() +
+                        " subclass=" + iface.getInterfaceSubclass() +
+                        " protocol=" + iface.getInterfaceProtocol() +
+                        " endpoints=" + iface.getEndpointCount());
+                boolean claimed = connection.claimInterface(iface, false);
+                if (!claimed) {
+                    append("USB probe claimInterface(false) failed; trying force=true interface=" + i);
+                    claimed = connection.claimInterface(iface, true);
+                }
+                append("USB probe claim interface=" + i + " claimed=" + claimed);
+                if (!claimed) {
+                    continue;
+                }
+                try {
+                    for (int endpointIndex = 0;
+                         endpointIndex < iface.getEndpointCount();
+                         endpointIndex++) {
+                        UsbEndpoint endpoint = iface.getEndpoint(endpointIndex);
+                        append("USB probe endpoint iface=" + i +
+                                " endpoint=" + endpointIndex +
+                                " " + describeUsbEndpoint(endpoint));
+                        if (endpoint.getDirection() != UsbConstants.USB_DIR_IN) {
+                            append("USB probe skip OUT endpoint iface=" + i +
+                                    " endpoint=" + endpointIndex);
+                            continue;
+                        }
+                        int type = endpoint.getType();
+                        if (type == UsbConstants.USB_ENDPOINT_XFER_BULK ||
+                                type == UsbConstants.USB_ENDPOINT_XFER_INT) {
+                            sawBytes = probeReadableEndpoint(connection, endpoint, i, endpointIndex) ||
+                                    sawBytes;
+                        } else if (type == UsbConstants.USB_ENDPOINT_XFER_ISOC) {
+                            append("USB probe skip ISO IN endpoint iface=" + i +
+                                    " endpoint=" + endpointIndex +
+                                    " because Android Java USB host has no isochronous read API");
+                        } else {
+                            append("USB probe skip unsupported IN endpoint type=" +
+                                    endpointTypeName(type));
+                        }
+                    }
+                } finally {
+                    try {
+                        connection.releaseInterface(iface);
+                    } catch (Throwable t) {
+                        append("USB probe releaseInterface FAIL interface=" + i +
+                                " " + formatThrowable(t));
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            append("USB probe FAIL " + formatThrowable(t));
+        } finally {
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (Throwable ignored) {
+                    // Nothing useful to do after a close failure in a debug probe.
+                }
+            }
+        }
+        append("USB probe finished sawBytes=" + sawBytes);
+        setStatus(sawBytes ? "USB probe saw bytes" : "USB probe no bytes");
+        return sawBytes;
+    }
+
+    private boolean probeReadableEndpoint(
+            UsbDeviceConnection connection,
+            UsbEndpoint endpoint,
+            int interfaceIndex,
+            int endpointIndex) {
+        int maxPacket = Math.max(64, endpoint.getMaxPacketSize());
+        int bufferLength = Math.max(64, Math.min(64 * 1024, maxPacket * 128));
+        byte[] buffer = new byte[bufferLength];
+        boolean sawBytes = false;
+        for (int attempt = 1; attempt <= 8; attempt++) {
+            int read;
+            try {
+                read = connection.bulkTransfer(endpoint, buffer, buffer.length, 180);
+            } catch (Throwable t) {
+                append("USB probe read FAIL iface=" + interfaceIndex +
+                        " endpoint=" + endpointIndex +
+                        " attempt=" + attempt +
+                        " " + formatThrowable(t));
+                break;
+            }
+            append("USB probe read iface=" + interfaceIndex +
+                    " endpoint=" + endpointIndex +
+                    " attempt=" + attempt +
+                    " read=" + read +
+                    " buffer=" + buffer.length);
+            if (read > 0) {
+                sawBytes = true;
+                append("USB probe data iface=" + interfaceIndex +
+                        " endpoint=" + endpointIndex +
+                        " read=" + read +
+                        " checksum=" + checksumHex(buffer, read) +
+                        " head=" + hexPrefix(buffer, Math.min(read, 96)));
+                if (read >= THERMAL_U16_BYTES) {
+                    byte[] frame = new byte[THERMAL_U16_BYTES];
+                    System.arraycopy(buffer, 0, frame, 0, THERMAL_U16_BYTES);
+                    renderThermal(frame, "usb endpoint sample");
+                }
+            }
+            sleepMs(80);
+        }
+        return sawBytes;
     }
 
     private void inspectThermoVuePackage() {
@@ -527,6 +692,8 @@ public class MainActivity extends Activity {
             tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
             tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
             tryInvoke(proxy, "resetIsFirstFrame");
+            Object frameCallback = createIrFrameCallback(loader, "SDK");
+            tryInstallFrameCallback(proxy, frameCallback, "SDK proxy");
 
             Class<?> usbMonitorManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
@@ -546,6 +713,8 @@ public class MainActivity extends Activity {
             deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
             liveDeviceControlManager = deviceControlManager;
             tryInvoke(deviceControlManager, "init");
+            tryInstallFrameCallback(deviceControlManager, frameCallback, "SDK deviceControl");
+            installFrameCallbacksOnKnownSingletons(loader, frameCallback, "SDK singleton");
 
             Class<?> modeClass = Class.forName(
                     "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
@@ -676,7 +845,9 @@ public class MainActivity extends Activity {
             initializeRxBaseApplication(loader);
             dumpImportantClasses(loader, false);
             dumpTargetedReverseEngineeringHints(loader);
+            dumpThermoVueClassIndex(loader);
             inspectUsb();
+            probeThermalUsbEndpoints();
 
             Class<?> modeClass = Class.forName(
                     "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
@@ -782,6 +953,8 @@ public class MainActivity extends Activity {
             tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
             tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
             tryInvoke(proxy, "resetIsFirstFrame");
+            Object frameCallback = createIrFrameCallback(loader, "AUTO scenario " + scenario);
+            tryInstallFrameCallback(proxy, frameCallback, "AUTO proxy");
 
             Class<?> usbMonitorManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
@@ -799,6 +972,8 @@ public class MainActivity extends Activity {
             liveDeviceControlManager = deviceControlManager;
             tryInvoke(deviceControlManager, "release");
             tryInvoke(deviceControlManager, "init");
+            tryInstallFrameCallback(deviceControlManager, frameCallback, "AUTO deviceControl");
+            installFrameCallbacksOnKnownSingletons(loader, frameCallback, "AUTO singleton");
 
             Object connected = waitForUsbConnected(usbMonitorManager, 3500);
             Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
@@ -880,6 +1055,129 @@ public class MainActivity extends Activity {
         }
         sleepMs(800);
         tryInvoke(proxy, "startPreview");
+    }
+
+    private Object createIrFrameCallback(ClassLoader loader, String label) {
+        try {
+            Class<?> callbackClass = Class.forName(
+                    "com.energy.ac020library.bean.IIrFrameCallback",
+                    true,
+                    loader);
+            Object callback = Proxy.newProxyInstance(
+                    callbackClass.getClassLoader(),
+                    new Class[]{callbackClass},
+                    (proxy, method, args) -> {
+                        append(label + " IIrFrameCallback." + method.getName() +
+                                " args=" + describeArgs(args));
+                        byte[] frame = findRenderableFrameArg(args);
+                        if (frame != null) {
+                            renderThermal(frame, label + " callback " + method.getName());
+                        }
+                        return defaultReturnValue(method.getReturnType());
+                    });
+            append(label + " frameCallbackProxy OK methods=" +
+                    callbackClass.getDeclaredMethods().length);
+            return callback;
+        } catch (Throwable t) {
+            append(label + " frameCallbackProxy FAIL " + formatThrowable(t));
+            return null;
+        }
+    }
+
+    private void installFrameCallbacksOnKnownSingletons(
+            ClassLoader loader,
+            Object callback,
+            String label) {
+        if (callback == null) {
+            return;
+        }
+        String[] classes = new String[]{
+                "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager",
+                "com.energy.ac020library.IrcamEngine"
+        };
+        for (String name : classes) {
+            try {
+                Class<?> cls = Class.forName(name, true, loader);
+                Object target = null;
+                for (Method method : cls.getMethods()) {
+                    if (method.getParameterTypes().length == 0 &&
+                            method.getName().equals("getInstance")) {
+                        target = method.invoke(null);
+                        break;
+                    }
+                }
+                if (target == null) {
+                    append(label + " callback singleton skip no getInstance " + name);
+                    continue;
+                }
+                tryInstallFrameCallback(target, callback, label + " " + name);
+            } catch (Throwable t) {
+                append(label + " callback singleton FAIL " + name +
+                        " " + formatThrowable(t));
+            }
+        }
+    }
+
+    private int tryInstallFrameCallback(Object target, Object callback, String label) {
+        if (target == null || callback == null) {
+            return 0;
+        }
+        Set<String> seen = new HashSet<>();
+        int installed = 0;
+        installed += tryInstallFrameCallbackMethods(
+                target,
+                callback,
+                label,
+                target.getClass().getMethods(),
+                seen);
+        installed += tryInstallFrameCallbackMethods(
+                target,
+                callback,
+                label,
+                target.getClass().getDeclaredMethods(),
+                seen);
+        append(label + " callback install attempts=" + installed +
+                " target=" + target.getClass().getName());
+        return installed;
+    }
+
+    private int tryInstallFrameCallbackMethods(
+            Object target,
+            Object callback,
+            String label,
+            Method[] methods,
+            Set<String> seen) {
+        int installed = 0;
+        for (Method method : methods) {
+            String key = describeMethod(method);
+            if (!seen.add(key)) {
+                continue;
+            }
+            Class<?>[] types = method.getParameterTypes();
+            if (types.length != 1 || !types[0].isInstance(callback)) {
+                continue;
+            }
+            String lower = method.getName().toLowerCase(Locale.US);
+            if (!lower.contains("callback") &&
+                    !lower.contains("listener") &&
+                    !lower.contains("frame") &&
+                    !lower.contains("data")) {
+                append(label + " callback candidate non-obvious " + describeMethod(method));
+            }
+            try {
+                method.setAccessible(true);
+                Object result = method.invoke(target, callback);
+                installed++;
+                append(label + " callback install OK " + describeMethod(method) +
+                        " result=" + describeObject(result));
+            } catch (Throwable t) {
+                append(label + " callback install FAIL " + describeMethod(method) +
+                        " " + formatThrowable(t));
+            }
+        }
+        return installed;
     }
 
     private Object waitForUsbConnected(Object usbMonitorManager, long timeoutMs) {
@@ -1078,6 +1376,14 @@ public class MainActivity extends Activity {
                     commonCalibrationDir.getAbsolutePath());
             setField(rxBaseClass, rxApp, "CALIBRATION_DATA_EXCEPTION_LOG",
                     new File(calibrationDir, "CalibrationDataLog.txt").getAbsolutePath());
+            trySetField(rxBaseClass, rxApp, "ISP_SWITCH_PATH",
+                    new File(deviceDir, "isp_switch.json").getAbsolutePath());
+            trySetField(rxBaseClass, rxApp, "ISP_STATIC_LIB_PATH",
+                    new File(deviceDir, "isp_static_lib.json").getAbsolutePath());
+            trySetField(rxBaseClass, rxApp, "ISP_H_PATH",
+                    new File(deviceDir, "isp_H.json").getAbsolutePath());
+            trySetField(rxBaseClass, rxApp, "ISP_L_PATH",
+                    new File(deviceDir, "isp_L.json").getAbsolutePath());
             setField(rxBaseClass, rxApp, "DATA_FILE_SAVE_PATH", pictures.getAbsolutePath());
             setField(rxBaseClass, rxApp, "isNeedReadCalData", false);
             Object result = rxBaseClass.getMethod("getInstance").invoke(null);
@@ -1198,6 +1504,140 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable t) {
             append("targetEnum FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void dumpThermoVueClassIndex(ClassLoader loader) {
+        append("===== ThermoVue relevant DEX class index =====");
+        DexFile dexFile = null;
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(THERMOVUE_PACKAGE, 0);
+            dexFile = new DexFile(packageInfo.applicationInfo.sourceDir);
+            Enumeration<String> entries = dexFile.entries();
+            int total = 0;
+            int relevant = 0;
+            int logged = 0;
+            Set<String> highSignalClasses = new HashSet<>();
+            while (entries.hasMoreElements()) {
+                String name = entries.nextElement();
+                total++;
+                if (!matchesRelevantClassName(name)) {
+                    continue;
+                }
+                relevant++;
+                if (isHighSignalClassName(name)) {
+                    highSignalClasses.add(name);
+                }
+                if (logged < 260) {
+                    logged++;
+                    append("dexClassRelevant " + name);
+                }
+            }
+            append("dexClassIndex total=" + total +
+                    " relevant=" + relevant +
+                    " logged=" + logged +
+                    " highSignal=" + highSignalClasses.size());
+
+            List<String> sorted = new ArrayList<>(highSignalClasses);
+            Collections.sort(sorted);
+            int signatures = 0;
+            for (String name : sorted) {
+                if (signatures >= 70) {
+                    append("dexSignature truncated remaining=" + (sorted.size() - signatures));
+                    break;
+                }
+                dumpCompactClassSignature(loader, name);
+                signatures++;
+            }
+        } catch (Throwable t) {
+            append("dexClassIndex FAIL " + formatThrowable(t));
+        } finally {
+            if (dexFile != null) {
+                try {
+                    dexFile.close();
+                } catch (Throwable ignored) {
+                    // DEX index logging is best-effort only.
+                }
+            }
+        }
+    }
+
+    private boolean matchesRelevantClassName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.contains("thermal") ||
+                lower.contains("thermo") ||
+                lower.contains("ircam") ||
+                lower.contains("uvc") ||
+                lower.contains("usb") ||
+                lower.contains("tiny2c") ||
+                lower.contains("dual") ||
+                lower.contains("fusion") ||
+                lower.contains("frame") ||
+                lower.contains("temp") ||
+                lower.contains("camera") ||
+                lower.contains("preview") ||
+                lower.contains("calibration") ||
+                lower.contains("pallete") ||
+                lower.contains("palette");
+    }
+
+    private boolean isHighSignalClassName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.contains("ircam") ||
+                lower.contains("iirframe") ||
+                lower.contains("uvc") ||
+                lower.contains("tiny2c") ||
+                lower.contains("dualfusion") ||
+                lower.contains("dualmodule") ||
+                lower.contains("usbmonitor") ||
+                lower.contains("framecallback") ||
+                lower.contains("previewmanager") ||
+                lower.contains("devicecontrol");
+    }
+
+    private void dumpCompactClassSignature(ClassLoader loader, String name) {
+        try {
+            Class<?> cls = Class.forName(name, false, loader);
+            append("dexSignature " + name +
+                    " constructors=" + cls.getDeclaredConstructors().length +
+                    " methods=" + cls.getDeclaredMethods().length +
+                    " fields=" + cls.getDeclaredFields().length);
+            int constructorCount = 0;
+            for (java.lang.reflect.Constructor<?> constructor : cls.getDeclaredConstructors()) {
+                append("dexConstructor " + name + " " + describeConstructor(constructor));
+                constructorCount++;
+                if (constructorCount >= 5) {
+                    append("dexConstructor " + name + " truncated");
+                    break;
+                }
+            }
+            int methodCount = 0;
+            for (Method method : cls.getDeclaredMethods()) {
+                String lower = method.getName().toLowerCase(Locale.US);
+                if (lower.contains("preview") ||
+                        lower.contains("frame") ||
+                        lower.contains("surface") ||
+                        lower.contains("callback") ||
+                        lower.contains("handle") ||
+                        lower.contains("init") ||
+                        lower.contains("start") ||
+                        lower.contains("stop") ||
+                        lower.contains("open") ||
+                        lower.contains("close") ||
+                        lower.contains("usb") ||
+                        lower.contains("uvc") ||
+                        lower.contains("data") ||
+                        lower.contains("temp")) {
+                    append("dexMethod " + name + " " + describeMethod(method));
+                    methodCount++;
+                    if (methodCount >= 16) {
+                        append("dexMethod " + name + " truncated");
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            append("dexSignature FAIL " + name + " " + formatThrowable(t));
         }
     }
 
@@ -1513,6 +1953,17 @@ public class MainActivity extends Activity {
         field.set(target, value);
     }
 
+    private void trySetField(Class<?> owner, Object target, String name, Object value) {
+        try {
+            setField(owner, target, name, value);
+            append("trySetField OK " + owner.getName() + "." + name +
+                    "=" + describeObject(value));
+        } catch (Throwable t) {
+            append("trySetField skip " + owner.getName() + "." + name +
+                    " " + formatThrowable(t));
+        }
+    }
+
     private boolean isThermalDevice(UsbDevice device) {
         return (device.getVendorId() == THERMAL_VENDOR_ID &&
                 device.getProductId() == THERMAL_PRODUCT_ID) ||
@@ -1531,6 +1982,44 @@ public class MainActivity extends Activity {
                 " interfaces=" + device.getInterfaceCount();
     }
 
+    private String describeUsbEndpoint(UsbEndpoint endpoint) {
+        if (endpoint == null) {
+            return "null";
+        }
+        return "address=0x" + Integer.toHexString(endpoint.getAddress()) +
+                " number=" + endpoint.getEndpointNumber() +
+                " direction=" + endpointDirectionName(endpoint.getDirection()) +
+                " type=" + endpointTypeName(endpoint.getType()) +
+                " maxPacket=" + endpoint.getMaxPacketSize() +
+                " interval=" + endpoint.getInterval();
+    }
+
+    private String endpointDirectionName(int direction) {
+        if (direction == UsbConstants.USB_DIR_IN) {
+            return "IN";
+        }
+        if (direction == UsbConstants.USB_DIR_OUT) {
+            return "OUT";
+        }
+        return "0x" + Integer.toHexString(direction);
+    }
+
+    private String endpointTypeName(int type) {
+        if (type == UsbConstants.USB_ENDPOINT_XFER_CONTROL) {
+            return "CONTROL";
+        }
+        if (type == UsbConstants.USB_ENDPOINT_XFER_ISOC) {
+            return "ISO";
+        }
+        if (type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+            return "BULK";
+        }
+        if (type == UsbConstants.USB_ENDPOINT_XFER_INT) {
+            return "INT";
+        }
+        return "0x" + Integer.toHexString(type);
+    }
+
     private String describeObject(Object object) {
         if (object == null) {
             return "null";
@@ -1539,6 +2028,79 @@ public class MainActivity extends Activity {
             return describeBytes((byte[]) object);
         }
         return object.getClass().getName() + ":" + object;
+    }
+
+    private String describeArgs(Object[] args) {
+        if (args == null || args.length == 0) {
+            return "[]";
+        }
+        StringBuilder builder = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            Object arg = args[i];
+            if (arg instanceof byte[]) {
+                builder.append("byte[]{").append(describeBytes((byte[]) arg)).append('}');
+            } else if (arg instanceof int[]) {
+                builder.append("int[]{len=").append(((int[]) arg).length).append('}');
+            } else if (arg instanceof short[]) {
+                builder.append("short[]{len=").append(((short[]) arg).length).append('}');
+            } else if (arg instanceof float[]) {
+                builder.append("float[]{len=").append(((float[]) arg).length).append('}');
+            } else if (arg instanceof double[]) {
+                builder.append("double[]{len=").append(((double[]) arg).length).append('}');
+            } else {
+                builder.append(describeObject(arg));
+            }
+        }
+        return builder.append(']').toString();
+    }
+
+    private byte[] findRenderableFrameArg(Object[] args) {
+        if (args == null) {
+            return null;
+        }
+        for (Object arg : args) {
+            if (arg instanceof byte[]) {
+                byte[] frame = chooseRenderableFrame((byte[]) arg, null);
+                if (frame != null) {
+                    return frame;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Object defaultReturnValue(Class<?> type) {
+        if (type == Void.TYPE) {
+            return null;
+        }
+        if (type == Boolean.TYPE) {
+            return false;
+        }
+        if (type == Byte.TYPE) {
+            return (byte) 0;
+        }
+        if (type == Short.TYPE) {
+            return (short) 0;
+        }
+        if (type == Integer.TYPE) {
+            return 0;
+        }
+        if (type == Long.TYPE) {
+            return 0L;
+        }
+        if (type == Float.TYPE) {
+            return 0.0f;
+        }
+        if (type == Double.TYPE) {
+            return 0.0d;
+        }
+        if (type == Character.TYPE) {
+            return (char) 0;
+        }
+        return null;
     }
 
     private String describeBytes(byte[] bytes) {
@@ -1553,12 +2115,58 @@ public class MainActivity extends Activity {
         return "len=" + bytes.length + " checksum1024=0x" + Integer.toHexString(checksum);
     }
 
+    private String checksumHex(byte[] bytes, int length) {
+        if (bytes == null) {
+            return "null";
+        }
+        int checksum = 0;
+        int limit = Math.max(0, Math.min(length, bytes.length));
+        for (int i = 0; i < limit; i++) {
+            checksum = (checksum + (bytes[i] & 0xff)) & 0xffff;
+        }
+        return "0x" + Integer.toHexString(checksum);
+    }
+
+    private String hexPrefix(byte[] bytes, int length) {
+        if (bytes == null) {
+            return "null";
+        }
+        int limit = Math.max(0, Math.min(length, bytes.length));
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            int value = bytes[i] & 0xff;
+            if (value < 16) {
+                builder.append('0');
+            }
+            builder.append(Integer.toHexString(value));
+        }
+        if (limit < bytes.length) {
+            builder.append(" ...");
+        }
+        return builder.toString();
+    }
+
     private String describeMethod(Method method) {
         StringBuilder builder = new StringBuilder(method.getReturnType().getName())
                 .append(' ')
                 .append(method.getName())
                 .append('(');
         Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(types[i].getName());
+        }
+        return builder.append(')').toString();
+    }
+
+    private String describeConstructor(java.lang.reflect.Constructor<?> constructor) {
+        StringBuilder builder = new StringBuilder(constructor.getName()).append('(');
+        Class<?>[] types = constructor.getParameterTypes();
         for (int i = 0; i < types.length; i++) {
             if (i > 0) {
                 builder.append(',');
