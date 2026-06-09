@@ -36,6 +36,16 @@ public final class UsbShellHelper {
             String packageName = args.length > 1 ? args[1] : BRIDGE_PACKAGE;
             long timeoutMs = args.length > 2 ? Long.parseLong(args[2]) : 15000L;
             grantThermalDeviceToPackage(binder, packageName, timeoutMs);
+        } else if ("changenode-inspect".equals(command)) {
+            String node = args.length > 1
+                    ? args[1]
+                    : "/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode";
+            inspectChangeNode(node);
+        } else if ("changenode-write".equals(command)) {
+            if (args.length < 3) {
+                throw new IllegalArgumentException("Usage: changenode-write <node> <data>");
+            }
+            writeChangeNode(args[1], args[2]);
         } else if ("inspect".equals(command)) {
             // Inspection only.
         } else {
@@ -180,6 +190,38 @@ public final class UsbShellHelper {
         grant.invoke(proxy, thermalDevice, uid);
         System.out.println("grantThermal OK package=" + packageName +
                 " uid=" + uid + " device=" + thermalDevice.getDeviceName());
+    }
+
+    private static Object getChangeNodeService() throws Exception {
+        Class<?> changeNodeClass =
+                Class.forName("vendor.yft.hardware.changenode.V1_0.IChangeNode");
+        Method getService = changeNodeClass.getMethod("getService");
+        Object service = getService.invoke(null);
+        if (service == null) {
+            throw new IllegalStateException("IChangeNode.getService returned null");
+        }
+        System.out.println("changeNodeService=" + service);
+        return service;
+    }
+
+    private static void inspectChangeNode(String node) throws Exception {
+        Object service = getChangeNodeService();
+        Method contains = findMethod(service.getClass(), "is_node_contain", 1);
+        Object result = contains.invoke(service, node);
+        System.out.println("changeNode is_node_contain node=" + node + " result=" + result);
+    }
+
+    private static void writeChangeNode(String node, String data) throws Exception {
+        Object service = getChangeNodeService();
+        Method contains = findMethod(service.getClass(), "is_node_contain", 1);
+        Object before = contains.invoke(service, node);
+        System.out.println("changeNode before node=" + node + " result=" + before);
+        Method change = findMethod(service.getClass(), "change_node_data", 2);
+        Object writeResult = change.invoke(service, node, data);
+        System.out.println("changeNode write node=" + node +
+                " data=" + data + " result=" + writeResult);
+        Object after = contains.invoke(service, node);
+        System.out.println("changeNode after node=" + node + " result=" + after);
     }
 
     private static UsbDevice findThermalDevice(Object usbProxy) throws Exception {

@@ -49,6 +49,11 @@ Thermal is the high-value but privileged stream:
   sysfs power/mux nodes.
 - Latest side-loaded exact-startup test still ended with `ctrlBlock=null`,
   `frameCount=0`, `rawTemp=null`, and `remapTemp=null`.
+- FactoryMode can power/connect the module from its privileged thermal test,
+  but the activity is not exported and the vendor `IChangeNode` HAL is blocked
+  to shell/normal apps by SELinux.
+- Starting our bridge immediately after FactoryMode connects the module still
+  produced no reusable raw thermal stream.
 - Frida/in-process hooking targets the real ThermoVue PID but is blocked on the
   production phone by no root, no debuggable target, and no usable frida-server.
 - Production-quality raw thermal requires a vendor SDK/API, root, platform

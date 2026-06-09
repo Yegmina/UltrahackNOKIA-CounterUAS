@@ -676,6 +676,115 @@ Public information found so far matches the local reverse-engineering result:
   <https://pypi.org/project/pythermal/0.2.2/> and
   <https://pypi.org/project/tiny-thermal-camera/>
 
+## 2026-06-09 FactoryMode / IChangeNode HAL Probe
+
+FactoryMode confirms the vendor thermal power/control path but does not expose a
+normal-app bridge.
+
+Observed on the connected Armor 28 Ultra:
+
+```text
+FactoryMode package: com.yft.factorymode
+FactoryMode SELinux context: u:r:platform_app:s0:...
+ThermoVue package: com.energy.tc2c
+ThermoVue SELinux context: u:r:platform_app:s0:...
+Thermal module: /dev/bus/usb/001/002 VID=0x3474 PID=0x4321
+```
+
+The decompiled FactoryMode thermal test uses the same Tiny2C power nodes:
+
+```text
+/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode
+/sys/class/yft_extcon/tiny2c_mode
+```
+
+`InfirayEcoTest` writes those nodes, registers `USBMonitor`, receives
+`onAttach` / `onGranted` / `onConnect`, and creates an `IrcamEngine` with:
+
+```text
+streamWidth=256
+streamHeight=384
+driverType=USB
+frameOutputFormat=YUYV_AND_TEMP_OUTPUT
+```
+
+It then checks calibration with `advFileRead` and its preview button only
+launches ThermoVue/Infisense. It is therefore a useful proof that the internal
+thermal module is UVC-like and vendor-controlled, but not a reusable frame export
+API.
+
+Direct shell launch of the test activity is blocked:
+
+```text
+am start -n com.yft.factorymode/.InfirayEcoTest
+SecurityException: Activity not exported from uid 10074
+```
+
+Launching the FactoryMode menu and tapping `Thermal Camera module` works because
+the activity is started from inside the privileged FactoryMode process. Logs then
+show:
+
+```text
+FM/InfirayEcoTest: USBMonitor want to register
+USBMonitor: processAttach
+FM/InfirayEcoTest: USBMonitor->onAttach
+FM/InfirayEcoTest: USBMonitor->onGranted
+USBMonitor: processConnect
+FM/InfirayEcoTest: USBMonitor->onConnect
+libuvc/device: bNumInterfaces=2
+```
+
+The phone also has a vendor HAL:
+
+```text
+vendor.yft.hardware.changenode@1.0::IChangeNode/default
+methods:
+  int change_node_data(String node, String data)
+  String is_node_contain(String node)
+```
+
+The `android_usb_shell_helper` now includes:
+
+```text
+changenode-inspect <node>
+changenode-write <node> <data>
+```
+
+Running those commands from `app_process` with FactoryMode's APK on the
+classpath proves the SELinux gate:
+
+```text
+avc: denied { find } for interface=vendor.yft.hardware.changenode::IChangeNode
+sid=u:r:shell:s0
+tcontext=u:object_r:hal_changenode_hwservice:s0
+tclass=hwservice_manager
+```
+
+So the HAL route is real, but shell and side-loaded apps cannot call it.
+
+We also tested a FactoryMode race/bridge handoff:
+
+1. Start FactoryMode.
+2. Tap `Thermal Camera module`.
+3. Wait for FactoryMode `USBMonitor->onConnect`.
+4. Start `thermovue-bridge-probe` in privileged exact-startup mode.
+
+Result:
+
+```text
+self context=u:r:untrusted_app:s0:...
+sysfsWrite FAIL ... EACCES
+ExactPro Android USB thermal device not visible after GPIO power-up
+ExactPro vendor wait connected=false ctrlBlock=null
+Tiny2C poll 0..19 frameCount=0 firstFrame=0 rawTemp=null remapTemp=null
+thermal_frame_evidence_validator: FAIL
+```
+
+This rules out the quick workaround where FactoryMode powers the sensor and our
+normal APK steals or reuses the stream. The remaining clean routes are
+platform/vendor signing, root/in-process instrumentation, or an official SDK/API
+that runs in the same privilege class as ThermoVue/FactoryMode.
+
 ## Practical Next Steps
 
 Best clean route:

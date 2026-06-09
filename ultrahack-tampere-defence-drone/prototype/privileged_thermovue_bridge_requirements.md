@@ -161,6 +161,61 @@ Tiny2C poll 0 frameCount=0 ... rawTemp=null
 That failure is useful: it proves the bridge is testing the same privilege gates
 that a Ulefone-signed/system build must pass.
 
+## FactoryMode / Changenode Requirement
+
+The connected phone contains a privileged FactoryMode thermal test:
+
+```text
+com.yft.factorymode/.InfirayEcoTest
+```
+
+When launched through FactoryMode's own menu, that test can power the thermal
+module and reaches:
+
+```text
+USBMonitor->onAttach
+USBMonitor->onGranted
+USBMonitor->onConnect
+libuvc/device: bNumInterfaces=2
+```
+
+The same test is not exported, so shell cannot launch it directly. FactoryMode
+also confirms the vendor-side thermal node HAL:
+
+```text
+vendor.yft.hardware.changenode@1.0::IChangeNode/default
+change_node_data(String node, String data)
+is_node_contain(String node)
+```
+
+Shell/app_process with FactoryMode's APK on the classpath is still denied:
+
+```text
+avc: denied { find } for interface=vendor.yft.hardware.changenode::IChangeNode
+sid=u:r:shell:s0
+tcontext=u:object_r:hal_changenode_hwservice:s0
+```
+
+So the minimum vendor ask is one of:
+
+```text
+1. sign our bridge with the same platform/vendor key and install it as a
+   platform/system app that can write Tiny2C sysfs nodes and use MANAGE_USB;
+2. ship a tiny vendor-signed bridge service that exposes thermal frames or safe
+   start/stop/read-frame methods to our app;
+3. add an SELinux/package policy that lets our bridge call IChangeNode and open
+   the internal thermal USB device.
+```
+
+The FactoryMode race test did not work as a workaround. Even after FactoryMode
+connected the thermal module, starting our normal bridge produced:
+
+```text
+ExactPro Android USB thermal device not visible after GPIO power-up
+ExactPro vendor wait connected=false ctrlBlock=null
+Tiny2C poll frameCount=0 rawTemp=null remapTemp=null
+```
+
 SELinux package-name shortcut check:
 
 - `/system/etc/selinux/plat_seapp_contexts` has the normal `seinfo=platform`

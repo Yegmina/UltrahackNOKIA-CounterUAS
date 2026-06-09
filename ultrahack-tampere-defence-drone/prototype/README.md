@@ -102,6 +102,17 @@ UID 2000, optionally tries shell-side Tiny2C sysfs power writes, and tries the
 same Tiny2C startup sequence. Use `-NoSysfsPower` if ThermoVue should be the only
 process touching the power path during a test.
 
+Probe the vendor Tiny2C `IChangeNode` HAL from shell/app_process:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_usb_shell_helper.ps1
+adb push prototype\android_usb_shell_helper\build\usb-shell-helper.dex /data/local/tmp/usb-shell-helper.dex
+adb shell 'CLASSPATH=/system/app/FactoryMode/FactoryMode.apk:/data/local/tmp/usb-shell-helper.dex app_process /system/bin com.yegmina.usbshellhelper.UsbShellHelper changenode-inspect /sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode'
+```
+
+On the stock phone this is expected to fail with an SELinux `hal_changenode`
+denial; a vendor/platform route should be able to call it.
+
 To wait for the phone authorization prompt and automatically run a test:
 
 ```powershell

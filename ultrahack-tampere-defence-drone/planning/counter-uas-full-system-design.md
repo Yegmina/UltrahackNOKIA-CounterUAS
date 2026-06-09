@@ -62,6 +62,13 @@ As of 2026-06-09, ADB works with the connected Armor 28 Ultra Thermal:
   side-loaded app still cannot read or write the Tiny2C sysfs power/mux nodes.
 - Latest exact-startup bridge result:
   `ctrlBlock=null`, `frameCount=0`, `rawTemp=null`, `remapTemp=null`.
+- FactoryMode's privileged `InfirayEcoTest` can power the module and reach
+  `USBMonitor->onConnect`, proving the internal thermal UVC path, but it is not
+  exported and does not provide a raw-frame API to normal apps.
+- The vendor `IChangeNode` HAL exists for Tiny2C node control, but shell and
+  side-loaded apps are denied by SELinux before they can call it.
+- A FactoryMode power-up followed by starting our bridge was tested and still
+  produced `ctrlBlock=null`, `frameCount=0`, and no raw thermal buffers.
 - Frida targeting now selects the real `com.energy.tc2c` PID first, but attach
   is blocked on this production phone because `ro.debuggable=0`, `su` is
   unavailable, and no reachable frida-server is running.
@@ -141,7 +148,8 @@ Raw thermal frame target:
 
 - Sensor-like temp frame: around 256x192x2 bytes.
 - Use frame timestamp and checksum in UDP metadata.
-- Jetson visualizes thermal as false-color heatmap.
+- Jetson preserves the raw uint16 thermal frame for detection and visualizes a
+  copy as a false-color heatmap only for the operator display.
 
 ### Audio
 
