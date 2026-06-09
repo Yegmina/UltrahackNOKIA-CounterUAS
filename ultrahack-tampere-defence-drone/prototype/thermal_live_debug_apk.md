@@ -19,10 +19,11 @@ live thermal frames into its own UI.
 6. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
 7. Tap `Start SDK`.
 
-If live thermal frames are available, the preview panel will show a false-color
-256x192 heatmap with min/max/mean/FPS status. If not, the log panel should show
-where the path failed: USB visibility, permission, ThermoVue package loading,
-native init, preview start, or frame polling.
+If live thermal frames are available, the preview panel will show the real
+256x192 thermal value matrix rendered with a color palette, plus min/max/mean/FPS
+status. If not, the log panel should show where the path failed: USB visibility,
+permission, ThermoVue package loading, native init, preview start, or frame
+polling.
 
 `Share Log` sends the visible debug log text through Android's share sheet.
 

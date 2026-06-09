@@ -132,6 +132,7 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.BLACK);
+        root.setPadding(0, dp(28), 0, 0);
         root.addView(buttonScroll, new LinearLayout.LayoutParams(-1, -2));
         root.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
         root.addView(preview, new LinearLayout.LayoutParams(-1, 0, 1.0f));
