@@ -24,6 +24,13 @@ Keep large datasets out of git unless explicitly needed.
 - [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
 - [thermal_live_debug_apk.md](thermal_live_debug_apk.md) documents the standalone on-phone APK for testing whether live thermal frames can be shown inside our own app.
 
+When ADB is unavailable but the phone is visible as MTP storage, use:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action CopyApk
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action PullLogs
+```
+
 Install prototype dependencies:
 
 ```powershell

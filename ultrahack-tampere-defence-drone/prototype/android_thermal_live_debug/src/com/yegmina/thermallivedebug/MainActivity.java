@@ -79,6 +79,7 @@ import dalvik.system.DexFile;
 
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
+    private static final String BUILD_MARKER = "thermal-live-debug 2026-06-09 mtp-http-engine-probe";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermallivedebug.USB_PERMISSION";
@@ -125,11 +126,28 @@ public class MainActivity extends Activity {
         runDir.mkdirs();
         logFile = new File(runDir, "thermal_live_debug.log");
         append("logFile=" + logFile.getAbsolutePath());
+        append("build=" + BUILD_MARKER);
         append("uid=" + Process.myUid() + " package=" + getPackageName());
+        appendSelfPackageInfo();
         append("device=" + Build.MANUFACTURER + " " + Build.MODEL +
                 " sdk=" + Build.VERSION.SDK_INT);
         requestAppPermissions();
         startHttpServer();
+    }
+
+    private void appendSelfPackageInfo() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+            append("selfPackage versionCode=" + getLongVersionCode(info) +
+                    " firstInstall=" + formatTime(info.firstInstallTime) +
+                    " lastUpdate=" + formatTime(info.lastUpdateTime));
+        } catch (Throwable t) {
+            append("selfPackage info FAIL " + formatThrowable(t));
+        }
+    }
+
+    private String formatTime(long millis) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date(millis));
     }
 
     private void buildUi() {

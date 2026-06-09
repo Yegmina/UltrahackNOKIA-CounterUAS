@@ -48,6 +48,38 @@ Use modes so the demo keeps working even when one sensor path fails:
 The operator UI should show the active mode and sensor health so a missing
 thermal stream does not look like a detector failure.
 
+## Current Phone Access Status
+
+As of 2026-06-09, laptop-to-phone USB storage access works, but ADB is not
+usable in the current Windows USB mode:
+
+- MTP can copy APKs to `Download` and pull
+  `Android/data/com.yegmina.thermallivedebug/files` logs.
+- `adb devices` is empty even though Windows shows an `ADB Interface` for
+  `VID_0E8D&PID_201D&MI_01`.
+- The currently pulled app logs are from an older installed build. They prove
+  ThermoVue SDK classes load and our app can reach a non-null USB
+  `UsbControlBlock`, but they still show `frameCount=0`, `rawTemp=null`, and
+  `remapTemp=null`.
+- Native thermal frames are not yet verified. Treat `native_thermal` as the
+  primary technical risk until the latest APK logs show a real frame or callback.
+
+Decision tree for the hackathon:
+
+```text
+Can latest APK install and run?
+  yes -> run Engine Probe / Native Auto -> pull logs over MTP or HTTP
+  no  -> use RGB + audio MVP while fixing ADB/USB mode
+
+Do latest logs show raw/remap thermal frames?
+  yes -> stream /latest.raw or UDP into Jetson fusion
+  no  -> keep thermal as research path, demo RGB/audio/fusion
+
+Can phone stream RGB/audio reliably?
+  yes -> main live demo is phone sensor head + Jetson detector
+  no  -> use replay/demo mode and focus on fusion/tracking UI
+```
+
 ## MVP Decision
 
 Use the Jetson as the main compute device.

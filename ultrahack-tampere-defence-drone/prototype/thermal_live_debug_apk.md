@@ -101,3 +101,27 @@ timeout so the dialog should not loop forever.
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_thermal_live_debug.ps1
 ```
+
+## USB Without ADB
+
+If Windows sees the phone over USB/MTP but `adb devices` is empty, use the MTP
+helper:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action CopyApk
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action PullLogs
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action PullCapture
+```
+
+`CopyApk` only places the APK in the phone `Download` folder. Install/open it on
+the phone, then use `PullLogs` to bring the debug sessions back to the laptop.
+
+Current Windows observation for the Ulefone connection:
+
+- MTP works and exposes `Armor 28 Ultra` shared storage.
+- The connected USB mode is `VID_0E8D&PID_201D`.
+- Windows shows `USB\VID_0E8D&PID_201D&MI_01` as a generic `WinUsb Device /
+  ADB Interface`, but `adb devices` still returns an empty list.
+- The registry also contains an older Android ADB interface entry for
+  `VID_0E8D&PID_201C`, so if ADB is needed, try changing the phone USB mode
+  from file-transfer/MTP to another debugging-capable mode and reconnecting.
