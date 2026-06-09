@@ -2226,7 +2226,9 @@ public class MainActivity extends Activity {
     private void dumpClassesOnly() {
         append("===== manual class dump =====");
         try {
-            dumpImportantClasses(getThermoVueClassLoader(), true);
+            DexClassLoader loader = getThermoVueClassLoader();
+            dumpImportantClasses(loader, true);
+            dumpTargetedReverseEngineeringHints(loader);
         } catch (Throwable t) {
             append("manual class dump FAIL " + formatThrowable(t));
         }
@@ -2256,7 +2258,7 @@ public class MainActivity extends Activity {
                 for (Method method : cls.getDeclaredMethods()) {
                     append("classMethod " + name + " " + describeMethod(method));
                     count++;
-                    if (count >= 24) {
+                    if (count >= 500) {
                         append("classMethod " + name + " truncated");
                         break;
                     }
