@@ -1,6 +1,6 @@
 # ThermoVue Pro Reverse-Engineering Notes
 
-Date: 2026-06-07
+Date: 2026-06-09
 
 Scope: benign interoperability analysis for reading the Ulefone Armor 28 Ultra Thermal sensor feed for our Counter-UAV prototype. This note avoids copying vendor source or native binaries into the project.
 
@@ -198,6 +198,67 @@ vendor object creation, but cannot keep the Tiny2C module alive or take over
 the active frame stream on this production phone. Raw thermal access requires a
 vendor-supported bridge, privileged/platform install, root, or an in-process
 hook inside ThermoVue.
+
+### 2026-06-09 Exact ThermoVue Pro Startup Clone
+
+The bridge APK now has a `privileged-exact-startup` path that mirrors the
+decompiled ThermoVue Pro `StartPreviewTask` order:
+
+```text
+USBMonitorManager.init/registerMonitor
+Tiny2CDualFusionProxy.startRestartTimer
+GPIOUtils.powerUpControl / Tiny2C sysfs writes
+wait up to 9000 ms for USBMonitorManager.isDeviceConnected
+MImageUtils.MRun3(MNN_SR_TINY2C)
+MImageUtils.initMNNModelModule(...)
+MImageUtils.MRun1(MNN_SR_TINY2C, 4, 2, 5)
+Tiny2CDualFusionProxy.initData()
+Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)
+poll getFrameCount/getRawTempData/getRemapTempData
+```
+
+Connected-phone result as a side-loaded APK:
+
+```text
+self uid=10305 package=com.yegmina.thermovuebridgeprobe
+context=u:r:untrusted_app:s0:...
+AUDIT_SYSFS tiny2c_usb_mode ... EACCES
+AUDIT_SYSFS tiny2c_mode ... EACCES
+sysfsWrite FAIL ... tiny2c_usb_mode ... EACCES
+sysfsWrite FAIL ... tiny2c_mode ... EACCES
+ExactPro Android USB thermal device not visible after GPIO power-up
+ExactPro vendorUsbConnected=false ctrlBlock=null
+MNNModelModule MRun3 result=-4
+MNNModelModule init result=-3
+MNNModelModule MRun1 result=-4
+ExactPro initHandleEngine skipped because ctrlBlock=null
+ExactPro direct initHandle frameSeen=false
+ExactPro worker StartPreviewTask frameSeen=false
+DeviceControl explicit startPreview frameSeen=false
+```
+
+This is stronger than the earlier broad reflection probes: the startup order is
+now aligned with ThermoVue, and the remaining standalone bridge blocker is the
+app privilege domain needed to power/mux the internal Tiny2C USB module.
+
+### 2026-06-09 Frida/In-Process Hook Test
+
+The Frida bridge now targets the exact Android PID from `pidof com.energy.tc2c`
+before falling back to fuzzy process-name matching. The connected phone still
+blocks attach:
+
+```text
+ro.debuggable: 0
+shell id: ... context=u:r:shell:s0
+su: unavailable or not root
+Using Android pidof target: com.energy.tc2c pid=12226
+Attaching Frida to com.energy.tc2c pid=12226...
+Bridge could not attach/run: unable to connect to remote frida-server: closed
+```
+
+The hook code remains the best fast proof path if a rooted/debuggable device,
+engineering image, Frida Gadget build, or vendor-approved instrumentation route
+becomes available.
 
 ### USB Permission Handler Test
 

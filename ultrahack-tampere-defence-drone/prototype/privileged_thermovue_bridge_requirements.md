@@ -1,6 +1,6 @@
 # Privileged ThermoVue Bridge Requirements
 
-Date: 2026-06-08
+Date: 2026-06-09
 
 Goal: run our own Android bridge that powers the Ulefone Armor 28 Ultra Thermal
 Tiny2C module, opens the internal UVC thermal USB device, receives the same
@@ -67,6 +67,47 @@ The bridge now attempts this fixed-handler setup in privileged mode. On the
 stock side-loaded build, the app cannot complete it, but the system/framework
 path is confirmed by decompilation.
 
+## 2026-06-09 Side-Loaded Exact-Startup Validation
+
+Build marker:
+
+```text
+thermovue-bridge-probe 2026-06-09 privileged-exact-startup
+```
+
+The bridge now runs the same high-level order as ThermoVue Pro's
+`StartPreviewTask`:
+
+```text
+USBMonitorManager.init/registerMonitor
+Tiny2CDualFusionProxy.startRestartTimer
+GPIOUtils.powerUpControl / Tiny2C sysfs power attempt
+wait up to 9000 ms for USBMonitorManager.isDeviceConnected
+MImageUtils.MRun3/initMNNModelModule/MRun1
+Tiny2CDualFusionProxy.initData
+Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)
+poll getFrameCount/getRawTempData/getRemapTempData
+```
+
+Current connected-phone result as a normal side-loaded APK:
+
+```text
+self context=u:r:untrusted_app:s0:...
+sysfsWrite FAIL ... tiny2c_usb_mode ... EACCES
+sysfsWrite FAIL ... tiny2c_mode ... EACCES
+ExactPro Android USB thermal device not visible after GPIO power-up
+ExactPro vendorUsbConnected=false ctrlBlock=null
+ExactPro initHandleEngine skipped because ctrlBlock=null
+ExactPro direct initHandle frameSeen=false
+ExactPro worker StartPreviewTask frameSeen=false
+DeviceControl explicit startPreview frameSeen=false
+```
+
+This is now a clean validation target: the same APK should change from
+`untrusted_app`/`EACCES`/`ctrlBlock=null` to sysfs OK, USB connected, non-null
+`ctrlBlock`, and non-empty frame data when installed through a real
+platform/privileged route.
+
 ## Validation Command Sequence
 
 After Ulefone provides a privileged/signed route, validate with:
@@ -112,7 +153,8 @@ On the stock side-loaded phone build, the expected failure is:
 ```text
 sysfsWrite FAIL ... EACCES (Permission denied)
 waitForThermalUsb timeout
-privileged bridge FAIL thermal USB did not appear after power-up
+ExactPro Android USB thermal device not visible after GPIO power-up
+ExactPro vendorUsbConnected=false ctrlBlock=null
 Tiny2C poll 0 frameCount=0 ... rawTemp=null
 ```
 

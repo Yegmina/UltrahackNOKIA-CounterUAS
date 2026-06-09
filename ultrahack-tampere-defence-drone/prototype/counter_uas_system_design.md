@@ -44,8 +44,13 @@ Thermal is the high-value but privileged stream:
 
 - ThermoVue proves the raw module produces 256x192 thermal planes at about
   25 fps inside the vendor app.
-- A normal side-loaded APK cannot currently keep the Tiny2C thermal USB module
-  powered or take over the stream after ThermoVue exits.
+- The latest bridge APK matches ThermoVue Pro's startup order, but a normal
+  side-loaded APK still runs as `untrusted_app` and cannot read/write the Tiny2C
+  sysfs power/mux nodes.
+- Latest side-loaded exact-startup test still ended with `ctrlBlock=null`,
+  `frameCount=0`, `rawTemp=null`, and `remapTemp=null`.
+- Frida/in-process hooking targets the real ThermoVue PID but is blocked on the
+  production phone by no root, no debuggable target, and no usable frida-server.
 - Production-quality raw thermal requires a vendor SDK/API, root, platform
   signing, or an in-process ThermoVue hook.
 - Screen capture of ThermoVue can be used only as a demo fallback, not as raw
@@ -94,5 +99,6 @@ can rotate:
 
 Do not depend on raw thermal for the first demo milestone. The real thermal
 feed is technically reachable only past a privilege boundary on the current
-phone firmware. Build the fusion pipeline so thermal can plug in later through
-the existing UDP/raw-frame receiver.
+phone firmware. Build and demo RGB + audio + tracking first, and keep the
+thermal UDP/raw-frame receiver as the integration point for vendor/platform
+access.

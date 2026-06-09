@@ -25,11 +25,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -55,6 +58,8 @@ import dalvik.system.DexClassLoader;
 
 public class MainActivity extends Activity {
     private static final String TAG = "ThermoVueBridgeProbe";
+    private static final String BUILD_MARKER =
+            "thermovue-bridge-probe 2026-06-09 privileged-exact-startup";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermovuebridgeprobe.USB_PERMISSION";
@@ -140,6 +145,7 @@ public class MainActivity extends Activity {
         runDir.mkdirs();
         logFile = new File(runDir, "thermovue_bridge_probe.log");
 
+        append("build=" + BUILD_MARKER);
         append("logFile=" + logFile.getAbsolutePath());
         append("manualMode=" + manualMode);
         append("privilegedMode=" + privilegedMode);
@@ -352,6 +358,7 @@ public class MainActivity extends Activity {
         append("device=" + Build.MANUFACTURER + " " + Build.MODEL +
                 " sdk=" + Build.VERSION.SDK_INT);
         append("===== Privileged raw thermal bridge candidate =====");
+        auditBridgePrivileges();
         try {
             DexClassLoader loader = getThermoVueClassLoader();
             probeClassLoading(loader);
@@ -360,23 +367,15 @@ public class MainActivity extends Activity {
             initializeRxBaseApplication(loader);
 
             attemptSetFixedUsbHandler("privileged bridge");
-            powerThermalModuleViaSysfs("privileged bridge");
-            powerThermalModuleViaVendor("privileged bridge");
-            UsbDevice thermalDevice = waitForThermalUsb(10000);
-            if (thermalDevice == null) {
-                append("privileged bridge FAIL thermal USB did not appear after power-up");
+            boolean exactSawFrame = runExactThermoVueProStartup(loader);
+            probeAndroidUsb("privileged bridge after exact startup");
+            probeVendorUsbMonitor(loader, "privileged bridge after exact startup");
+            if (exactSawFrame) {
+                append("privileged bridge exact startup produced thermal frame evidence");
             } else {
-                UsbManager usbManager = (UsbManager) getSystemService(USB_SERVICE);
-                append("privileged bridge thermalUsb=" + describeUsbDevice(thermalDevice) +
-                        " hasPermissionBeforeGrant=" + usbManager.hasPermission(thermalDevice));
-                attemptHiddenUsbGrant(usbManager, thermalDevice);
-                append("privileged bridge hasPermissionAfterGrant=" +
-                        usbManager.hasPermission(thermalDevice));
+                append("privileged bridge exact startup did not produce frames; running broad fallback probes");
+                probeTiny2cDeviceControlPath(loader);
             }
-
-            probeAndroidUsb("privileged bridge after power-up");
-            probeVendorUsbMonitor(loader, "privileged bridge after power-up");
-            probeTiny2cDeviceControlPath(loader);
         } catch (Throwable t) {
             append("PRIVILEGED FATAL " + formatThrowable(t));
         }
@@ -537,6 +536,240 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             append("GPIOUtils.powerUpControl FAIL " + formatThrowable(t));
         }
+    }
+
+    private boolean runExactThermoVueProStartup(ClassLoader loader) {
+        append("===== ThermoVue Pro exact startup clone =====");
+        Object proxy = null;
+        Object usbMonitorManager = null;
+        Object deviceControlManager = null;
+        boolean sawFrame = false;
+        try {
+            Class<?> proxyClass = Class.forName(
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy", true, loader);
+            proxy = proxyClass.getMethod("getInstance").invoke(null);
+            Method init = proxyClass.getMethod(
+                    "init",
+                    Context.class,
+                    int.class,
+                    int.class,
+                    float.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    int.class,
+                    int.class);
+            init.invoke(proxy, this, 256, 386, 1.0f, 25, "0", 1440, 1080, 25);
+            append("ExactPro Tiny2C init invoked");
+            tryInvoke(proxy, "resetIsFirstFrame");
+            tryInvoke(proxy, "cancelFrameDataCheck");
+            tryInvokeBoolean(proxy, "setHasAPPKilled", false);
+            tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
+            tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
+
+            Class<?> usbMonitorManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
+            usbMonitorManager = usbMonitorManagerClass.getMethod("getInstance").invoke(null);
+            tryInvoke(usbMonitorManager, "destroyMonitor");
+            tryInvoke(usbMonitorManager, "init");
+            tryInvoke(usbMonitorManager, "registerMonitor");
+
+            Class<?> deviceControlManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    true,
+                    loader);
+            deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            tryInvoke(deviceControlManager, "release");
+            tryInvoke(deviceControlManager, "init");
+
+            tryInvoke(proxy, "startRestartTimer");
+            powerThermalModuleViaSysfs("exact Pro startup");
+            powerThermalModuleViaVendor("exact Pro startup");
+            sleepMs(500);
+
+            UsbDevice thermalDevice = waitForThermalUsb(9000);
+            if (thermalDevice == null) {
+                append("ExactPro Android USB thermal device not visible after GPIO power-up");
+            } else {
+                UsbManager usbManager = (UsbManager) getSystemService(USB_SERVICE);
+                append("ExactPro Android thermalUsb=" + describeUsbDevice(thermalDevice) +
+                        " hasPermissionBeforeGrant=" + usbManager.hasPermission(thermalDevice));
+                attemptHiddenUsbGrant(usbManager, thermalDevice);
+                append("ExactPro Android hasPermissionAfterGrant=" +
+                        usbManager.hasPermission(thermalDevice));
+            }
+
+            boolean vendorConnected = waitForVendorUsbConnected(usbMonitorManager, 9000);
+            Object ctrlBlock = tryInvoke(usbMonitorManager, "getCtrlBlock");
+            append("ExactPro vendorUsbConnected=" + vendorConnected +
+                    " ctrlBlock=" + describeObject(ctrlBlock));
+
+            initializeMnnModelModule(loader);
+            tryInvoke(proxy, "initData");
+            if (ctrlBlock != null) {
+                try {
+                    Class<?> ctrlBlockClass = Class.forName(
+                            "com.energy.iruvccamera.usb.USBMonitor$UsbControlBlock",
+                            false,
+                            loader);
+                    Object initHandleResult = invoke(
+                            proxy,
+                            "initHandleEngine",
+                            new Class[]{ctrlBlockClass, boolean.class},
+                            ctrlBlock,
+                            true);
+                    append("ExactPro initHandleEngine(ctrlBlock,true) result=" +
+                            describeObject(initHandleResult));
+                } catch (Throwable t) {
+                    append("ExactPro initHandleEngine(ctrlBlock,true) FAIL " +
+                            formatThrowable(t));
+                }
+            } else {
+                append("ExactPro initHandleEngine skipped because ctrlBlock=null");
+            }
+
+            sleepMs(1500);
+            sawFrame = pollTiny2c(proxy);
+            append("ExactPro direct initHandle frameSeen=" + sawFrame);
+            if (!sawFrame) {
+                Class<?> modeClass = Class.forName(
+                        "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
+                Object mode = enumValue(modeClass, "MODE_DUAL_FUSION");
+                Method handleStartPreview = proxyClass.getMethod("handleStartPreview", modeClass);
+                handleStartPreview.invoke(proxy, mode);
+                append("ExactPro fallback handleStartPreview MODE_DUAL_FUSION invoked");
+                sleepMs(12000);
+                sawFrame = pollTiny2c(proxy);
+                append("ExactPro worker StartPreviewTask frameSeen=" + sawFrame);
+            }
+            if (keepStreaming) {
+                streamTiny2c(proxy);
+            }
+        } catch (Throwable t) {
+            append("ExactPro startup FAIL " + formatThrowable(t));
+        } finally {
+            if (proxy != null) {
+                tryInvoke(proxy, "cancelRestartTimer");
+                tryInvoke(proxy, "stopPreview");
+                tryInvoke(proxy, "releaseSource");
+            }
+            if (deviceControlManager != null) {
+                tryInvoke(deviceControlManager, "release");
+            }
+            if (usbMonitorManager != null) {
+                tryInvoke(usbMonitorManager, "unregisterMonitor");
+                tryInvoke(usbMonitorManager, "destroyMonitor");
+            }
+        }
+        return sawFrame;
+    }
+
+    private boolean waitForVendorUsbConnected(Object usbMonitorManager, long timeoutMs) {
+        append("ExactPro wait vendor USBMonitor.isDeviceConnected timeoutMs=" + timeoutMs);
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long nextStatusLog = 0;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Object connected = invoke(usbMonitorManager, "isDeviceConnected");
+                Object ctrlBlock = invoke(usbMonitorManager, "getCtrlBlock");
+                long now = System.currentTimeMillis();
+                if (now >= nextStatusLog) {
+                    append("ExactPro vendor wait connected=" + connected +
+                            " ctrlBlock=" + describeObject(ctrlBlock));
+                    nextStatusLog = now + 1000;
+                }
+                if (Boolean.TRUE.equals(connected)) {
+                    return true;
+                }
+            } catch (Throwable t) {
+                append("ExactPro vendor wait FAIL " + formatThrowable(t));
+                return false;
+            }
+            sleepMs(50);
+        }
+        return false;
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private void initializeMnnModelModule(ClassLoader loader) {
+        append("===== MNNModelModule warm-up =====");
+        try {
+            Class<?> imageClass = Class.forName(
+                    "com.energy.mnnmodellibrary.MImageUtils", true, loader);
+            Class<?> modelClass = Class.forName(
+                    "com.energy.mnnmodellibrary.MImageUtils$ModelName", true, loader);
+            Object model = Enum.valueOf((Class<? extends Enum>) modelClass.asSubclass(Enum.class),
+                    "MNN_SR_TINY2C");
+            Method mRun3 = imageClass.getMethod("MRun3", modelClass);
+            Method init = imageClass.getMethod("initMNNModelModule", Context.class);
+            Method mRun1 = imageClass.getMethod(
+                    "MRun1", modelClass, int.class, int.class, int.class);
+            Context context = getApplicationContext();
+            try {
+                Class<?> rxBaseClass = Class.forName(
+                        "com.energy.baselibrary.base.RXBaseApplication", true, loader);
+                Object rxApp = rxBaseClass.getMethod("getInstance").invoke(null);
+                if (rxApp instanceof Context) {
+                    context = (Context) rxApp;
+                }
+            } catch (Throwable t) {
+                append("MNNModelModule RXBaseApplication context fallback " + formatThrowable(t));
+            }
+            append("MNNModelModule MRun3 result=" + describeObject(mRun3.invoke(null, model)));
+            append("MNNModelModule init result=" + describeObject(init.invoke(null, context)));
+            append("MNNModelModule MRun1 result=" +
+                    describeObject(mRun1.invoke(null, model, 4, 2, 5)));
+        } catch (Throwable t) {
+            append("MNNModelModule warm-up FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void auditBridgePrivileges() {
+        append("===== Bridge privilege audit =====");
+        append("self uid=" + Process.myUid() +
+                " package=" + getPackageName() +
+                " context=" + readSmallTextFile("/proc/self/attr/current"));
+        auditPackage(getPackageName(), "Bridge self");
+        auditPackage(THERMOVUE_PACKAGE, "ThermoVue Pro");
+        auditSysfsPath(TINY2C_USB_MODE_PATH, "tiny2c_usb_mode");
+        auditSysfsPath(TINY2C_EXTCON_MODE_PATH, "tiny2c_mode");
+        auditSysfsPath(
+                "/sys/devices/platform/yft_tiny2c_usb/sensor_id",
+                "Tiny2C sensor_id");
+        append("Privilege target: platform/priv-app install should not show untrusted_app " +
+                "and should be able to write Tiny2C sysfs before exact startup.");
+    }
+
+    private void auditPackage(String packageName, String label) {
+        append("AUDIT_PACKAGE " + label + " package=" + packageName);
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(packageName, 0);
+            ApplicationInfo appInfo = packageInfo.applicationInfo;
+            int privateFlags = getIntField(appInfo, "privateFlags", -1);
+            append("  sourceDir=" + appInfo.sourceDir);
+            append("  nativeLibraryDir=" + appInfo.nativeLibraryDir);
+            append("  uid=" + appInfo.uid +
+                    " flags=0x" + Integer.toHexString(appInfo.flags) +
+                    " privateFlags=0x" + Integer.toHexString(privateFlags));
+            append("  system=" + ((appInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) +
+                    " updatedSystem=" +
+                    ((appInfo.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) +
+                    " debug=" + ((appInfo.flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0));
+            append("  version=" + packageInfo.versionName +
+                    " code=" + getLongVersionCode(packageInfo));
+        } catch (Throwable t) {
+            append("  package audit FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void auditSysfsPath(String path, String label) {
+        File file = new File(path);
+        append("AUDIT_SYSFS " + label + " path=" + path);
+        append("  exists=" + file.exists() +
+                " canRead=" + file.canRead() +
+                " canWrite=" + file.canWrite() +
+                " canExecute=" + file.canExecute());
+        append("  value=" + readSmallTextFile(path));
     }
 
     private void inspectUsbAttachIntent(String label, Intent intent) {
@@ -1556,6 +1789,39 @@ public class MainActivity extends Activity {
             return info.getLongVersionCode();
         }
         return info.versionCode;
+    }
+
+    private int getIntField(Object target, String name, int fallback) {
+        try {
+            Field field = target.getClass().getField(name);
+            field.setAccessible(true);
+            return field.getInt(target);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private String readSmallTextFile(String path) {
+        File file = new File(path);
+        if (!file.exists()) {
+            return "missing";
+        }
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new FileInputStream(file)))) {
+            StringBuilder builder = new StringBuilder();
+            String line;
+            int lines = 0;
+            while ((line = reader.readLine()) != null && lines < 4) {
+                if (builder.length() > 0) {
+                    builder.append(" | ");
+                }
+                builder.append(line);
+                lines++;
+            }
+            return builder.length() == 0 ? "empty" : builder.toString();
+        } catch (Throwable t) {
+            return "read FAIL " + formatThrowable(t);
+        }
     }
 
     private void sleepMs(long ms) {

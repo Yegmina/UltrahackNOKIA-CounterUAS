@@ -50,26 +50,32 @@ thermal stream does not look like a detector failure.
 
 ## Current Phone Access Status
 
-As of 2026-06-09, laptop-to-phone USB storage access works, but ADB is not
-usable in the current Windows USB mode:
+As of 2026-06-09, ADB works with the connected Armor 28 Ultra Thermal:
 
-- MTP can copy APKs to `Download` and pull
-  `Android/data/com.yegmina.thermallivedebug/files` logs.
-- `adb devices` is empty even though Windows shows an `ADB Interface` for
-  `VID_0E8D&PID_201D&MI_01`.
-- The currently pulled app logs are from an older installed build. They prove
-  ThermoVue SDK classes load and our app can reach a non-null USB
-  `UsbControlBlock`, but they still show `frameCount=0`, `rawTemp=null`, and
-  `remapTemp=null`.
-- Native thermal frames are not yet verified. Treat `native_thermal` as the
-  primary technical risk until the latest APK logs show a real frame or callback.
+- ADB serial: `5011AF1010013479`.
+- ThermoVue package: `com.energy.tc2c`.
+- Internal thermal USB device, when ThermoVue powers it:
+  `VID=0x3474 PID=0x4321`.
+- Our side-loaded bridge app runs as `u:r:untrusted_app:s0`, while ThermoVue
+  runs as `u:r:platform_app:s0`.
+- The bridge now follows the exact ThermoVue Pro startup order, but a
+  side-loaded app still cannot read or write the Tiny2C sysfs power/mux nodes.
+- Latest exact-startup bridge result:
+  `ctrlBlock=null`, `frameCount=0`, `rawTemp=null`, `remapTemp=null`.
+- Frida targeting now selects the real `com.energy.tc2c` PID first, but attach
+  is blocked on this production phone because `ro.debuggable=0`, `su` is
+  unavailable, and no reachable frida-server is running.
+
+Native thermal frames are not yet verified. Treat `native_thermal` as the
+primary technical risk until a privileged/platform bridge, vendor SDK, root, or
+in-process hook produces real `IIrFrameCallback` bytes.
 
 Decision tree for the hackathon:
 
 ```text
 Can latest APK install and run?
-  yes -> run Engine Probe / Native Auto -> pull logs over MTP or HTTP
-  no  -> use RGB + audio MVP while fixing ADB/USB mode
+  yes -> run privileged/exact bridge probe and pull logs over ADB
+  no  -> use RGB + audio MVP while fixing Android install/debug access
 
 Do latest logs show raw/remap thermal frames?
   yes -> stream /latest.raw or UDP into Jetson fusion
@@ -114,11 +120,11 @@ Target:
 
 ### Thermal / IR
 
-Current best native route:
+Current best native route if vendor/platform privilege is available:
 
 ```text
-ThermoVue powers internal Tiny2C USB module
-ADB shell helper grants USB permission to bridge app
+Privileged bridge powers internal Tiny2C USB module
+Bridge receives/grants USB permission for VID 0x3474 PID 0x4321
 Bridge loads ThermoVue SDK classes
 Bridge gets USB ctrlBlock
 Bridge initializes Tiny2C/IrcamEngine
@@ -349,27 +355,35 @@ What is already proven:
 
 - ThermoVue powers the internal thermal USB module.
 - Internal USB device appears as VID `0x3474`, PID `0x4321`.
-- Android fixed USB handler can grant our bridge app permission.
+- Android fixed USB handler is present in framework code and is the right
+  vendor/system route for package-level USB grants.
 - Shell-side `IUsbManager.grantDevicePermission` can grant the thermal USB device to our bridge while ThermoVue stays foreground.
 - The bridge can load ThermoVue SDK classes.
 - The bridge can get a vendor `USBMonitor$UsbControlBlock`.
 - `USBMonitorManager` can reach `connected=true` with a non-null control block.
+- The bridge now has a privileged/exact startup mode that follows ThermoVue
+  Pro's decompiled order: USB monitor register, Tiny2C GPIO power, 9000 ms USB
+  wait, MNN warm-up, `initData`, and `initHandleEngine(ctrlBlock, true)`.
 
-Current missing piece:
+Current missing pieces:
 
-- Raw frame counters still stay at zero until the bridge exactly matches ThermoVue's `initHandleEngine` / `startPreview` sequence.
-- Live tests require the phone to be ADB-authorized; when Android reports the device as `unauthorized`, all on-device retry paths are blocked before they reach ThermoVue.
+- Standalone bridge mode cannot power the sensor as a side-loaded APK because
+  Tiny2C sysfs access returns `EACCES`.
+- ThermoVue-foreground takeover can see/grant/open the USB device, but our
+  separate process still gets `frameCount=0`, `rawTemp=null`, and
+  `remapTemp=null`.
+- Frida/in-process hooking is ready in code but blocked by the production phone
+  state: no root, no debuggable target, no usable frida-server.
 
-Next thermal test:
+Next thermal unlock path:
 
 ```text
-watchUsb bridge mode
-launch ThermoVue
-grant thermal USB to bridge
-USBMonitorManager gets ctrlBlock
-bridge calls Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)
-bridge calls startPreview
-bridge polls getFrameCount/getRawTempData
+vendor SDK or platform-signed bridge
+  -> app runs in platform/privileged domain
+  -> sysfs power writes succeed
+  -> USB ctrlBlock becomes non-null without ThermoVue owning the stream
+  -> Tiny2C initHandleEngine/startVideoStream produces frames
+  -> UDP raw thermal frames feed Jetson fusion
 ```
 
 ## Risk Register

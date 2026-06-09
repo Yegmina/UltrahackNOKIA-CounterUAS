@@ -276,19 +276,19 @@ def run_bridge(args: argparse.Namespace) -> int:
     try:
         print("Connecting to Frida USB device...")
         device = frida.get_usb_device(timeout=args.frida_timeout)
-        pid = find_process(device, args.package)
-        if pid is None:
-            pid = adb_pidof(adb, serial, args.package)
-            if pid is not None:
-                print(f"Using Android pidof fallback: {args.package} pid={pid}")
+        pid = adb_pidof(adb, serial, args.package)
+        if pid is not None:
+            print(f"Using Android pidof target: {args.package} pid={pid}")
+        else:
+            pid = find_process(device, args.package)
         if pid is None:
             print(f"Process {args.package} was not found. Launching ThermoVue and retrying...")
             launch_thermovue(adb, serial, args.launch_delay)
-            pid = find_process(device, args.package)
-            if pid is None:
-                pid = adb_pidof(adb, serial, args.package)
-                if pid is not None:
-                    print(f"Using Android pidof fallback: {args.package} pid={pid}")
+            pid = adb_pidof(adb, serial, args.package)
+            if pid is not None:
+                print(f"Using Android pidof target: {args.package} pid={pid}")
+            else:
+                pid = find_process(device, args.package)
         if pid is None:
             print(f"Still cannot find process {args.package}.")
             return 1

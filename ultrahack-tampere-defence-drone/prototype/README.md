@@ -63,6 +63,21 @@ Run the side-loaded APK privilege/clone audit and pull the log:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_privilege_audit.ps1
 ```
 
+Run the bridge's exact ThermoVue Pro startup clone path:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_thermovue_bridge_probe.ps1
+adb install -r prototype\android_thermovue_bridge_probe\build\thermovue-bridge-probe.apk
+adb shell pm grant com.yegmina.thermovuebridgeprobe android.permission.CAMERA
+adb shell pm grant com.yegmina.thermovuebridgeprobe android.permission.RECORD_AUDIO
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true --ei udpMaxFrames 1
+```
+
+On the stock side-loaded phone build this should still fail at
+`untrusted_app`/Tiny2C `EACCES`/`ctrlBlock=null`. If a vendor/platform install
+route is available, this is the first command path that should change to real
+thermal frames.
+
 The watch and shell bridge runners invoke `thermal_frame_evidence_validator.py`
 after pulling their logs, so a real run reports whether the saved output proves
 live, non-empty thermal frames.
