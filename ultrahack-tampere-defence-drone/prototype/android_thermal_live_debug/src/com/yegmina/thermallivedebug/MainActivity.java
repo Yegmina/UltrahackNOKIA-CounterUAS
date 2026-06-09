@@ -121,6 +121,8 @@ public class MainActivity extends Activity {
     private volatile boolean httpServerRunning;
     private volatile ServerSocket httpServerSocket;
     private volatile long vendorCtrlBlockDelayBeforeInitMs;
+    private volatile boolean vendorCtrlBlockForceOpenWithoutPermission;
+    private volatile boolean vendorCtrlBlockSkipUsbPermissionRequest;
     private SurfaceTexture vendorSurfaceTexture;
     private Surface vendorSurface;
     private DexClassLoader thermoVueLoader;
@@ -206,6 +208,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("Engine Probe", view -> startEngineProbe()));
         buttons.addView(button("Native CAM", view -> startTargetedNativeCamProbe()));
         buttons.addView(button("CtrlBlock", view -> startVendorControlBlockProbe()));
+        buttons.addView(button("ForceOpen", view -> startVendorControlBlockForceOpenProbe()));
         buttons.addView(button("Takeover", view -> startVendorControlBlockTakeoverProbe()));
         buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
         buttons.addView(button("Cap TVue", view -> requestThermoVueScreenCapture()));
@@ -1452,8 +1455,24 @@ public class MainActivity extends Activity {
         }
         foregroundThermoVueTest = false;
         vendorCtrlBlockDelayBeforeInitMs = 0;
+        vendorCtrlBlockForceOpenWithoutPermission = false;
+        vendorCtrlBlockSkipUsbPermissionRequest = false;
         running = true;
         setStatus("vendor ctrlBlock running");
+        startThread(this::runVendorControlBlockProbe);
+    }
+
+    private void startVendorControlBlockForceOpenProbe() {
+        if (running) {
+            append("vendor ctrlBlock force-open already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        vendorCtrlBlockDelayBeforeInitMs = 0;
+        vendorCtrlBlockForceOpenWithoutPermission = true;
+        vendorCtrlBlockSkipUsbPermissionRequest = true;
+        running = true;
+        setStatus("ctrlBlock force-open running");
         startThread(this::runVendorControlBlockProbe);
     }
 
@@ -1464,6 +1483,8 @@ public class MainActivity extends Activity {
         }
         foregroundThermoVueTest = false;
         vendorCtrlBlockDelayBeforeInitMs = 6000;
+        vendorCtrlBlockForceOpenWithoutPermission = false;
+        vendorCtrlBlockSkipUsbPermissionRequest = false;
         running = true;
         setStatus("ctrlBlock takeover running");
         startThread(this::runVendorControlBlockProbe);
@@ -2179,15 +2200,21 @@ public class MainActivity extends Activity {
             } catch (Throwable t) {
                 append("CTRLBLOCK hidden grant attempt FAIL " + formatThrowable(t));
             }
-            if (!manager.hasPermission(thermal)) {
+            boolean forceOpenWithoutPermission = vendorCtrlBlockForceOpenWithoutPermission;
+            boolean skipUsbPermissionRequest = vendorCtrlBlockSkipUsbPermissionRequest;
+            if (!manager.hasPermission(thermal) && skipUsbPermissionRequest) {
+                append("CTRLBLOCK skipping Android USB permission request for force-open diagnostic");
+            } else if (!manager.hasPermission(thermal)) {
                 append("CTRLBLOCK requesting app USB permission for " + describeUsbDevice(thermal));
                 requestUsbPermissionAndWait(manager, thermal);
             }
             append("CTRLBLOCK Android UsbManager.hasPermission=" + manager.hasPermission(thermal));
-            if (!manager.hasPermission(thermal)) {
+            if (!manager.hasPermission(thermal) && !forceOpenWithoutPermission) {
                 append("CTRLBLOCK stop: app still has no USB permission");
                 setStatus("ctrlBlock no usb permission");
                 return;
+            } else if (!manager.hasPermission(thermal)) {
+                append("CTRLBLOCK force-open diagnostic: continuing to vendor USBMonitor.openDevice without Android USB permission");
             }
 
             Class<?> listenerClass = Class.forName(
@@ -2322,6 +2349,8 @@ public class MainActivity extends Activity {
             liveUsbMonitorManager = null;
             liveDeviceControlManager = null;
             vendorCtrlBlockDelayBeforeInitMs = 0;
+            vendorCtrlBlockForceOpenWithoutPermission = false;
+            vendorCtrlBlockSkipUsbPermissionRequest = false;
             append("===== vendor USBMonitor ctrlBlock probe finished sawFrame=" +
                     sawFrame + " =====");
         }
@@ -4558,6 +4587,9 @@ public class MainActivity extends Activity {
             } else if ("/start-ctrlblock".equals(path)) {
                 runOnUiThread(this::startVendorControlBlockProbe);
                 writeHttpText(output, 202, "Accepted", "vendor ctrlBlock probe started\n", "text/plain");
+            } else if ("/start-ctrlblock-force-open".equals(path)) {
+                runOnUiThread(this::startVendorControlBlockForceOpenProbe);
+                writeHttpText(output, 202, "Accepted", "vendor ctrlBlock force-open started\n", "text/plain");
             } else if ("/start-ctrlblock-takeover".equals(path)) {
                 runOnUiThread(this::startVendorControlBlockTakeoverProbe);
                 writeHttpText(output, 202, "Accepted", "vendor ctrlBlock takeover started\n", "text/plain");
@@ -4602,6 +4634,7 @@ public class MainActivity extends Activity {
                 "<p><a href=\"/start-engine\">Start Engine Probe</a></p>" +
                 "<p><a href=\"/start-native-cam\">Start Targeted Native CAM</a></p>" +
                 "<p><a href=\"/start-ctrlblock\">Start Vendor CtrlBlock</a></p>" +
+                "<p><a href=\"/start-ctrlblock-force-open\">Start CtrlBlock ForceOpen</a></p>" +
                 "<p><a href=\"/start-ctrlblock-takeover\">Start CtrlBlock Takeover</a></p>" +
                 "<p><a href=\"/start-native-auto\">Start Native Auto</a></p>" +
                 "<p><a href=\"/stop\">Stop</a></p>" +

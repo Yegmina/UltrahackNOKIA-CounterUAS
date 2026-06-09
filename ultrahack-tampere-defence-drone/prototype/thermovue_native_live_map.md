@@ -159,6 +159,10 @@ Verified on the stock phone:
 - Hidden `UsbManager` grant attempts fail because `MANAGE_USB` is not granted to
   the side-loaded APK, and `cmd usb` exposes no shell permission command on this
   build.
+- A force-open diagnostic that skips the Android permission request and calls
+  ThermoVue's bundled `USBMonitor.openDevice(...)` directly still fails inside
+  vendor code:
+  `java.lang.SecurityException: has no permission at ...USBMonitor.openDevice`.
 
 ## Best Next Live Routes
 
@@ -167,7 +171,9 @@ Verified on the stock phone:
    `UsbControlBlock` is non-null and `IIrFrameCallback.onFrame` increments.
 2. **In-process hook:** root/Frida/Xposed/LSPosed module inside
    `com.energy.tc2c`, hook `UvcNativeCamDualFusionPreviewManager$3.onFrame`,
-   and forward the raw frame bytes.
+   and forward the raw frame bytes. A buildable Xposed/LSPosed forwarder now
+   exists under `android_thermovue_xposed_bridge`; see
+   `thermovue_xposed_bridge.md`.
 3. **Native FD bridge:** if an official permission path can open the internal
    USB device for our UID, pass the resulting FD/bus/dev/usbfs values through
    `USB_DUAL_NATIVE_CAM` and call `startVideoStream()`.

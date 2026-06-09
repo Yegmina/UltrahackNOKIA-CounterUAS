@@ -46,10 +46,14 @@ the current Tiny2C privilege/clone diagnostic.
 13. Tap `CtrlBlock` to shell-grant the thermal USB device first, then create a
    real vendor `USBMonitor.UsbControlBlock` and call
    `Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)`.
-14. Tap `Takeover` for a controlled ownership-transition test. It opens the
+14. Tap `ForceOpen` to skip the Android USB permission request and directly
+   test whether ThermoVue's bundled `USBMonitor.openDevice(...)` can open the
+   visible internal USB device without `UsbManager.hasPermission(...)`. This is
+   a diagnostic only; expected stock-phone result is `openDevice` failure.
+15. Tap `Takeover` for a controlled ownership-transition test. It opens the
    vendor `UsbControlBlock` while ThermoVue has powered the module, waits six
    seconds so the host can stop ThermoVue, then tries the same proxy startup.
-15. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
+16. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
     from the laptop.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
@@ -145,6 +149,10 @@ not obtain frames inside our side-loaded app:
   manufacturer `Thermal Cam Co.,Ltd` and serial `202206223`.
 - `Native CAM` can build `IrcamEngine`, receive `initHandle` success, install
   `IIrFrameCallback`, and call `startVideoStream`, but no frame callback fires.
+- `ForceOpen` exists to verify whether the vendor `USBMonitor` can bypass
+  Android's USB permission gate when ThermoVue keeps the module visible.
+  Current result: it cannot. ThermoVue's bundled `USBMonitor.openDevice(...)`
+  throws `java.lang.SecurityException: has no permission`.
 - While ThermoVue remains foreground, it owns the active stream. When ThermoVue
   is force-stopped, the thermal USB module disappears from normal app view
   (`usbDeviceCount=0`), and `initHandleEngine(ctrlBlock, true)` returns `false`.

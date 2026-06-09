@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ThermoVue Frame Forwarder</string>
+    <string name="xposed_description">Hooks ThermoVue IR frame callbacks and forwards raw thermal planes over UDP.</string>
+</resources>
