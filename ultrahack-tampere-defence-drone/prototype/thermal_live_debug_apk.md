@@ -25,6 +25,11 @@ status. If not, the log panel should show where the path failed: USB visibility,
 permission, ThermoVue package loading, native init, preview start, or frame
 polling.
 
+If the log shows `connected=true` with a non-null `UsbControlBlock`, USB access
+is at least partly working. If it still shows `frameCount=0 rawTemp=null`, the
+app is blocked later in the ThermoVue/Tiny2C preview engine. The APK then tries
+explicit `initHandleEngine(ctrlBlock, true)` and `startPreview()` fallbacks.
+
 `Share Log` sends the visible debug log text through Android's share sheet.
 
 ## Build

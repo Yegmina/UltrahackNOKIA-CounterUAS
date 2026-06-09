@@ -132,7 +132,7 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.BLACK);
-        root.setPadding(0, dp(28), 0, 0);
+        root.setPadding(0, dp(72), 0, 0);
         root.addView(buttonScroll, new LinearLayout.LayoutParams(-1, -2));
         root.addView(statusText, new LinearLayout.LayoutParams(-1, -2));
         root.addView(preview, new LinearLayout.LayoutParams(-1, 0, 1.0f));
@@ -353,6 +353,8 @@ public class MainActivity extends Activity {
         Object deviceControlManager = null;
         long firstFrameAt = 0;
         int renderedFrames = 0;
+        boolean explicitInitTried = false;
+        boolean explicitStartTried = false;
         try {
             DexClassLoader loader = getThermoVueClassLoader();
             initializeMmkv(loader);
@@ -444,7 +446,36 @@ public class MainActivity extends Activity {
                             " remapTemp=" + describeBytes(remapTemp) +
                             " connected=" + describeObject(connected) +
                             " ctrlBlock=" + describeObject(ctrlBlock));
-                    if (frame == null) {
+                    boolean fallbackAction = false;
+                    if (frame == null && ctrlBlock != null && !explicitInitTried) {
+                        explicitInitTried = true;
+                        fallbackAction = true;
+                        setStatus("trying explicit engine init");
+                        append("fallback: explicit initData/initHandleEngine because ctrlBlock exists but no frames");
+                        tryInvoke(proxy, "initData");
+                        try {
+                            Class<?> ctrlBlockClass = Class.forName(
+                                    "com.energy.iruvccamera.usb.USBMonitor$UsbControlBlock",
+                                    false,
+                                    loader);
+                            Object result = invoke(
+                                    proxy,
+                                    "initHandleEngine",
+                                    new Class[]{ctrlBlockClass, boolean.class},
+                                    ctrlBlock,
+                                    true);
+                            append("fallback initHandleEngine OK result=" + describeObject(result));
+                        } catch (Throwable t) {
+                            append("fallback initHandleEngine FAIL " + formatThrowable(t));
+                        }
+                    } else if (frame == null && explicitInitTried && !explicitStartTried) {
+                        explicitStartTried = true;
+                        fallbackAction = true;
+                        setStatus("trying explicit startPreview");
+                        append("fallback: explicit startPreview because engine init still has no frames");
+                        tryInvoke(proxy, "startPreview");
+                    }
+                    if (frame == null && !fallbackAction) {
                         setStatus("no thermal frames yet");
                     }
                 }
