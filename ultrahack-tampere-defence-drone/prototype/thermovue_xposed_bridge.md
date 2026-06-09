@@ -38,6 +38,32 @@ py -3 prototype\thermal_udp_receiver.py --host 0.0.0.0 --port 25000
 py -3 prototype\counter_uas_fusion_node.py --thermal-port 25000
 ```
 
+The bridge also has optional deeper forwarding for validating "same as
+ThermoVue" access. The raw ThermoVue callback contains:
+
+```text
+[ir_u16le 98304][info 1024][temp_u16le 98304][visible_rgb 4665600]
+```
+
+By default these larger payloads are disabled so the phone does not flood the
+network. Enable them only while validating a privileged/in-process build:
+
+```bash
+adb shell setprop debug.yegmina.thermal_ir_every 25
+adb shell setprop debug.yegmina.thermal_packet_every 100
+```
+
+- `thermal_ir_every=N` sends the 256x192 raw IR plane every `N` raw callback
+  frames using `YEGMINA_THERMAL_FRAME_V2 kind=ir_u16le`.
+- `thermal_packet_every=N` sends the full ThermoVue raw callback packet every
+  `N` raw callback frames using
+  `YEGMINA_THERMAL_FRAME_V2 kind=thermovue_raw_packet`.
+
+`prototype/thermal_udp_receiver.py` now reassembles both the original V1
+temperature stream and these optional V2 payloads. For full raw packets it saves
+the binary payload and extracts the embedded temperature plane for immediate
+preview.
+
 ## Build
 
 ```powershell
@@ -58,6 +84,8 @@ The hook reads debug system properties from inside the ThermoVue process:
 adb shell setprop debug.yegmina.thermal_host <jetson-ip-or-broadcast>
 adb shell setprop debug.yegmina.thermal_port 25000
 adb shell setprop debug.yegmina.thermal_every 1
+adb shell setprop debug.yegmina.thermal_ir_every 0
+adb shell setprop debug.yegmina.thermal_packet_every 0
 ```
 
 Defaults:
@@ -65,7 +93,9 @@ Defaults:
 ```text
 host=255.255.255.255
 port=25000
-every=1
+thermal_every=1
+thermal_ir_every=0
+thermal_packet_every=0
 ```
 
 ## Stock Phone Status

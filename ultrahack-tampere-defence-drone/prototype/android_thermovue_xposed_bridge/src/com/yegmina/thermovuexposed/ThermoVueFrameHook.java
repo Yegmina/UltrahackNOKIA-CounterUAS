@@ -19,11 +19,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
     private static final String TAG = "YegminaThermoVueHook";
     private static final String MAGIC = "YEGMINA_THERMAL_RAW_V1 ";
+    private static final String MAGIC_V2 = "YEGMINA_THERMAL_FRAME_V2 ";
     private static final int WIDTH = 256;
     private static final int HEIGHT = 192;
     private static final int PLANE_BYTES = WIDTH * HEIGHT * 2;
     private static final int INFO_BYTES = 1024;
     private static final int TEMP_OFFSET = PLANE_BYTES + INFO_BYTES;
+    private static final int VISIBLE_RGB_BYTES = 1440 * 1080 * 3;
+    private static final int RAW_PACKET_BYTES = TEMP_OFFSET + PLANE_BYTES + VISIBLE_RGB_BYTES;
     private static final int FUSION_RGBA_BYTES = 1080 * 1440 * 4;
     private static final int UDP_CHUNK_BYTES = 1200;
     private static final long RAW_PREFERRED_WINDOW_MS = 2000;
@@ -149,6 +152,52 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         String host = getStringProperty("debug.yegmina.thermal_host", "255.255.255.255");
         int port = getIntProperty("debug.yegmina.thermal_port", 25000);
         SENDER.execute(() -> sendPlane(host, port, count, plane));
+
+        if (!fusionTempLayout) {
+            maybeForwardRawExtras(host, port, count, className, frame, length);
+        }
+    }
+
+    private static void maybeForwardRawExtras(
+            String host,
+            int port,
+            int frameId,
+            String className,
+            byte[] frame,
+            int length) {
+        int irEvery = getIntProperty("debug.yegmina.thermal_ir_every", 0);
+        if (irEvery > 0 && frameId % irEvery == 0) {
+            byte[] irPlane = extractIrPlane(frame, length);
+            if (irPlane != null) {
+                SENDER.execute(() -> sendPayloadV2(
+                        host,
+                        port,
+                        frameId,
+                        "ir_u16le",
+                        "u16le",
+                        WIDTH,
+                        HEIGHT,
+                        className,
+                        irPlane));
+            }
+        }
+
+        int packetEvery = getIntProperty("debug.yegmina.thermal_packet_every", 0);
+        if (packetEvery > 0 && frameId % packetEvery == 0) {
+            byte[] packet = extractRawPacket(frame, length);
+            if (packet != null) {
+                SENDER.execute(() -> sendPayloadV2(
+                        host,
+                        port,
+                        frameId,
+                        "thermovue_raw_packet",
+                        "thermovue-ir-info-temp-visible",
+                        0,
+                        0,
+                        className,
+                        packet));
+            }
+        }
     }
 
     private static byte[] extractRawPacketTempPlane(byte[] frame, int length) {
@@ -163,6 +212,25 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
             return out;
         }
         return null;
+    }
+
+    private static byte[] extractIrPlane(byte[] frame, int length) {
+        if (length >= PLANE_BYTES && frame.length >= PLANE_BYTES) {
+            byte[] out = new byte[PLANE_BYTES];
+            System.arraycopy(frame, 0, out, 0, PLANE_BYTES);
+            return out;
+        }
+        return null;
+    }
+
+    private static byte[] extractRawPacket(byte[] frame, int length) {
+        if (length < TEMP_OFFSET + PLANE_BYTES || frame.length < TEMP_OFFSET + PLANE_BYTES) {
+            return null;
+        }
+        int packetBytes = Math.min(Math.min(length, frame.length), RAW_PACKET_BYTES);
+        byte[] out = new byte[packetBytes];
+        System.arraycopy(frame, 0, out, 0, packetBytes);
+        return out;
     }
 
     private static byte[] extractFusionTempPlane(byte[] frame, int length) {
@@ -204,6 +272,75 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("udp send failed: " + t);
         }
+    }
+
+    private static void sendPayloadV2(
+            String host,
+            int port,
+            int frameId,
+            String kind,
+            String format,
+            int width,
+            int height,
+            String source,
+            byte[] payload) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.setBroadcast(true);
+            InetAddress address = InetAddress.getByName(host);
+            int chunks = (payload.length + UDP_CHUNK_BYTES - 1) / UDP_CHUNK_BYTES;
+            for (int chunk = 0; chunk < chunks; chunk++) {
+                int offset = chunk * UDP_CHUNK_BYTES;
+                int length = Math.min(UDP_CHUNK_BYTES, payload.length - offset);
+                String header = String.format(
+                        Locale.US,
+                        "%sframe=%d kind=%s chunk=%d chunks=%d offset=%d total=%d width=%d height=%d format=%s source=%s\n",
+                        MAGIC_V2,
+                        frameId,
+                        kind,
+                        chunk,
+                        chunks,
+                        offset,
+                        payload.length,
+                        width,
+                        height,
+                        format,
+                        sanitizeHeaderValue(source));
+                byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
+                byte[] packet = new byte[headerBytes.length + length];
+                System.arraycopy(headerBytes, 0, packet, 0, headerBytes.length);
+                System.arraycopy(payload, offset, packet, headerBytes.length, length);
+                socket.send(new DatagramPacket(packet, packet.length, address, port));
+            }
+            log("forwarded v2 frame=" + frameId +
+                    " kind=" + kind +
+                    " bytes=" + payload.length +
+                    " host=" + host +
+                    " port=" + port);
+        } catch (Throwable t) {
+            log("udp v2 send failed: " + t);
+        }
+    }
+
+    private static String sanitizeHeaderValue(String value) {
+        if (value == null || value.length() == 0) {
+            return "unknown";
+        }
+        StringBuilder out = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if ((ch >= 'a' && ch <= 'z') ||
+                    (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') ||
+                    ch == '.' ||
+                    ch == '_' ||
+                    ch == '-' ||
+                    ch == '$') {
+                out.append(ch);
+            } else {
+                out.append('_');
+            }
+        }
+        return out.toString();
     }
 
     private static String getStringProperty(String key, String fallback) {
