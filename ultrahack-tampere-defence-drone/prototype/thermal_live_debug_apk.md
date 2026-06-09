@@ -30,6 +30,9 @@ laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
 8. Tap `Start SDK`.
 9. Tap `Engine Probe` for a focused direct-native attempt around
    `IrcamEngine`, `IrcamEngineBuilder`, and `DualUvcHandleParam`.
+   Current builds also create a hidden `SurfaceTexture`/`Surface` and
+   reflectively attach it to vendor preview objects before starting the native
+   preview path.
 10. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
     from the laptop.
 

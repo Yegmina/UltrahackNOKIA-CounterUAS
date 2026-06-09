@@ -17,6 +17,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.hardware.usb.UsbConstants;
@@ -32,6 +33,7 @@ import android.os.Looper;
 import android.os.Process;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.Surface;
 import android.view.View;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -80,7 +82,7 @@ import dalvik.system.DexFile;
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
     private static final String BUILD_MARKER =
-            "thermal-live-debug 2026-06-09 usb-attach-endpoint-capture";
+            "thermal-live-debug 2026-06-09 hidden-preview-surface";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermallivedebug.USB_PERMISSION";
@@ -116,6 +118,8 @@ public class MainActivity extends Activity {
     private volatile long latestThermalFrameAt;
     private volatile boolean httpServerRunning;
     private volatile ServerSocket httpServerSocket;
+    private SurfaceTexture vendorSurfaceTexture;
+    private Surface vendorSurface;
     private DexClassLoader thermoVueLoader;
 
     @Override
@@ -217,6 +221,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         stopHttpServer();
+        releaseVendorPreviewSurface();
         super.onDestroy();
     }
 
@@ -242,6 +247,185 @@ public class MainActivity extends Activity {
         if (device != null && isThermalDevice(device)) {
             startThread(this::probeThermalUsbEndpoints);
         }
+    }
+
+    private synchronized Surface getVendorPreviewSurface() {
+        if (vendorSurface != null && vendorSurface.isValid()) {
+            return vendorSurface;
+        }
+        releaseVendorPreviewSurface();
+        vendorSurfaceTexture = new SurfaceTexture(0);
+        vendorSurfaceTexture.setDefaultBufferSize(1440, 1080);
+        vendorSurface = new Surface(vendorSurfaceTexture);
+        append("vendor preview surface created surfaceValid=" + vendorSurface.isValid());
+        return vendorSurface;
+    }
+
+    private synchronized void releaseVendorPreviewSurface() {
+        if (vendorSurface != null) {
+            try {
+                vendorSurface.release();
+            } catch (Throwable ignored) {
+                // Debug surface cleanup should not mask the real probe result.
+            }
+            vendorSurface = null;
+        }
+        if (vendorSurfaceTexture != null) {
+            try {
+                vendorSurfaceTexture.release();
+            } catch (Throwable ignored) {
+                // Debug surface cleanup should not mask the real probe result.
+            }
+            vendorSurfaceTexture = null;
+        }
+    }
+
+    private void attachPreviewSurfaceToThermoVueObjects(
+            ClassLoader loader,
+            String label,
+            Object... roots) {
+        Surface surface = getVendorPreviewSurface();
+        SurfaceTexture texture = vendorSurfaceTexture;
+        for (Object root : roots) {
+            attachPreviewSurface(root, surface, texture, label);
+        }
+        String[] singletonClasses = new String[]{
+                "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager",
+                "com.energy.ac020library.IrcamEngine"
+        };
+        for (String className : singletonClasses) {
+            try {
+                Class<?> cls = Class.forName(className, true, loader);
+                Object instance = null;
+                for (Method method : cls.getMethods()) {
+                    if (method.getParameterTypes().length == 0 &&
+                            method.getName().equals("getInstance")) {
+                        instance = method.invoke(null);
+                        break;
+                    }
+                }
+                attachPreviewSurface(instance, surface, texture, label + " " + className);
+            } catch (Throwable t) {
+                append(label + " surface singleton skip " + className +
+                        " " + formatThrowable(t));
+            }
+        }
+    }
+
+    private int attachPreviewSurface(
+            Object target,
+            Surface surface,
+            SurfaceTexture texture,
+            String label) {
+        if (target == null) {
+            return 0;
+        }
+        int attached = 0;
+        Class<?> cls = target.getClass();
+        for (Field field : cls.getDeclaredFields()) {
+            int modifiers = field.getModifiers();
+            if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
+                continue;
+            }
+            Object value = previewSurfaceValueForType(field.getType(), surface, texture);
+            if (value == null) {
+                continue;
+            }
+            try {
+                field.setAccessible(true);
+                field.set(target, value);
+                attached++;
+                append(label + " surface field OK " + cls.getName() +
+                        "." + describeField(field) +
+                        "=" + describeObject(value));
+            } catch (Throwable t) {
+                append(label + " surface field FAIL " + cls.getName() +
+                        "." + describeField(field) +
+                        " " + formatThrowable(t));
+            }
+        }
+
+        Set<String> seen = new HashSet<>();
+        attached += attachPreviewSurfaceMethods(target, surface, texture, label, cls.getMethods(), seen);
+        attached += attachPreviewSurfaceMethods(
+                target,
+                surface,
+                texture,
+                label,
+                cls.getDeclaredMethods(),
+                seen);
+        append(label + " surface attach attempts=" + attached +
+                " target=" + cls.getName());
+        return attached;
+    }
+
+    private int attachPreviewSurfaceMethods(
+            Object target,
+            Surface surface,
+            SurfaceTexture texture,
+            String label,
+            Method[] methods,
+            Set<String> seen) {
+        int attached = 0;
+        for (Method method : methods) {
+            String key = describeMethod(method);
+            if (!seen.add(key)) {
+                continue;
+            }
+            Class<?>[] types = method.getParameterTypes();
+            if (types.length != 1) {
+                continue;
+            }
+            Object value = previewSurfaceValueForType(types[0], surface, texture);
+            if (value == null) {
+                continue;
+            }
+            String lower = method.getName().toLowerCase(Locale.US);
+            if (!lower.contains("surface") &&
+                    !lower.contains("texture") &&
+                    !lower.contains("preview") &&
+                    !lower.contains("display") &&
+                    !lower.contains("render")) {
+                append(label + " surface method candidate non-obvious " +
+                        describeMethod(method));
+            }
+            try {
+                method.setAccessible(true);
+                Object result = method.invoke(target, value);
+                attached++;
+                append(label + " surface method OK " + describeMethod(method) +
+                        " value=" + describeObject(value) +
+                        " result=" + describeObject(result));
+            } catch (Throwable t) {
+                append(label + " surface method FAIL " + describeMethod(method) +
+                        " " + formatThrowable(t));
+            }
+        }
+        return attached;
+    }
+
+    private Object previewSurfaceValueForType(
+            Class<?> type,
+            Surface surface,
+            SurfaceTexture texture) {
+        if (surface != null && isSurfaceType(type)) {
+            return surface;
+        }
+        if (texture != null && isSurfaceTextureType(type)) {
+            return texture;
+        }
+        return null;
+    }
+
+    private boolean isSurfaceType(Class<?> type) {
+        return type == Surface.class || "android.view.Surface".equals(type.getName());
+    }
+
+    private boolean isSurfaceTextureType(Class<?> type) {
+        return type == SurfaceTexture.class ||
+                "android.graphics.SurfaceTexture".equals(type.getName());
     }
 
     private void requestAppPermissions() {
@@ -879,6 +1063,12 @@ public class MainActivity extends Activity {
             tryInvoke(deviceControlManager, "init");
             tryInstallFrameCallback(deviceControlManager, frameCallback, "SDK deviceControl");
             installFrameCallbacksOnKnownSingletons(loader, frameCallback, "SDK singleton");
+            attachPreviewSurfaceToThermoVueObjects(
+                    loader,
+                    "SDK",
+                    proxy,
+                    usbMonitorManager,
+                    deviceControlManager);
 
             Class<?> modeClass = Class.forName(
                     "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
@@ -1135,6 +1325,12 @@ public class MainActivity extends Activity {
             tryInstallFrameCallback(proxy, callback, "ENGINE proxy");
             tryInstallFrameCallback(deviceControlManager, callback, "ENGINE deviceControl");
             installFrameCallbacksOnKnownSingletons(loader, callback, "ENGINE singleton");
+            attachPreviewSurfaceToThermoVueObjects(
+                    loader,
+                    "ENGINE",
+                    proxy,
+                    usbMonitorManager,
+                    deviceControlManager);
 
             Object connected = waitForUsbConnected(usbMonitorManager, 4000);
             Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
@@ -1242,6 +1438,12 @@ public class MainActivity extends Activity {
             tryInvoke(deviceControlManager, "init");
             tryInstallFrameCallback(deviceControlManager, frameCallback, "AUTO deviceControl");
             installFrameCallbacksOnKnownSingletons(loader, frameCallback, "AUTO singleton");
+            attachPreviewSurfaceToThermoVueObjects(
+                    loader,
+                    "AUTO scenario " + scenario,
+                    proxy,
+                    usbMonitorManager,
+                    deviceControlManager);
 
             Object connected = waitForUsbConnected(usbMonitorManager, 3500);
             Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
@@ -1583,6 +1785,13 @@ public class MainActivity extends Activity {
         }
         if (type.isInstance(this)) {
             return this;
+        }
+        if (isSurfaceType(type) || isSurfaceTextureType(type)) {
+            Surface surface = getVendorPreviewSurface();
+            Object value = previewSurfaceValueForType(type, surface, vendorSurfaceTexture);
+            if (value != null) {
+                return value;
+            }
         }
         if (type == String.class) {
             String lower = name.toLowerCase(Locale.US);
