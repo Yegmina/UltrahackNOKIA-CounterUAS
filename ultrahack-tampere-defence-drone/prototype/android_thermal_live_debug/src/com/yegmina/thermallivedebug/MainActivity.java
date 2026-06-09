@@ -13,6 +13,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -20,6 +21,7 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Looper;
@@ -67,6 +69,7 @@ public class MainActivity extends Activity {
     private static final int THERMAL_U16_BYTES = THERMAL_WIDTH * THERMAL_HEIGHT * 2;
     private static final int THERMAL_PACKET_TEMP_OFFSET = THERMAL_U16_BYTES + 1024;
     private static final int REQUEST_PERMISSIONS = 41;
+    private static final int REQUEST_MEDIA_PROJECTION = 42;
     private static final String TINY2C_USB_MODE_PATH =
             "/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode";
     private static final String TINY2C_EXTCON_MODE_PATH =
@@ -129,6 +132,9 @@ public class MainActivity extends Activity {
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
         buttons.addView(button("Start SDK", view -> startSdkLive()));
         buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
+        buttons.addView(button("Cap TVue", view -> requestThermoVueScreenCapture()));
+        buttons.addView(button("Load Cap", view -> showLatestScreenCapture()));
+        buttons.addView(button("Stop Cap", view -> stopThermoVueScreenCapture()));
         buttons.addView(button("Stop", view -> stopSdkLive()));
         buttons.addView(button("Share Log", view -> shareLog()));
 
@@ -163,6 +169,11 @@ public class MainActivity extends Activity {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             missing.add(Manifest.permission.RECORD_AUDIO);
         }
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED) {
+            missing.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
         if (!missing.isEmpty()) {
             append("requesting runtime permissions " + missing);
             requestPermissions(missing.toArray(new String[0]), REQUEST_PERMISSIONS);
@@ -182,7 +193,32 @@ public class MainActivity extends Activity {
         }
         append("runtime permission result camera=" +
                 hasPermission(Manifest.permission.CAMERA) +
-                " audio=" + hasPermission(Manifest.permission.RECORD_AUDIO));
+                " audio=" + hasPermission(Manifest.permission.RECORD_AUDIO) +
+                " notifications=" + (Build.VERSION.SDK_INT < 33 ||
+                hasPermission(Manifest.permission.POST_NOTIFICATIONS)));
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_MEDIA_PROJECTION) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            append("screen capture permission denied resultCode=" + resultCode);
+            return;
+        }
+        append("screen capture permission granted; starting foreground service");
+        Intent intent = new Intent(this, ThermalScreenCaptureService.class);
+        intent.setAction(ThermalScreenCaptureService.ACTION_START);
+        intent.putExtra(ThermalScreenCaptureService.EXTRA_RESULT_CODE, resultCode);
+        intent.putExtra(ThermalScreenCaptureService.EXTRA_RESULT_DATA, data);
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+        launchThermoVue();
     }
 
     private boolean hasPermission(String permission) {
@@ -330,6 +366,51 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             append("ThermoVue launch FAIL " + formatThrowable(t));
         }
+    }
+
+    private void requestThermoVueScreenCapture() {
+        append("===== ThermoVue screen capture fallback =====");
+        append("This captures ThermoVue's foreground screen, not raw sensor bytes.");
+        try {
+            MediaProjectionManager manager =
+                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            startActivityForResult(
+                    manager.createScreenCaptureIntent(),
+                    REQUEST_MEDIA_PROJECTION);
+        } catch (Throwable t) {
+            append("screen capture request FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void stopThermoVueScreenCapture() {
+        append("stop ThermoVue screen capture service");
+        Intent intent = new Intent(this, ThermalScreenCaptureService.class);
+        intent.setAction(ThermalScreenCaptureService.ACTION_STOP);
+        startService(intent);
+    }
+
+    private void showLatestScreenCapture() {
+        File latest = new File(
+                new File(getExternalFilesDir(null), "screen_capture"),
+                "latest_thermovue_screen.jpg");
+        if (!latest.exists()) {
+            append("latest screen capture not found: " + latest.getAbsolutePath());
+            setStatus("no screen capture yet");
+            return;
+        }
+        Bitmap bitmap = BitmapFactory.decodeFile(latest.getAbsolutePath());
+        if (bitmap == null) {
+            append("latest screen capture decode failed: " + latest.getAbsolutePath());
+            setStatus("capture decode failed");
+            return;
+        }
+        runOnUiThread(() -> {
+            preview.setBitmap(bitmap);
+            statusText.setText("loaded ThermoVue screen capture " +
+                    bitmap.getWidth() + "x" + bitmap.getHeight());
+        });
+        append("loaded screen capture " + latest.getAbsolutePath() +
+                " bytes=" + latest.length());
     }
 
     private void startSdkLive() {

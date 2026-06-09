@@ -24,6 +24,12 @@ foreground, use `TVue FG Test` instead of `Launch TVue` + `Start SDK`. It starts
 the SDK polling thread first, then launches ThermoVue on top and keeps logging
 in the background. Wait 15-20 seconds, return to this app, then tap `Share Log`.
 
+If raw SDK frames are still blocked, use `Cap TVue`. Android will ask for screen
+recording permission, then the app starts a foreground capture service and
+launches ThermoVue. Leave ThermoVue foreground so its thermal stream stays alive.
+Return to this app and tap `Load Cap` to show the latest captured ThermoVue
+screen. This is real ThermoVue display capture, not raw sensor bytes.
+
 If live thermal frames are available, the preview panel will show the real
 256x192 thermal value matrix rendered with a color palette, plus min/max/mean/FPS
 status. If not, the log panel should show where the path failed: USB visibility,
