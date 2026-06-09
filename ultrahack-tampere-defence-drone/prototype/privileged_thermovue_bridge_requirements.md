@@ -77,7 +77,7 @@ path is confirmed by decompilation.
 Build marker:
 
 ```text
-thermovue-bridge-probe 2026-06-09 privileged-exact-startup
+thermovue-bridge-probe 2026-06-09 callback-packet-forwarder
 ```
 
 The bridge now runs the same high-level order as ThermoVue Pro's
@@ -90,6 +90,7 @@ GPIOUtils.powerUpControl / Tiny2C sysfs power attempt
 wait up to 9000 ms for USBMonitorManager.isDeviceConnected
 MImageUtils.MRun3/initMNNModelModule/MRun1
 Tiny2CDualFusionProxy.initData
+wrap UvcNativeCamDualFusionPreviewManager.mIrFrameCallback
 Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)
 poll getFrameCount/getRawTempData/getRemapTempData
 ```
@@ -102,16 +103,18 @@ sysfsWrite FAIL ... tiny2c_usb_mode ... EACCES
 sysfsWrite FAIL ... tiny2c_mode ... EACCES
 ExactPro Android USB thermal device not visible after GPIO power-up
 ExactPro vendorUsbConnected=false ctrlBlock=null
+ExactPro before initHandleEngine frameCallback installed previewManager=...
 ExactPro initHandleEngine skipped because ctrlBlock=null
 ExactPro direct initHandle frameSeen=false
 ExactPro worker StartPreviewTask frameSeen=false
+DeviceControl before startPreview frameCallback installed previewManager=...
 DeviceControl explicit startPreview frameSeen=false
 ```
 
 This is now a clean validation target: the same APK should change from
 `untrusted_app`/`EACCES`/`ctrlBlock=null` to sysfs OK, USB connected, non-null
-`ctrlBlock`, and non-empty frame data when installed through a real
-platform/privileged route.
+`ctrlBlock`, non-empty callback packets, and non-empty frame data when installed
+through a real platform/privileged route.
 
 ## Validation Command Sequence
 
@@ -120,7 +123,7 @@ After Ulefone provides a privileged/signed route, validate with:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_thermovue_bridge_probe.ps1
 adb install -r prototype\android_thermovue_bridge_probe\build\thermovue-bridge-probe.apk
-adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true --ei udpMaxFrames 1 --ei udpFullPacketMaxFrames 1
 adb shell cat /sdcard/Android/data/com.yegmina.thermovuebridgeprobe/files/*/thermovue_bridge_probe.log
 ```
 
@@ -133,7 +136,7 @@ py -3 prototype\thermal_udp_receiver.py --host 0.0.0.0 --port 25000 --save-dir p
 Then launch the bridge with the receiver IP:
 
 ```powershell
-adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true --es jetsonHost <JETSON_OR_LAPTOP_IP> --ei jetsonPort 25000
+adb shell am start -n com.yegmina.thermovuebridgeprobe/.MainActivity --ez privileged true --es jetsonHost <JETSON_OR_LAPTOP_IP> --ei jetsonPort 25000 --ei udpMaxFrames 25 --ei udpFullPacketMaxFrames 1
 ```
 
 Success criteria:
@@ -147,10 +150,15 @@ waitForThermalUsb found /dev/bus/usb/001/002 vendor=0x3474 product=0x4321
 hiddenUsbGrant ... hasPermission=true
 USBMonitor hasPermissionAfterRequest=true
 USBMonitor openDevice result=<non-null control block>
+ExactPro before initHandleEngine frameCallback installed previewManager=...
+callbackFrame count increases length=4863232
 Tiny2C poll frameCount increases
 getRawTempData returns non-null 256x192 thermal data
 frameDump raw_temp path=...
+frameDump callback_temp path=...
+frameDump callback_packet path=...
 udpThermalFrame sent ... chunks=...
+udpThermoVuePacket sent ... chunks=...
 ```
 
 On the stock side-loaded phone build, the expected failure is:

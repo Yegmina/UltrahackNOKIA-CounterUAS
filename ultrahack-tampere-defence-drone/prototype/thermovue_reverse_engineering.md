@@ -391,18 +391,31 @@ This mode does not launch ThermoVue. It tries to behave like the future vendor-s
 6. wait for USB VID/PID `0x3474:0x4321`;
 7. call the framework USB grant method if available;
 8. start the vendor Tiny2C preview path;
-9. dump `raw_temp_*.bin` / `remap_temp_*.bin` if thermal bytes appear;
-10. optionally send raw thermal frames over UDP with `--es jetsonHost <ip> --ei jetsonPort 25000`.
+9. wrap `UvcNativeCamDualFusionPreviewManager.mIrFrameCallback` with a
+   composite callback that captures the raw packet and then forwards to the
+   vendor callback;
+10. dump `raw_temp_*.bin` / `remap_temp_*.bin` and
+   `callback_temp_*.bin` / `callback_packet_*.bin` if thermal bytes appear;
+11. optionally send raw thermal frames over UDP with `--es jetsonHost <ip> --ei jetsonPort 25000`.
 
 On the stock side-loaded build this now fails at the precise expected gate:
 
 ```text
 sysfsWrite FAIL path=/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode value=1 ... EACCES
 sysfsWrite FAIL path=/sys/class/yft_extcon/tiny2c_mode value=1 ... EACCES
-waitForThermalUsb timeout afterMs=10000
-privileged bridge FAIL thermal USB did not appear after power-up
+ExactPro vendorUsbConnected=false ctrlBlock=null
+ExactPro before initHandleEngine frameCallback installed previewManager=...
+ExactPro initHandleEngine skipped because ctrlBlock=null
 Tiny2C poll 0 frameCount=0 ... rawTemp=null remapTemp=null
 ```
+
+The callback install is now verified on the stock phone: the bridge reaches
+`Tiny2CDualFusionProxy.dualFusionPreviewManager`, reads the vendor
+`mIrFrameCallback`, and replaces it with a wrapper. No `callbackFrame` entries
+appear on the stock side-loaded install because the USB control block remains
+null; with platform/vendor privilege, the next expected proof is
+`callbackFrame count=... length=4863232`, followed by `frameDump callback_temp`
+and `frameDump callback_packet`.
 
 The matching receiver is:
 
@@ -670,6 +683,11 @@ buffers, and only then falls back to explicit `initData`, `initHandleEngine`, an
 `startPreview` calls. When `keepStreaming` is enabled and frames appear, it sends
 raw temp frames to the Jetson/laptop over UDP using the
 `YEGMINA_THERMAL_RAW_V1` chunk protocol consumed by `thermal_udp_receiver.py`.
+The bridge also wraps `mIrFrameCallback` before `initHandleEngine`; callback
+packets are saved as `callback_packet_*.bin`, their embedded 256x192 temperature
+plane is saved as `callback_temp_*.bin`, and one full callback packet can be
+forwarded as `YEGMINA_THERMAL_FRAME_V2 kind=thermovue_raw_packet` by launching
+with `--ei udpFullPacketMaxFrames 1`.
 
 Second experimental path:
 

@@ -59,12 +59,20 @@ import dalvik.system.DexClassLoader;
 public class MainActivity extends Activity {
     private static final String TAG = "ThermoVueBridgeProbe";
     private static final String BUILD_MARKER =
-            "thermovue-bridge-probe 2026-06-09 privileged-exact-startup";
+            "thermovue-bridge-probe 2026-06-09 callback-packet-forwarder";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermovuebridgeprobe.USB_PERMISSION";
     private static final int THERMAL_VENDOR_ID = 0x3474;
     private static final int THERMAL_PRODUCT_ID = 0x4321;
+    private static final int THERMAL_WIDTH = 256;
+    private static final int THERMAL_HEIGHT = 192;
+    private static final int THERMAL_PLANE_BYTES = THERMAL_WIDTH * THERMAL_HEIGHT * 2;
+    private static final int THERMAL_INFO_BYTES = 1024;
+    private static final int THERMAL_TEMP_OFFSET = THERMAL_PLANE_BYTES + THERMAL_INFO_BYTES;
+    private static final int THERMAL_VISIBLE_RGB_BYTES = 1440 * 1080 * 3;
+    private static final int THERMOVUE_RAW_PACKET_BYTES =
+            THERMAL_TEMP_OFFSET + THERMAL_PLANE_BYTES + THERMAL_VISIBLE_RGB_BYTES;
     private static final int REQUEST_APP_PERMISSIONS = 42;
     private static final String TINY2C_USB_MODE_PATH =
             "/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode";
@@ -85,7 +93,14 @@ public class MainActivity extends Activity {
     private int streamSeconds;
     private boolean dumpedRawTemp;
     private boolean dumpedRemapTemp;
+    private boolean dumpedCallbackPacket;
+    private boolean dumpedCallbackTemp;
+    private int udpFullPacketMaxFrames;
     private int udpSentFrames;
+    private int udpSentFullPackets;
+    private volatile int callbackFrameCount;
+    private volatile long lastCallbackFrameMs;
+    private Object installedIrFrameCallback;
     private DexClassLoader thermoVueLoader;
     private boolean loggedUsbManagerPermissionMethods;
 
@@ -99,6 +114,7 @@ public class MainActivity extends Activity {
         jetsonHost = getIntent().getStringExtra("jetsonHost");
         jetsonPort = getIntent().getIntExtra("jetsonPort", 25000);
         udpMaxFrames = getIntent().getIntExtra("udpMaxFrames", 25);
+        udpFullPacketMaxFrames = getIntent().getIntExtra("udpFullPacketMaxFrames", 1);
         streamSeconds = getIntent().getIntExtra("streamSeconds", 3600);
 
         text = new TextView(this);
@@ -153,6 +169,8 @@ public class MainActivity extends Activity {
         append("keepStreaming=" + keepStreaming + " streamSeconds=" + streamSeconds);
         append("jetsonUdp=" + (jetsonHost == null ? "disabled" : jetsonHost + ":" + jetsonPort));
         append("udpMaxFrames=" + (udpMaxFrames <= 0 ? "unlimited" : String.valueOf(udpMaxFrames)));
+        append("udpFullPacketMaxFrames=" +
+                (udpFullPacketMaxFrames <= 0 ? "unlimited" : String.valueOf(udpFullPacketMaxFrames)));
         inspectUsbAttachIntent("onCreate", getIntent());
         boolean usbAttachLaunch = isUsbAttachIntent(getIntent());
         if (usbAttachLaunch && !manualMode && !privilegedMode && !watchUsbMode) {
@@ -606,6 +624,7 @@ public class MainActivity extends Activity {
 
             initializeMnnModelModule(loader);
             tryInvoke(proxy, "initData");
+            installPacketCaptureIrFrameCallback(loader, proxy, "ExactPro before initHandleEngine");
             if (ctrlBlock != null) {
                 try {
                     Class<?> ctrlBlockClass = Class.forName(
@@ -632,6 +651,7 @@ public class MainActivity extends Activity {
             sawFrame = pollTiny2c(proxy);
             append("ExactPro direct initHandle frameSeen=" + sawFrame);
             if (!sawFrame) {
+                installPacketCaptureIrFrameCallback(loader, proxy, "ExactPro before fallback startPreview");
                 Class<?> modeClass = Class.forName(
                         "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
                 Object mode = enumValue(modeClass, "MODE_DUAL_FUSION");
@@ -1183,6 +1203,7 @@ public class MainActivity extends Activity {
             append("Tiny2C init invoked");
 
             tryInvoke(proxy, "initData");
+            installPacketCaptureIrFrameCallback(loader, proxy, "Tiny2C before startPreview");
             tryInvoke(proxy, "startPreview");
             pollTiny2c(proxy);
         } catch (Throwable t) {
@@ -1293,6 +1314,189 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean installPacketCaptureIrFrameCallback(
+            ClassLoader loader,
+            Object proxy,
+            String label) {
+        try {
+            if (proxy == null) {
+                append(label + " frameCallback install skipped: proxy=null");
+                return false;
+            }
+            Object previewManager = tryGetFieldValue(
+                    proxy.getClass(),
+                    proxy,
+                    "dualFusionPreviewManager");
+            if (previewManager == null) {
+                append(label + " frameCallback install skipped: previewManager=null");
+                return false;
+            }
+            Object originalCallback = tryGetFieldValue(
+                    previewManager.getClass(),
+                    previewManager,
+                    "mIrFrameCallback");
+            if (originalCallback == installedIrFrameCallback) {
+                append(label + " frameCallback already installed");
+                return true;
+            }
+            Object callback = createPacketCaptureIrFrameCallback(loader, originalCallback, label);
+            if (callback == null) {
+                return false;
+            }
+            setField(previewManager.getClass(), previewManager, "mIrFrameCallback", callback);
+            installedIrFrameCallback = callback;
+            append(label + " frameCallback installed previewManager=" +
+                    previewManager.getClass().getName() +
+                    " original=" + describeObject(originalCallback));
+            return true;
+        } catch (Throwable t) {
+            append(label + " frameCallback install FAIL " + formatThrowable(t));
+            return false;
+        }
+    }
+
+    private Object createPacketCaptureIrFrameCallback(
+            ClassLoader loader,
+            Object originalCallback,
+            String label) {
+        try {
+            Class<?> callbackClass = Class.forName(
+                    "com.energy.ac020library.bean.IIrFrameCallback",
+                    true,
+                    loader);
+            Object callback = Proxy.newProxyInstance(
+                    callbackClass.getClassLoader(),
+                    new Class[]{callbackClass},
+                    (proxy, method, args) -> {
+                        if ("onFrame".equals(method.getName())) {
+                            byte[] frame = findByteArrayArg(args);
+                            if (frame != null) {
+                                int length = findFrameLengthArg(args, frame);
+                                handleIrCallbackPacket(label, frame, length);
+                            }
+                        }
+                        if (originalCallback != null) {
+                            try {
+                                method.invoke(originalCallback, args);
+                            } catch (Throwable t) {
+                                append(label + " vendor callback forward FAIL " +
+                                        formatThrowable(t));
+                            }
+                        }
+                        return defaultReturnValue(method.getReturnType());
+                    });
+            append(label + " packetCaptureCallback OK methods=" +
+                    callbackClass.getDeclaredMethods().length);
+            return callback;
+        } catch (Throwable t) {
+            append(label + " packetCaptureCallback FAIL " + formatThrowable(t));
+            return null;
+        }
+    }
+
+    private byte[] findByteArrayArg(Object[] args) {
+        if (args == null) {
+            return null;
+        }
+        for (Object arg : args) {
+            if (arg instanceof byte[]) {
+                return (byte[]) arg;
+            }
+        }
+        return null;
+    }
+
+    private int findFrameLengthArg(Object[] args, byte[] frame) {
+        if (args != null) {
+            for (Object arg : args) {
+                if (arg instanceof Number) {
+                    int length = ((Number) arg).intValue();
+                    if (length > 0 && length <= frame.length) {
+                        return length;
+                    }
+                }
+            }
+        }
+        return frame.length;
+    }
+
+    private synchronized void handleIrCallbackPacket(String label, byte[] frame, int length) {
+        callbackFrameCount++;
+        lastCallbackFrameMs = System.currentTimeMillis();
+        int safeLength = Math.min(Math.max(length, 0), frame.length);
+        if (safeLength == 0) {
+            append(label + " callbackFrame count=" + callbackFrameCount +
+                    " empty length=" + length);
+            return;
+        }
+        if (callbackFrameCount <= 3 || callbackFrameCount % 25 == 0) {
+            append(label + " callbackFrame count=" + callbackFrameCount +
+                    " length=" + safeLength +
+                    " checksum1024=0x" + Integer.toHexString(checksum(frame, 1024)));
+        }
+        byte[] tempPlane = extractCallbackTempPlane(frame, safeLength);
+        if (tempPlane != null) {
+            maybeDumpCallbackFrame("callback_temp", tempPlane);
+            maybeSendThermalUdp("callback-" + callbackFrameCount, tempPlane);
+        }
+        byte[] packet = copyCallbackPacket(frame, safeLength);
+        if (packet != null) {
+            maybeDumpCallbackFrame("callback_packet", packet);
+            maybeSendThermalPacketUdp("callback-" + callbackFrameCount, packet);
+        }
+    }
+
+    private byte[] extractCallbackTempPlane(byte[] frame, int length) {
+        if (length == THERMAL_PLANE_BYTES && frame.length >= THERMAL_PLANE_BYTES) {
+            byte[] out = new byte[THERMAL_PLANE_BYTES];
+            System.arraycopy(frame, 0, out, 0, THERMAL_PLANE_BYTES);
+            return out;
+        }
+        if (length >= THERMAL_TEMP_OFFSET + THERMAL_PLANE_BYTES &&
+                frame.length >= THERMAL_TEMP_OFFSET + THERMAL_PLANE_BYTES) {
+            byte[] out = new byte[THERMAL_PLANE_BYTES];
+            System.arraycopy(frame, THERMAL_TEMP_OFFSET, out, 0, THERMAL_PLANE_BYTES);
+            return out;
+        }
+        return null;
+    }
+
+    private byte[] copyCallbackPacket(byte[] frame, int length) {
+        if (length < THERMAL_TEMP_OFFSET + THERMAL_PLANE_BYTES ||
+                frame.length < THERMAL_TEMP_OFFSET + THERMAL_PLANE_BYTES) {
+            return null;
+        }
+        int packetBytes = Math.min(Math.min(length, frame.length), THERMOVUE_RAW_PACKET_BYTES);
+        byte[] out = new byte[packetBytes];
+        System.arraycopy(frame, 0, out, 0, packetBytes);
+        return out;
+    }
+
+    private void maybeDumpCallbackFrame(String label, byte[] bytes) {
+        if (bytes == null || bytes.length == 0 || runDir == null) {
+            return;
+        }
+        if ("callback_packet".equals(label)) {
+            if (dumpedCallbackPacket) {
+                return;
+            }
+            dumpedCallbackPacket = true;
+        } else if ("callback_temp".equals(label)) {
+            if (dumpedCallbackTemp) {
+                return;
+            }
+            dumpedCallbackTemp = true;
+        }
+        File out = new File(runDir, label + "_" + stamp() + ".bin");
+        try (FileOutputStream output = new FileOutputStream(out)) {
+            output.write(bytes);
+            append("frameDump " + label + " path=" + out.getAbsolutePath() +
+                    " " + describeBytes(bytes));
+        } catch (IOException e) {
+            append("frameDump FAIL " + label + " " + formatThrowable(e));
+        }
+    }
+
     private void maybeSendThermalUdp(Object frameCount, byte[] rawTemp) {
         if (jetsonHost == null || jetsonHost.length() == 0 ||
                 rawTemp == null || rawTemp.length == 0 ||
@@ -1331,6 +1535,49 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void maybeSendThermalPacketUdp(Object frameCount, byte[] packetBytes) {
+        if (jetsonHost == null || jetsonHost.length() == 0 ||
+                packetBytes == null || packetBytes.length == 0 ||
+                (udpFullPacketMaxFrames > 0 && udpSentFullPackets >= udpFullPacketMaxFrames)) {
+            return;
+        }
+        final int chunkBytes = 1200;
+        int chunks = (packetBytes.length + chunkBytes - 1) / chunkBytes;
+        try (DatagramSocket socket = new DatagramSocket()) {
+            InetAddress address = InetAddress.getByName(jetsonHost);
+            for (int chunk = 0; chunk < chunks; chunk++) {
+                int offset = chunk * chunkBytes;
+                int length = Math.min(chunkBytes, packetBytes.length - offset);
+                byte[] header = ("YEGMINA_THERMAL_FRAME_V2 frame=" + frameCount +
+                        " kind=thermovue_raw_packet" +
+                        " chunk=" + chunk +
+                        " chunks=" + chunks +
+                        " offset=" + offset +
+                        " total=" + packetBytes.length +
+                        " width=0" +
+                        " height=0" +
+                        " format=thermovue-ir-info-temp-visible" +
+                        " source=thermovue_bridge_probe\n").getBytes();
+                byte[] payload = new byte[header.length + length];
+                System.arraycopy(header, 0, payload, 0, header.length);
+                System.arraycopy(packetBytes, offset, payload, header.length, length);
+                DatagramPacket packet = new DatagramPacket(
+                        payload,
+                        payload.length,
+                        address,
+                        jetsonPort);
+                socket.send(packet);
+            }
+            udpSentFullPackets++;
+            append("udpThermoVuePacket sent count=" + udpSentFullPackets +
+                    " host=" + jetsonHost + ":" + jetsonPort +
+                    " bytes=" + packetBytes.length +
+                    " chunks=" + chunks);
+        } catch (Throwable t) {
+            append("udpThermoVuePacket FAIL " + formatThrowable(t));
+        }
+    }
+
     private void probeTiny2cDeviceControlPath(ClassLoader loader) {
         append("===== Tiny2C vendor device-control path =====");
         Object proxy = null;
@@ -1354,6 +1601,7 @@ public class MainActivity extends Activity {
             init.invoke(proxy, this, 256, 386, 1.0f, 25, "0", 1440, 1080, 25);
             append("DeviceControl Tiny2C init invoked");
             tryInvoke(proxy, "initData");
+            installPacketCaptureIrFrameCallback(loader, proxy, "DeviceControl before startPreview");
             tryInvokeBoolean(proxy, "setHasAPPKilled", false);
             tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
             tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
@@ -1400,6 +1648,7 @@ public class MainActivity extends Activity {
             if (!sawFrame && ctrlBlock != null) {
                 append("DeviceControl fallback: explicit initData/initHandleEngine");
                 tryInvoke(proxy, "initData");
+                installPacketCaptureIrFrameCallback(loader, proxy, "DeviceControl before initHandleEngine");
                 try {
                     Class<?> ctrlBlockClass = Class.forName(
                             "com.energy.iruvccamera.usb.USBMonitor$UsbControlBlock",
@@ -1425,6 +1674,7 @@ public class MainActivity extends Activity {
 
             if (!sawFrame) {
                 append("DeviceControl fallback: explicit startPreview");
+                installPacketCaptureIrFrameCallback(loader, proxy, "DeviceControl before explicit startPreview");
                 tryInvoke(proxy, "startPreview");
                 sawFrame = pollTiny2c(proxy);
                 append("DeviceControl explicit startPreview frameSeen=" + sawFrame);
@@ -1822,6 +2072,40 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             return "read FAIL " + formatThrowable(t);
         }
+    }
+
+    private Object defaultReturnValue(Class<?> type) {
+        if (type == null || type == Void.TYPE) {
+            return null;
+        }
+        if (!type.isPrimitive()) {
+            return null;
+        }
+        if (type == Boolean.TYPE) {
+            return false;
+        }
+        if (type == Character.TYPE) {
+            return (char) 0;
+        }
+        if (type == Byte.TYPE) {
+            return (byte) 0;
+        }
+        if (type == Short.TYPE) {
+            return (short) 0;
+        }
+        if (type == Integer.TYPE) {
+            return 0;
+        }
+        if (type == Long.TYPE) {
+            return 0L;
+        }
+        if (type == Float.TYPE) {
+            return 0f;
+        }
+        if (type == Double.TYPE) {
+            return 0d;
+        }
+        return null;
     }
 
     private void sleepMs(long ms) {
