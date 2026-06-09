@@ -53,6 +53,20 @@ class DetectionState:
     status: str = "idle"
 
 
+@dataclass
+class RgbMotionAnalysis:
+    score: float
+    target_xy: tuple[int, int] | None
+    target_radius: int
+    previous_gray: np.ndarray | None
+    candidate_area: float = 0.0
+    global_motion: bool = False
+    global_dx: float = 0.0
+    global_dy: float = 0.0
+    global_consensus: float = 0.0
+    tracked_vectors: int = 0
+
+
 class ThermalUdpThread(threading.Thread):
     def __init__(
         self,
@@ -337,31 +351,66 @@ def detect_thermal_candidate(frame: ThermalFrame | None) -> tuple[float, tuple[i
     return score, center, radius
 
 
-def detect_rgb_motion(
-    frame: np.ndarray | None,
-    previous_gray: np.ndarray | None,
+def estimate_global_shift(
+    cv2: Any,
+    previous_gray: np.ndarray,
+    gray: np.ndarray,
+    min_vectors: int = 12,
+    consensus_px: float = 2.0,
+) -> tuple[float, float, float, int]:
+    scale = min(1.0, 640.0 / max(previous_gray.shape))
+    if scale < 1.0:
+        size = (int(previous_gray.shape[1] * scale), int(previous_gray.shape[0] * scale))
+        previous_work = cv2.resize(previous_gray, size)
+        gray_work = cv2.resize(gray, size)
+    else:
+        previous_work = previous_gray
+        gray_work = gray
+
+    points = cv2.goodFeaturesToTrack(
+        previous_work,
+        maxCorners=240,
+        qualityLevel=0.01,
+        minDistance=12,
+        blockSize=7,
+    )
+    if points is None or len(points) < min_vectors:
+        return 0.0, 0.0, 0.0, 0
+
+    next_points, status, _err = cv2.calcOpticalFlowPyrLK(
+        previous_work,
+        gray_work,
+        points,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+    )
+    if next_points is None or status is None:
+        return 0.0, 0.0, 0.0, 0
+
+    valid = status.reshape(-1) == 1
+    if int(valid.sum()) < min_vectors:
+        return 0.0, 0.0, 0.0, int(valid.sum())
+
+    vectors = next_points.reshape(-1, 2)[valid] - points.reshape(-1, 2)[valid]
+    median = np.median(vectors, axis=0)
+    residuals = np.linalg.norm(vectors - median, axis=1)
+    consensus = float(np.mean(residuals <= consensus_px))
+    dx = float(median[0] / scale)
+    dy = float(median[1] / scale)
+    return dx, dy, consensus, int(vectors.shape[0])
+
+
+def best_motion_candidate(
+    cv2: Any,
+    mask: np.ndarray,
+    frame_area: int,
     min_area: float = 6.0,
     max_area_ratio: float = 0.08,
-    threshold: int = 22,
-) -> tuple[float, tuple[int, int] | None, int, np.ndarray | None]:
-    if frame is None:
-        return 0.0, None, 0, previous_gray
-    try:
-        import cv2
-    except ImportError:
-        return 0.0, None, 0, previous_gray
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 0)
-    if previous_gray is None:
-        return 0.0, None, 0, gray
-
-    delta = cv2.absdiff(previous_gray, gray)
-    _, mask = cv2.threshold(delta, threshold, 255, cv2.THRESH_BINARY)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+) -> tuple[float, tuple[int, int] | None, int, float]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best: tuple[float, tuple[int, int], int] | None = None
-    frame_area = frame.shape[0] * frame.shape[1]
+    best: tuple[float, tuple[int, int], int, float] | None = None
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < min_area or area > frame_area * max_area_ratio:
@@ -372,12 +421,113 @@ def detect_rgb_motion(
             continue
         size_score = 1.0 - min(1.0, area / (frame_area * 0.03))
         score = float(np.clip(0.25 + 0.75 * size_score, 0.0, 1.0))
-        candidate = (score, (x + w // 2, y + h // 2), max(5, max(w, h) // 2))
+        candidate = (score, (x + w // 2, y + h // 2), max(5, max(w, h) // 2), area)
         if best is None or candidate[0] > best[0]:
             best = candidate
     if best is None:
-        return 0.05, None, 0, gray
-    return best[0], best[1], best[2], gray
+        return 0.05, None, 0, 0.0
+    return best
+
+
+def detect_rgb_motion_guarded(
+    frame: np.ndarray | None,
+    previous_gray: np.ndarray | None,
+    min_area: float = 6.0,
+    max_area_ratio: float = 0.08,
+    threshold: int = 22,
+    shake_protection: bool = True,
+    shake_min_shift: float = 1.5,
+    shake_consensus: float = 0.72,
+    shake_consensus_px: float = 2.0,
+    shake_residual_min_score: float = 0.75,
+    shake_max_residual_area_ratio: float = 0.008,
+) -> RgbMotionAnalysis:
+    if frame is None:
+        return RgbMotionAnalysis(0.0, None, 0, previous_gray)
+    try:
+        import cv2
+    except ImportError:
+        return RgbMotionAnalysis(0.0, None, 0, previous_gray)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    if previous_gray is None:
+        return RgbMotionAnalysis(0.0, None, 0, gray)
+
+    compare_gray = previous_gray
+    global_dx = 0.0
+    global_dy = 0.0
+    global_consensus = 0.0
+    tracked_vectors = 0
+    global_motion = False
+    if shake_protection:
+        global_dx, global_dy, global_consensus, tracked_vectors = estimate_global_shift(
+            cv2,
+            previous_gray,
+            gray,
+            consensus_px=shake_consensus_px,
+        )
+        global_shift = float(np.hypot(global_dx, global_dy))
+        global_motion = global_shift >= shake_min_shift and global_consensus >= shake_consensus
+        if global_motion:
+            transform = np.array([[1.0, 0.0, global_dx], [0.0, 1.0, global_dy]], dtype=np.float32)
+            compare_gray = cv2.warpAffine(
+                previous_gray,
+                transform,
+                (gray.shape[1], gray.shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+
+    delta = cv2.absdiff(compare_gray, gray)
+    _, mask = cv2.threshold(delta, threshold, 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    frame_area = frame.shape[0] * frame.shape[1]
+    score, target_xy, radius, candidate_area = best_motion_candidate(
+        cv2,
+        mask,
+        frame_area,
+        min_area=min_area,
+        max_area_ratio=max_area_ratio,
+    )
+    if global_motion and target_xy is None:
+        score = 0.0
+    elif global_motion and target_xy is not None:
+        candidate_area_ratio = candidate_area / max(1, frame_area)
+        if score < shake_residual_min_score or candidate_area_ratio > shake_max_residual_area_ratio:
+            score = 0.0
+            target_xy = None
+            radius = 0
+    return RgbMotionAnalysis(
+        score,
+        target_xy,
+        radius,
+        gray,
+        candidate_area=candidate_area,
+        global_motion=global_motion,
+        global_dx=global_dx,
+        global_dy=global_dy,
+        global_consensus=global_consensus,
+        tracked_vectors=tracked_vectors,
+    )
+
+
+def detect_rgb_motion(
+    frame: np.ndarray | None,
+    previous_gray: np.ndarray | None,
+    min_area: float = 6.0,
+    max_area_ratio: float = 0.08,
+    threshold: int = 22,
+) -> tuple[float, tuple[int, int] | None, int, np.ndarray | None]:
+    result = detect_rgb_motion_guarded(
+        frame,
+        previous_gray,
+        min_area=min_area,
+        max_area_ratio=max_area_ratio,
+        threshold=threshold,
+        shake_protection=False,
+    )
+    return result.score, result.target_xy, result.target_radius, result.previous_gray
 
 
 def fuse(
@@ -421,6 +571,7 @@ def write_telemetry(
     audio_fresh: bool,
     latest_audio: AudioScore | None,
     mount_command: Any | None,
+    rgb_motion: RgbMotionAnalysis | None = None,
 ) -> None:
     target = None
     if state.target_xy is not None:
@@ -458,6 +609,16 @@ def write_telemetry(
             "rms": None if latest_audio is None else rounded(latest_audio.rms),
             "peak_hz": None if latest_audio is None else rounded(latest_audio.peak_hz, 1),
             "band_ratio": None if latest_audio is None else rounded(latest_audio.band_ratio),
+        },
+        "rgb_motion": None
+        if rgb_motion is None
+        else {
+            "global_motion": rgb_motion.global_motion,
+            "global_dx": rounded(rgb_motion.global_dx),
+            "global_dy": rounded(rgb_motion.global_dy),
+            "global_consensus": rounded(rgb_motion.global_consensus),
+            "tracked_vectors": rgb_motion.tracked_vectors,
+            "candidate_area": rounded(rgb_motion.candidate_area),
         },
         "mount": mount,
     }
@@ -620,13 +781,23 @@ def run(args: argparse.Namespace) -> None:
             else:
                 thermal_score, thermal_xy, thermal_radius = 0.0, None, 0
 
-            rgb_score, rgb_xy, rgb_radius, previous_gray = detect_rgb_motion(
+            rgb_motion = detect_rgb_motion_guarded(
                 rgb,
                 previous_gray,
                 min_area=args.rgb_motion_min_area,
                 max_area_ratio=args.rgb_motion_max_area_ratio,
                 threshold=args.rgb_motion_threshold,
+                shake_protection=not args.disable_rgb_shake_protection,
+                shake_min_shift=args.rgb_shake_min_shift,
+                shake_consensus=args.rgb_shake_consensus,
+                shake_consensus_px=args.rgb_shake_consensus_px,
+                shake_residual_min_score=args.rgb_shake_residual_min_score,
+                shake_max_residual_area_ratio=args.rgb_shake_max_residual_area_ratio,
             )
+            rgb_score = rgb_motion.score
+            rgb_xy = rgb_motion.target_xy
+            rgb_radius = rgb_motion.target_radius
+            previous_gray = rgb_motion.previous_gray
             audio_age = None if latest_audio is None else now - latest_audio.timestamp
             audio_fresh = (
                 latest_audio is not None
@@ -655,7 +826,8 @@ def run(args: argparse.Namespace) -> None:
                 live_sources.append("thermal")
             if audio_fresh:
                 live_sources.append("audio")
-            status = f"{base_status} {'/'.join(live_sources) if live_sources else 'no-source'}"
+            shake_note = " shake-filtered" if rgb_motion.global_motion else ""
+            status = f"{base_status} {'/'.join(live_sources) if live_sources else 'no-source'}{shake_note}"
             state = DetectionState(
                 rgb_score=rgb_score,
                 thermal_score=thermal_score,
@@ -699,6 +871,9 @@ def run(args: argparse.Namespace) -> None:
                 print(
                     f"frame={frame_index} fps={fps:.1f} fused={fused_score:.2f} "
                     f"rgb={rgb_score:.2f} thermal={thermal_score:.2f} "
+                    f"shake={rgb_motion.global_motion} "
+                    f"shift=({rgb_motion.global_dx:.1f},{rgb_motion.global_dy:.1f}) "
+                    f"consensus={rgb_motion.global_consensus:.2f} "
                     f"thermal_age={thermal_age} thermal_fresh={thermal_fresh} audio={audio_text}"
                 )
             if (
@@ -717,6 +892,7 @@ def run(args: argparse.Namespace) -> None:
                     audio_fresh,
                     latest_audio,
                     mount_command,
+                    rgb_motion,
                 )
             if save_dir and dashboard is not None and frame_index % max(1, args.save_every) == 0:
                 try:
@@ -751,6 +927,12 @@ def main() -> None:
     parser.add_argument("--rgb-motion-min-area", type=float, default=6.0)
     parser.add_argument("--rgb-motion-max-area-ratio", type=float, default=0.08)
     parser.add_argument("--rgb-motion-threshold", type=int, default=22)
+    parser.add_argument("--disable-rgb-shake-protection", action="store_true")
+    parser.add_argument("--rgb-shake-min-shift", type=float, default=1.5)
+    parser.add_argument("--rgb-shake-consensus", type=float, default=0.72)
+    parser.add_argument("--rgb-shake-consensus-px", type=float, default=2.0)
+    parser.add_argument("--rgb-shake-residual-min-score", type=float, default=0.75)
+    parser.add_argument("--rgb-shake-max-residual-area-ratio", type=float, default=0.008)
     parser.add_argument("--fusion-rgb-weight", type=float, default=0.60)
     parser.add_argument("--fusion-thermal-weight", type=float, default=0.25)
     parser.add_argument("--fusion-audio-weight", type=float, default=0.15)
