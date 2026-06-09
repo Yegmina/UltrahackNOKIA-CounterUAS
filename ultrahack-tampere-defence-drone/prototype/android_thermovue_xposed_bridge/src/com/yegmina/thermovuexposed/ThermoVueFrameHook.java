@@ -8,6 +8,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -23,7 +24,9 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
     private static final int PLANE_BYTES = WIDTH * HEIGHT * 2;
     private static final int INFO_BYTES = 1024;
     private static final int TEMP_OFFSET = PLANE_BYTES + INFO_BYTES;
+    private static final int FUSION_RGBA_BYTES = 1080 * 1440 * 4;
     private static final int UDP_CHUNK_BYTES = 1200;
+    private static final long RAW_PREFERRED_WINDOW_MS = 2000;
 
     private static final String[] TARGET_PACKAGES = {
             "com.energy.tc2c",
@@ -35,7 +38,12 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
             "com.energy.tc2c.sop.camera.UvcNativeCamDualCalManager$mIIrFrameCallback$1",
     };
 
+    private static final String[] TEMP_CALLBACK_CLASSES = {
+            "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager$1",
+    };
+
     private static final AtomicInteger FRAME_COUNTER = new AtomicInteger();
+    private static final AtomicLong LAST_RAW_FRAME_AT_MS = new AtomicLong(0);
     private static final ExecutorService SENDER = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "yegmina-thermal-udp");
         thread.setDaemon(true);
@@ -49,7 +57,10 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         }
         log("loaded in " + lpparam.packageName);
         for (String className : CALLBACK_CLASSES) {
-            hookCallback(lpparam.classLoader, className);
+            hookRawCallback(lpparam.classLoader, className);
+        }
+        for (String className : TEMP_CALLBACK_CLASSES) {
+            hookTempCallback(lpparam.classLoader, className);
         }
     }
 
@@ -62,7 +73,7 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    private static void hookCallback(ClassLoader classLoader, String className) {
+    private static void hookRawCallback(ClassLoader classLoader, String className) {
         try {
             XposedHelpers.findAndHookMethod(
                     className,
@@ -78,7 +89,7 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
                             if (!(frameObj instanceof byte[]) || !(lengthObj instanceof Integer)) {
                                 return;
                             }
-                            maybeForward(className, (byte[]) frameObj, (Integer) lengthObj);
+                            maybeForward(className, (byte[]) frameObj, (Integer) lengthObj, false);
                         }
                     });
             log("hooked " + className + ".onFrame(byte[],int)");
@@ -87,19 +98,52 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void maybeForward(String className, byte[] frame, int length) {
+    private static void hookTempCallback(ClassLoader classLoader, String className) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    className,
+                    classLoader,
+                    "onFrame",
+                    byte[].class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            Object frameObj = param.args[0];
+                            if (!(frameObj instanceof byte[])) {
+                                return;
+                            }
+                            byte[] frame = (byte[]) frameObj;
+                            maybeForward(className, frame, frame.length, true);
+                        }
+                    });
+            log("hooked " + className + ".onFrame(byte[])");
+        } catch (Throwable t) {
+            log("hook pending/failed for " + className + ": " + t);
+        }
+    }
+
+    private static void maybeForward(String className, byte[] frame, int length, boolean fusionTempLayout) {
+        long nowMs = System.currentTimeMillis();
+        if (fusionTempLayout && nowMs - LAST_RAW_FRAME_AT_MS.get() < RAW_PREFERRED_WINDOW_MS) {
+            return;
+        }
         int every = Math.max(1, getIntProperty("debug.yegmina.thermal_every", 1));
         int count = FRAME_COUNTER.incrementAndGet();
         if (count % every != 0) {
             return;
         }
 
-        byte[] plane = extractTempPlane(frame, length);
+        byte[] plane = fusionTempLayout
+                ? extractFusionTempPlane(frame, length)
+                : extractRawPacketTempPlane(frame, length);
         if (plane == null) {
             if (count <= 10 || count % 100 == 0) {
                 log("skip frame length=" + length + " class=" + className);
             }
             return;
+        }
+        if (!fusionTempLayout) {
+            LAST_RAW_FRAME_AT_MS.set(nowMs);
         }
 
         String host = getStringProperty("debug.yegmina.thermal_host", "255.255.255.255");
@@ -107,7 +151,7 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
         SENDER.execute(() -> sendPlane(host, port, count, plane));
     }
 
-    private static byte[] extractTempPlane(byte[] frame, int length) {
+    private static byte[] extractRawPacketTempPlane(byte[] frame, int length) {
         if (length == PLANE_BYTES && frame.length >= PLANE_BYTES) {
             byte[] out = new byte[PLANE_BYTES];
             System.arraycopy(frame, 0, out, 0, PLANE_BYTES);
@@ -119,6 +163,16 @@ public final class ThermoVueFrameHook implements IXposedHookLoadPackage {
             return out;
         }
         return null;
+    }
+
+    private static byte[] extractFusionTempPlane(byte[] frame, int length) {
+        if (length >= FUSION_RGBA_BYTES + PLANE_BYTES &&
+                frame.length >= FUSION_RGBA_BYTES + PLANE_BYTES) {
+            byte[] out = new byte[PLANE_BYTES];
+            System.arraycopy(frame, FUSION_RGBA_BYTES, out, 0, PLANE_BYTES);
+            return out;
+        }
+        return extractRawPacketTempPlane(frame, length);
     }
 
     private static void sendPlane(String host, int port, int frameId, byte[] plane) {

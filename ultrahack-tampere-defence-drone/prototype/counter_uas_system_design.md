@@ -67,6 +67,8 @@ Thermal is the high-value but privileged stream:
   signing, or an in-process ThermoVue hook.
 - Screen capture of ThermoVue can be used only as a visual fallback, not as raw
   temperature data. Prefer IJPEG extraction for any thermal algorithm tests.
+- ThermoVue `.mp4` recordings are visual H.264/AAC files in the confirmed
+  sample; no IJPEG/private raw thermal payload was found.
 
 ## Thermal Access Modes
 
@@ -87,7 +89,8 @@ Mode B, working raw fallback:
 
 Mode C, visual fallback:
 
-- source: ThermoVue screen capture or normal RGB capture of ThermoVue UI;
+- source: ThermoVue screen capture, MP4 playback, or normal RGB capture of
+  ThermoVue UI;
 - rate: near-live visual feed possible;
 - status: useful for a demo display or visual detector, but not raw thermal
   temperature data.

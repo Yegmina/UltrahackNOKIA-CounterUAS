@@ -9,14 +9,26 @@ The module hooks ThermoVue's real Java IR callbacks:
 ```text
 com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager$3.onFrame(byte[], int)
 com.energy.tc2c.sop.camera.UvcNativeCamDualCalManager$mIIrFrameCallback$1.onFrame(byte[], int)
+com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager$1.onFrame(byte[])
 ```
 
-For full ThermoVue packets it extracts the temperature plane using the mapped
-layout:
+For full ThermoVue raw packets it extracts the temperature plane using the
+mapped layout:
 
 ```text
 [ir_u16le 98304][info 1024][temp_u16le 98304][visible/fusion bytes...]
 ```
+
+The one-argument callback is a fallback for ThermoVue's fusion temperature
+callback:
+
+```text
+[fusion_rgba 6220800][temp_u16le 98304][optional tail]
+```
+
+The bridge prefers raw `IIrFrameCallback` packets. It only forwards the fusion
+temperature callback when no raw packet has been seen recently, so both hooks can
+be enabled without intentionally duplicating frames.
 
 It forwards `temp_u16le` as `YEGMINA_THERMAL_RAW_V1` UDP packets, which are
 already accepted by:
