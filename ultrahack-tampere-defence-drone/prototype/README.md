@@ -22,6 +22,7 @@ Keep large datasets out of git unless explicitly needed.
 - [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
 - [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
+- [thermal_live_debug_apk.md](thermal_live_debug_apk.md) documents the standalone on-phone APK for testing whether live thermal frames can be shown inside our own app.
 
 Install prototype dependencies:
 
