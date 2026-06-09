@@ -7,7 +7,7 @@ downloaded from `zsx060/Anti-UAV-datasets`.
 ## Install
 
 ```powershell
-py -3 -m pip install -r prototype\vision_drone_detector\requirements-vision-drone-detector.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\vision_drone_detector\install_vision_detector_cpu.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\vision_drone_detector\download_anti_uav_model.ps1
 ```
 
