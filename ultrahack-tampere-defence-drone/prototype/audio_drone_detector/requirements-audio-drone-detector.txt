@@ -1,0 +1,6 @@
+numpy
+scipy
+soundfile
+transformers>=4.53,<5
+streamlit
+pandas
