@@ -46,6 +46,14 @@ The `temp_u16le` values are not yet mapped to Celsius. For detection and
 tracking, use the raw relative frame values or normalized contrast until the
 ThermoVue temperature calibration formula is cloned.
 
+APP5 metadata is decoded into the extractor summary for calibration context.
+In the first confirmed sample it contained:
+
+```text
+env_temp=17.0 dist=4.5 ems=1.0 hum=0.5 ref_temp=25.0
+center_temp_raw=0 max_temp_raw=0 min_temp_raw=0
+```
+
 ## Extract One Capture
 
 Pull or copy a ThermoVue JPEG to the laptop, then run:

@@ -135,6 +135,31 @@ def uint16_stats(data: bytes) -> dict[str, float | int]:
     }
 
 
+def parse_app5_environment(payload: bytes) -> dict[str, float | int] | None:
+    """Parse IJPEG APP5 environmental metadata when present.
+
+    Decompilation names APP5 fields as env_temp, dist, ems, hum, ref_temp,
+    temp_unit, center_temp, max_temp, and min_temp. The temperature plane itself
+    still needs ThermoVue's conversion formula before these raw values can be
+    treated as Celsius.
+    """
+    if len(payload) < 28:
+        return None
+    env_temp, dist, ems, hum, ref_temp = struct.unpack_from("<fffff", payload, 0)
+    temp_unit, center_temp, max_temp, min_temp = struct.unpack_from("<hhhh", payload, 20)
+    return {
+        "env_temp": round(env_temp, 4),
+        "dist": round(dist, 4),
+        "ems": round(ems, 4),
+        "hum": round(hum, 4),
+        "ref_temp": round(ref_temp, 4),
+        "temp_unit": temp_unit,
+        "center_temp_raw": center_temp,
+        "max_temp_raw": max_temp,
+        "min_temp_raw": min_temp,
+    }
+
+
 def write_uint16_png(data: bytes, width: int, height: int, out_path: Path) -> None:
     from PIL import Image
 
@@ -155,6 +180,7 @@ def write_rgba_png(data: bytes, width: int, height: int, out_path: Path) -> None
 def extract(input_path: Path, out_dir: Path, write_png: bool) -> dict:
     data = input_path.read_bytes()
     app2_ijpeg = None
+    app5_environment = None
     app3_chunks: list[bytes] = []
     marker_counts: dict[str, int] = {}
     sos_offset = None
@@ -168,6 +194,8 @@ def extract(input_path: Path, out_dir: Path, write_png: bool) -> dict:
             app2_ijpeg = payload
         elif marker == 0xE3:
             app3_chunks.append(payload)
+        elif marker == 0xE5:
+            app5_environment = parse_app5_environment(payload)
 
     if app2_ijpeg is None:
         raise ValueError("no IJPEG APP2 descriptor found")
@@ -189,6 +217,9 @@ def extract(input_path: Path, out_dir: Path, write_png: bool) -> dict:
         "sos_offset": sos_offset,
         "marker_counts": marker_counts,
         "ijpeg": {},
+        "metadata": {
+            "app5_environment": app5_environment,
+        },
         "outputs": {},
     }
 
