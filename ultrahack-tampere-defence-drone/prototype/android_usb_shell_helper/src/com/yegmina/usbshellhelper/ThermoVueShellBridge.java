@@ -7,6 +7,7 @@ import android.content.pm.ApplicationInfo;
 import android.hardware.usb.UsbDevice;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Looper;
 import android.os.Process;
 
 import java.io.File;
@@ -112,6 +113,10 @@ public final class ThermoVueShellBridge {
     }
 
     private Context createShellContext() throws Exception {
+        if (Looper.myLooper() == null) {
+            Looper.prepareMainLooper();
+            append("prepared main looper for ActivityThread.systemMain");
+        }
         Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
         Object activityThread = activityThreadClass
                 .getMethod("currentActivityThread")

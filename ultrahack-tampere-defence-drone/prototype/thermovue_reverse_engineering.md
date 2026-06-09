@@ -137,6 +137,68 @@ crw-rw---- 1 media system u:object_r:video_device:s0 81, 138 /dev/video1
 
 The USB node is visible only after ThermoVue powers the module. Shell cannot inspect enough sysfs metadata to confirm a usable public V4L2 path, and Android Camera2 still does not advertise a thermal camera.
 
+## 2026-06-09 Direct Vendor-Control Tests
+
+The latest APK tests reached further into the vendor path but still did not
+produce raw frames in a side-loaded app.
+
+Confirmed working:
+
+- ThermoVue itself streams real thermal packets. Logcat repeatedly shows
+  `UvcNativeCamDualFusionPreviewManager$3.onFrame(...)` and
+  `AC020library ... frame_callback memcpy: total_length=4863232`.
+- Android shell can grant the already-attached thermal USB device to our app
+  using `IUsbManager.grantDevicePermission(...)`.
+- Our app can open the real USB device through the vendor
+  `com.energy.iruvccamera.usb.USBMonitor.openDevice(...)`.
+- The resulting `USBMonitor.UsbControlBlock` reports:
+
+  ```text
+  device=/dev/bus/usb/001/002
+  vendor=0x3474
+  product=0x4321
+  manufacturer=Thermal Cam Co.,Ltd
+  product=Camera
+  serial=202206223
+  ```
+
+- The direct native path can build `IrcamEngine`, receive `initHandle`
+  success, install an `IIrFrameCallback`, and call `startVideoStream`.
+
+Confirmed blockers:
+
+- With ThermoVue foreground, ThermoVue continues receiving frames but our
+  process gets no `IIrFrameCallback` frames and no `Tiny2CDualFusionProxy`
+  `rawTemp`/`remapTemp` buffers.
+- When ThermoVue is force-stopped during a controlled takeover test, our app
+  sees:
+
+  ```text
+  usbDeviceCount=0
+  CTRLBLOCK proxy initHandleEngine(true) OK result=java.lang.Boolean:false
+  frameCount=0 rawTemp=null remapTemp=null
+  ```
+
+  This means ThermoVue is not only consuming the stream; it also keeps the
+  internal Tiny2C USB module powered/enumerated.
+- `adb root` is unavailable, `su` is missing, SELinux is enforcing,
+  `run-as com.energy.tc2c` is blocked because ThermoVue is not debuggable, and
+  `cmd activity attach-agent com.energy.tc2c ...` fails with:
+
+  ```text
+  java.lang.SecurityException: Process not debuggable: com.energy.tc2c
+  ```
+
+One unsafe exploratory fallback caused a native crash in `libircmd020.so` after
+calling unrelated vendor control methods. The controlled APK path now avoids
+that broad reflection pass and only calls explainable startup methods.
+
+Practical conclusion: a normal side-loaded APK can reach USB permission and
+vendor object creation, but cannot keep the Tiny2C module alive or take over
+the active frame stream on this production phone. Raw thermal access requires a
+vendor-supported bridge, privileged/platform install, root, or an in-process
+hook inside ThermoVue.
+
 ### USB Permission Handler Test
 
 The bridge probe now registers as a static USB handler for the thermal device:

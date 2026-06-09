@@ -23,6 +23,7 @@ Keep large datasets out of git unless explicitly needed.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
 - [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
 - [thermal_live_debug_apk.md](thermal_live_debug_apk.md) documents the standalone on-phone APK for testing whether live thermal frames can be shown inside our own app.
+- [counter_uas_system_design.md](counter_uas_system_design.md) summarizes the phone + Jetson fusion architecture and current thermal-access decision.
 
 When ADB is unavailable but the phone is visible as MTP storage, use:
 
@@ -30,6 +31,10 @@ When ADB is unavailable but the phone is visible as MTP storage, use:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action CopyApk
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.ps1 -Action PullLogs
 ```
+
+Inside the Thermal Live Debug app, `Dump APKs` writes ThermoVue Pro/SOP APK and
+native-library artifacts into the current `thermal_live_debug_*` session folder
+under `vendor_dump/`; `PullLogs` copies those files back to the laptop.
 
 Install prototype dependencies:
 
@@ -138,6 +143,12 @@ Analyze raw USB endpoint captures pulled from the debug APK:
 
 ```powershell
 py -3 prototype\analyze_usb_probe_capture.py prototype\mtp_pulled_logs --write-pgm prototype\logs\usb_probe_previews
+```
+
+Inspect pulled ThermoVue APK/native-library dumps:
+
+```powershell
+py -3 prototype\inspect_vendor_dump.py prototype\mtp_pulled_logs --out prototype\logs\vendor_dump_report.md
 ```
 
 Pan/tilt command scaffold:

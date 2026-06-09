@@ -12,7 +12,8 @@ live thermal frames into its own UI.
 The app also starts a small HTTP debug server on port `8088`. This is important
 when USB/ADB is unreliable: open the URL shown in the app log/status from the
 laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
-`/latest.png`.
+`/latest.png`. Use `/dump-vendor` to start the ThermoVue APK/native-library dump
+from the laptop if the app is already open and reachable.
 
 ## Button Flow
 
@@ -23,17 +24,29 @@ laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
    read attempts from readable IN endpoints.
    If bytes are read, the app also saves them under the current debug session's
    `usb_probe/` folder so they can be pulled later with the MTP helper.
-5. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
-6. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
+5. Tap `Dump APKs` to copy ThermoVue Pro and ThermoVue SOP APK/native-library
+   artifacts into the current debug session's `vendor_dump/` folder. This is
+   the non-ADB path for decompiling the real system app on the laptop.
+6. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
+7. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
    appears.
-7. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
-8. Tap `Start SDK`.
-9. Tap `Engine Probe` for a focused direct-native attempt around
+8. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
+9. Tap `Start SDK`.
+10. Tap `Engine Probe` for a focused direct-native attempt around
    `IrcamEngine`, `IrcamEngineBuilder`, and `DualUvcHandleParam`.
    Current builds also create a hidden `SurfaceTexture`/`Surface` and
    reflectively attach it to vendor preview objects before starting the native
    preview path.
-10. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
+11. Tap `Native CAM` to call the decompiled ThermoVue native path directly:
+   `DualUvcHandleParam -> IrcamEngine.Builder -> initHandle ->
+   setIrFrameCallback -> startVideoStream`.
+12. Tap `CtrlBlock` to shell-grant the thermal USB device first, then create a
+   real vendor `USBMonitor.UsbControlBlock` and call
+   `Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)`.
+13. Tap `Takeover` for a controlled ownership-transition test. It opens the
+   vendor `UsbControlBlock` while ThermoVue has powered the module, waits six
+   seconds so the host can stop ThermoVue, then tries the same proxy startup.
+14. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
     from the laptop.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
@@ -99,6 +112,32 @@ If Android keeps showing the USB permission dialog, tap `Stop`. Current builds
 also close ThermoVue's `USBMonitorManager` automatically after a short no-frame
 timeout so the dialog should not loop forever.
 
+## Current Direct-Thermal Result
+
+2026-06-09 connected-phone tests reached the vendor USB/native boundary but did
+not obtain frames inside our side-loaded app:
+
+- ThermoVue streaming is real: logcat shows repeated
+  `UvcNativeCamDualFusionPreviewManager$3.onFrame(...)` callbacks and
+  `AC020library ... total_length=4863232`.
+- Shell helper can grant `/dev/bus/usb/001/002` VID/PID `0x3474:0x4321` to our
+  app.
+- `CtrlBlock` can create a real vendor `USBMonitor.UsbControlBlock` with
+  manufacturer `Thermal Cam Co.,Ltd` and serial `202206223`.
+- `Native CAM` can build `IrcamEngine`, receive `initHandle` success, install
+  `IIrFrameCallback`, and call `startVideoStream`, but no frame callback fires.
+- While ThermoVue remains foreground, it owns the active stream. When ThermoVue
+  is force-stopped, the thermal USB module disappears from normal app view
+  (`usbDeviceCount=0`), and `initHandleEngine(ctrlBlock, true)` returns `false`.
+- `adb root`, `su`, `run-as com.energy.tc2c`, and `cmd activity attach-agent`
+  are blocked on this production phone.
+
+Conclusion: direct raw thermal frames from a normal side-loaded APK are blocked
+by the Tiny2C power/USB ownership boundary. A reliable raw thermal bridge needs
+one of: vendor SDK/API support, platform-signed/privileged install, root, or an
+in-process hook inside ThermoVue. Screen capture remains a demo fallback only;
+it is not raw sensor access.
+
 `Share Log` sends the visible debug log text through Android's share sheet.
 
 ## Build
@@ -121,7 +160,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.p
 `CopyApk` only places the APK in the phone `Download` folder. Install/open it on
 the phone, then use `PullLogs` to bring the debug sessions back to the laptop.
 `PullLogs` copies the whole `thermal_live_debug_*` session folder, including
-logs and any `usb_probe/*.bin` endpoint captures.
+logs, `vendor_dump/` APK/native-lib exports, and any `usb_probe/*.bin` endpoint
+captures.
 
 Current Windows observation for the Ulefone connection:
 

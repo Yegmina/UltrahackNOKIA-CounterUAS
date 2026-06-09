@@ -44,6 +44,7 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -82,8 +83,9 @@ import dalvik.system.DexFile;
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
     private static final String BUILD_MARKER =
-            "thermal-live-debug 2026-06-09 hidden-preview-surface";
+            "thermal-live-debug 2026-06-09 vendor-ctrlblock-takeover";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
+    private static final String THERMOVUE_SOP_PACKAGE = "com.energy.tc2c.sop";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermallivedebug.USB_PERMISSION";
     private static final int THERMAL_VENDOR_ID = 0x3474;
@@ -118,9 +120,20 @@ public class MainActivity extends Activity {
     private volatile long latestThermalFrameAt;
     private volatile boolean httpServerRunning;
     private volatile ServerSocket httpServerSocket;
+    private volatile long vendorCtrlBlockDelayBeforeInitMs;
     private SurfaceTexture vendorSurfaceTexture;
     private Surface vendorSurface;
     private DexClassLoader thermoVueLoader;
+
+    private static final class UsbProbeContext {
+        UsbDevice device;
+        UsbDeviceConnection connection;
+        int fileDescriptor = -1;
+        int busNum = -1;
+        int devNum = -1;
+        String usbFsName;
+        byte[] rawDescriptors;
+    }
 
     @Override
     protected void onCreate(Bundle state) {
@@ -181,12 +194,17 @@ public class MainActivity extends Activity {
         buttons.addView(button("Scan", view -> scanAll()));
         buttons.addView(button("USB Probe", view -> startThread(this::probeThermalUsbEndpoints)));
         buttons.addView(button("Dump Classes", view -> startThread(this::dumpClassesOnly)));
+        buttons.addView(button("Dump APKs", view -> startThread(this::dumpThermoVueArtifacts)));
         buttons.addView(button("Request USB", view -> requestThermalUsb()));
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
         buttons.addView(button("Start SDK", view -> startSdkLive()));
+        buttons.addView(button("Startup Clone", view -> startStartupCloneTest()));
         buttons.addView(button("Native Auto", view -> startNativeAutoTest()));
         buttons.addView(button("Engine Probe", view -> startEngineProbe()));
+        buttons.addView(button("Native CAM", view -> startTargetedNativeCamProbe()));
+        buttons.addView(button("CtrlBlock", view -> startVendorControlBlockProbe()));
+        buttons.addView(button("Takeover", view -> startVendorControlBlockTakeoverProbe()));
         buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
         buttons.addView(button("Cap TVue", view -> requestThermoVueScreenCapture()));
         buttons.addView(button("Load Cap", view -> showLatestScreenCapture()));
@@ -673,6 +691,112 @@ public class MainActivity extends Activity {
         return sawBytes;
     }
 
+    private UsbProbeContext openUsbProbeContext(String label) {
+        UsbDevice thermal = inspectUsb();
+        if (thermal == null) {
+            append(label + " USB context no candidate thermal device");
+            return null;
+        }
+        UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+        try {
+            attemptHiddenUsbGrant(manager, thermal);
+        } catch (Throwable t) {
+            append(label + " USB context hidden grant attempt FAIL " + formatThrowable(t));
+        }
+        if (!manager.hasPermission(thermal)) {
+            append(label + " USB context requesting permission for " +
+                    describeUsbDevice(thermal));
+            requestUsbPermissionAndWait(manager, thermal);
+        }
+        if (!manager.hasPermission(thermal)) {
+            append(label + " USB context no permission for " + describeUsbDevice(thermal));
+            return null;
+        }
+        UsbDeviceConnection connection = null;
+        try {
+            connection = manager.openDevice(thermal);
+            if (connection == null) {
+                append(label + " USB context openDevice returned null");
+                return null;
+            }
+            UsbProbeContext context = new UsbProbeContext();
+            context.device = thermal;
+            context.connection = connection;
+            context.fileDescriptor = connection.getFileDescriptor();
+            context.rawDescriptors = connection.getRawDescriptors();
+            fillUsbBusDev(context);
+            append(label + " USB context opened " + describeUsbProbeContext(context) +
+                    " rawDescriptors=" + describeBytes(context.rawDescriptors) +
+                    " head=" + hexPrefix(context.rawDescriptors, 64));
+            return context;
+        } catch (Throwable t) {
+            append(label + " USB context open FAIL " + formatThrowable(t));
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (Throwable ignored) {
+                    // Ignore cleanup failure while reporting the real open failure.
+                }
+            }
+            return null;
+        }
+    }
+
+    private void closeUsbProbeContext(UsbProbeContext context, String label) {
+        if (context == null || context.connection == null) {
+            return;
+        }
+        try {
+            context.connection.close();
+            append(label + " USB context closed fd=" + context.fileDescriptor);
+        } catch (Throwable t) {
+            append(label + " USB context close FAIL " + formatThrowable(t));
+        } finally {
+            context.connection = null;
+        }
+    }
+
+    private void fillUsbBusDev(UsbProbeContext context) {
+        if (context == null || context.device == null) {
+            return;
+        }
+        String path = context.device.getDeviceName();
+        if (path == null) {
+            return;
+        }
+        String[] parts = path.split("/");
+        if (parts.length >= 2) {
+            context.busNum = parseIntSafe(parts[parts.length - 2], -1);
+            context.devNum = parseIntSafe(parts[parts.length - 1], -1);
+        }
+        int busSlash = -1;
+        if (context.busNum >= 0 && context.devNum >= 0) {
+            String bus = parts[parts.length - 2];
+            String dev = parts[parts.length - 1];
+            busSlash = path.lastIndexOf("/" + bus + "/" + dev);
+        }
+        context.usbFsName = busSlash > 0 ? path.substring(0, busSlash) : "/dev/bus/usb";
+    }
+
+    private int parseIntSafe(String value, int fallback) {
+        try {
+            return Integer.parseInt(value);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private String describeUsbProbeContext(UsbProbeContext context) {
+        if (context == null) {
+            return "null";
+        }
+        return "device=" + describeUsbDevice(context.device) +
+                " fd=" + context.fileDescriptor +
+                " bus=" + context.busNum +
+                " dev=" + context.devNum +
+                " usbFsName=" + context.usbFsName;
+    }
+
     private boolean probeReadableEndpoint(
             UsbDeviceConnection connection,
             UsbEndpoint endpoint,
@@ -812,6 +936,144 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void dumpThermoVueArtifacts() {
+        append("===== dump ThermoVue artifacts =====");
+        File runDir = logFile == null ? getExternalFilesDir(null) : logFile.getParentFile();
+        File root = new File(runDir, "vendor_dump");
+        //noinspection ResultOfMethodCallIgnored
+        root.mkdirs();
+        dumpPackageArtifacts(THERMOVUE_PACKAGE, new File(root, "thermovue_pro"));
+        dumpPackageArtifacts(THERMOVUE_SOP_PACKAGE, new File(root, "thermovue_sop"));
+        append("vendor dump root=" + root.getAbsolutePath());
+        setStatus("vendor dump finished");
+    }
+
+    private void dumpPackageArtifacts(String packageName, File destDir) {
+        append("vendor dump package=" + packageName);
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(packageName, 0);
+            ApplicationInfo appInfo = packageInfo.applicationInfo;
+            //noinspection ResultOfMethodCallIgnored
+            destDir.mkdirs();
+            File metadata = new File(destDir, "package-info.txt");
+            try (FileOutputStream output = new FileOutputStream(metadata)) {
+                writeText(output, "package=" + packageName + "\n");
+                writeText(output, "versionName=" + packageInfo.versionName + "\n");
+                writeText(output, "versionCode=" + getLongVersionCode(packageInfo) + "\n");
+                writeText(output, "sourceDir=" + appInfo.sourceDir + "\n");
+                writeText(output, "publicSourceDir=" + appInfo.publicSourceDir + "\n");
+                writeText(output, "nativeLibraryDir=" + appInfo.nativeLibraryDir + "\n");
+                writeText(output, "dataDir=" + appInfo.dataDir + "\n");
+                writeText(output, "flags=0x" + Integer.toHexString(appInfo.flags) + "\n");
+                if (appInfo.splitSourceDirs != null) {
+                    for (int i = 0; i < appInfo.splitSourceDirs.length; i++) {
+                        writeText(output, "splitSourceDir[" + i + "]=" +
+                                appInfo.splitSourceDirs[i] + "\n");
+                    }
+                }
+            }
+            append("vendor dump metadata " + metadata.getAbsolutePath());
+
+            copyPathIfReadable(new File(appInfo.sourceDir), new File(destDir, "base.apk"));
+            if (appInfo.publicSourceDir != null &&
+                    !appInfo.publicSourceDir.equals(appInfo.sourceDir)) {
+                copyPathIfReadable(
+                        new File(appInfo.publicSourceDir),
+                        new File(destDir, "public-source.apk"));
+            }
+            if (appInfo.splitSourceDirs != null) {
+                File splitDir = new File(destDir, "splits");
+                //noinspection ResultOfMethodCallIgnored
+                splitDir.mkdirs();
+                for (int i = 0; i < appInfo.splitSourceDirs.length; i++) {
+                    copyPathIfReadable(
+                            new File(appInfo.splitSourceDirs[i]),
+                            new File(splitDir, "split_" + i + ".apk"));
+                }
+            }
+            if (appInfo.nativeLibraryDir != null) {
+                copyPathIfReadable(
+                        new File(appInfo.nativeLibraryDir),
+                        new File(destDir, "nativeLibraryDir"));
+            }
+        } catch (Throwable t) {
+            append("vendor dump package FAIL " + packageName + " " + formatThrowable(t));
+        }
+    }
+
+    private void writeText(OutputStream output, String text) throws IOException {
+        output.write(text.getBytes("UTF-8"));
+    }
+
+    private void copyPathIfReadable(File source, File dest) {
+        if (source == null) {
+            return;
+        }
+        try {
+            append("vendor dump copy source=" + source.getAbsolutePath() +
+                    " exists=" + source.exists() +
+                    " dir=" + source.isDirectory() +
+                    " readable=" + source.canRead() +
+                    " dest=" + dest.getAbsolutePath());
+            if (!source.exists() || !source.canRead()) {
+                return;
+            }
+            if (source.isDirectory()) {
+                copyDirectory(source, dest, 0);
+            } else {
+                copyFile(source, dest);
+            }
+        } catch (Throwable t) {
+            append("vendor dump copy FAIL source=" + source.getAbsolutePath() +
+                    " " + formatThrowable(t));
+        }
+    }
+
+    private void copyDirectory(File sourceDir, File destDir, int depth) throws IOException {
+        if (depth > 8) {
+            append("vendor dump directory depth cap " + sourceDir.getAbsolutePath());
+            return;
+        }
+        //noinspection ResultOfMethodCallIgnored
+        destDir.mkdirs();
+        File[] children = sourceDir.listFiles();
+        if (children == null) {
+            append("vendor dump directory list null " + sourceDir.getAbsolutePath());
+            return;
+        }
+        for (File child : children) {
+            File childDest = new File(destDir, child.getName());
+            if (!child.exists() || !child.canRead()) {
+                append("vendor dump skip unreadable " + child.getAbsolutePath());
+            } else if (child.isDirectory()) {
+                copyDirectory(child, childDest, depth + 1);
+            } else {
+                copyFile(child, childDest);
+            }
+        }
+    }
+
+    private void copyFile(File source, File dest) throws IOException {
+        File parent = dest.getParentFile();
+        if (parent != null) {
+            //noinspection ResultOfMethodCallIgnored
+            parent.mkdirs();
+        }
+        long copied = 0;
+        byte[] buffer = new byte[128 * 1024];
+        try (FileInputStream input = new FileInputStream(source);
+             FileOutputStream output = new FileOutputStream(dest)) {
+            int read;
+            while ((read = input.read(buffer)) > 0) {
+                output.write(buffer, 0, read);
+                copied += read;
+            }
+        }
+        append("vendor dump copied " + source.getAbsolutePath() +
+                " -> " + dest.getAbsolutePath() +
+                " bytes=" + copied);
+    }
+
     private void requestThermalUsb() {
         startThread(() -> {
             append("===== request thermal USB =====");
@@ -835,25 +1097,64 @@ public class MainActivity extends Activity {
         writeSysfs(TINY2C_EXTCON_MODE_PATH, "1\n");
         try {
             DexClassLoader loader = getThermoVueClassLoader();
-            Class<?> gpio = Class.forName("com.energy.ac020library.utils.GPIOUtils", true, loader);
-            for (Method method : gpio.getDeclaredMethods()) {
-                if (method.getParameterTypes().length == 0 &&
-                        method.getName().toLowerCase(Locale.US).contains("power")) {
-                    try {
-                        method.setAccessible(true);
-                        Object result = method.invoke(null);
-                        append("GPIOUtils " + describeMethod(method) +
-                                " OK result=" + describeObject(result));
-                    } catch (Throwable t) {
-                        append("GPIOUtils " + describeMethod(method) +
-                                " FAIL " + formatThrowable(t));
-                    }
-                }
-            }
+            invokeVendorPowerControl(loader, true, "manual power");
         } catch (Throwable t) {
             append("vendor power FAIL " + formatThrowable(t));
         }
         inspectUsb();
+    }
+
+    private boolean invokeVendorPowerControl(ClassLoader loader, boolean powerUp, String label) {
+        String wanted = powerUp ? "powerupcontrol" : "powerdowncontrol";
+        String[] classNames = new String[]{
+                "com.energy.dualmodule.sdk.util.GPIOUtils",
+                "com.energy.ac020library.utils.GPIOUtils",
+                "com.energy.tc2c.sop.utils.GPIOUtils"
+        };
+        boolean invoked = false;
+        for (String className : classNames) {
+            try {
+                Class<?> gpio = Class.forName(className, true, loader);
+                Object instance = null;
+                try {
+                    Field instanceField = gpio.getDeclaredField("INSTANCE");
+                    instanceField.setAccessible(true);
+                    instance = instanceField.get(null);
+                } catch (Throwable ignored) {
+                    // Java implementation uses static methods; Kotlin object uses INSTANCE.
+                }
+                for (Method method : gpio.getDeclaredMethods()) {
+                    if (method.getParameterTypes().length != 0 ||
+                            !method.getName().toLowerCase(Locale.US).equals(wanted)) {
+                        continue;
+                    }
+                    try {
+                        method.setAccessible(true);
+                        Object receiver = Modifier.isStatic(method.getModifiers()) ? null : instance;
+                        if (receiver == null && !Modifier.isStatic(method.getModifiers())) {
+                            append(label + " GPIO " + className + "." +
+                                    describeMethod(method) + " skip no INSTANCE");
+                            continue;
+                        }
+                        Object result = method.invoke(receiver);
+                        invoked = true;
+                        append(label + " GPIO " + className + "." +
+                                describeMethod(method) + " OK result=" +
+                                describeObject(result));
+                    } catch (Throwable t) {
+                        append(label + " GPIO " + className + "." +
+                                describeMethod(method) + " FAIL " + formatThrowable(t));
+                    }
+                }
+            } catch (Throwable t) {
+                append(label + " GPIO class " + className + " unavailable " +
+                        formatThrowable(t));
+            }
+        }
+        if (!invoked) {
+            append(label + " GPIO no " + wanted + " method invoked");
+        }
+        return invoked;
     }
 
     private void writeSysfs(String path, String value) {
@@ -961,6 +1262,17 @@ public class MainActivity extends Activity {
         startThread(this::runNativeAutoTest);
     }
 
+    private void startStartupCloneTest() {
+        if (running) {
+            append("startup clone already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        running = true;
+        setStatus("startup clone running");
+        startThread(this::runStartupCloneTest);
+    }
+
     private void startEngineProbe() {
         if (running) {
             append("engine probe already running");
@@ -970,6 +1282,162 @@ public class MainActivity extends Activity {
         running = true;
         setStatus("engine probe running");
         startThread(this::runStandaloneEngineProbe);
+    }
+
+    private void startTargetedNativeCamProbe() {
+        if (running) {
+            append("targeted native cam already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        running = true;
+        setStatus("targeted native cam running");
+        startThread(this::runTargetedNativeCamProbe);
+    }
+
+    private void startVendorControlBlockProbe() {
+        if (running) {
+            append("vendor ctrlBlock probe already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        vendorCtrlBlockDelayBeforeInitMs = 0;
+        running = true;
+        setStatus("vendor ctrlBlock running");
+        startThread(this::runVendorControlBlockProbe);
+    }
+
+    private void startVendorControlBlockTakeoverProbe() {
+        if (running) {
+            append("vendor ctrlBlock takeover already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        vendorCtrlBlockDelayBeforeInitMs = 6000;
+        running = true;
+        setStatus("ctrlBlock takeover running");
+        startThread(this::runVendorControlBlockProbe);
+    }
+
+    private void runStartupCloneTest() {
+        append("===== strict ThermoVue startup clone start =====");
+        append("Sequence: init app shims, init USB monitor, powerUpControl, wait ctrlBlock, initHandleEngine, startPreview, poll non-flat frames.");
+        Object proxy = null;
+        Object usbMonitorManager = null;
+        Object deviceControlManager = null;
+        boolean sawFrame = false;
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            dumpImportantClasses(loader, false);
+            inspectUsb();
+
+            Class<?> proxyClass = Class.forName(
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy", true, loader);
+            proxy = proxyClass.getMethod("getInstance").invoke(null);
+            liveProxy = proxy;
+            tryInvoke(proxy, "stopPreview");
+            tryInvoke(proxy, "releaseSource");
+            Method init = proxyClass.getMethod(
+                    "init",
+                    Context.class,
+                    int.class,
+                    int.class,
+                    float.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    int.class,
+                    int.class);
+            init.invoke(proxy, this, 256, 386, 1.0f, 25, "0", 1440, 1080, 25);
+            append("CLONE proxy init OK");
+            tryInvoke(proxy, "resetIsFirstFrame");
+            tryInvoke(proxy, "cancelFrameDataCheck");
+            tryInvokeBoolean(proxy, "setHasAPPKilled", false);
+            tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
+            tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
+
+            Class<?> usbMonitorManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
+            usbMonitorManager = usbMonitorManagerClass.getMethod("getInstance").invoke(null);
+            liveUsbMonitorManager = usbMonitorManager;
+            tryInvoke(usbMonitorManager, "destroyMonitor");
+            tryInvoke(usbMonitorManager, "init");
+            tryInvoke(usbMonitorManager, "registerMonitor");
+
+            Class<?> deviceControlManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    true,
+                    loader);
+            deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            liveDeviceControlManager = deviceControlManager;
+            tryInvoke(deviceControlManager, "release");
+            tryInvoke(deviceControlManager, "init");
+
+            Object callback = createIrFrameCallback(loader, "CLONE");
+            tryInstallFrameCallback(proxy, callback, "CLONE proxy");
+            tryInstallFrameCallback(deviceControlManager, callback, "CLONE deviceControl");
+            installFrameCallbacksOnKnownSingletons(loader, callback, "CLONE singleton");
+            attachPreviewSurfaceToThermoVueObjects(
+                    loader,
+                    "CLONE",
+                    proxy,
+                    usbMonitorManager,
+                    deviceControlManager);
+
+            invokeVendorPowerControl(loader, true, "CLONE");
+            Object connected = waitForUsbConnected(usbMonitorManager, 10000);
+            Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
+            append("CLONE USB connected=" + describeObject(connected) +
+                    " ctrlBlock=" + describeObject(ctrlBlock));
+            inspectUsb();
+            dumpObjectState(usbMonitorManager, "CLONE usbMonitor state");
+
+            if (ctrlBlock == null) {
+                append("CLONE stop: vendor USB monitor did not produce a real UsbControlBlock");
+                setStatus("startup clone no ctrlBlock");
+                return;
+            }
+
+            tryInvoke(proxy, "initData");
+            explicitInitAndStart(loader, proxy, ctrlBlock);
+            sawFrame = pollNativeScenario(proxy, "CLONE proxy", 10000);
+            if (!sawFrame) {
+                sawFrame = runDirectEngineProbe(
+                        loader,
+                        proxy,
+                        usbMonitorManager,
+                        deviceControlManager,
+                        ctrlBlock,
+                        callback,
+                        "CLONE");
+            }
+            setStatus(sawFrame ? "startup clone got frame" : "startup clone no frames");
+        } catch (Throwable t) {
+            append("CLONE FATAL " + formatThrowable(t));
+            setStatus("startup clone failed");
+        } finally {
+            running = false;
+            foregroundThermoVueTest = false;
+            if (proxy != null) {
+                tryInvoke(proxy, "stopPreview");
+                tryInvoke(proxy, "releaseSource");
+            }
+            if (deviceControlManager != null) {
+                tryInvoke(deviceControlManager, "release");
+            }
+            if (usbMonitorManager != null) {
+                tryInvoke(usbMonitorManager, "unregisterMonitor");
+                tryInvoke(usbMonitorManager, "destroyMonitor");
+            }
+            liveProxy = null;
+            liveUsbMonitorManager = null;
+            liveDeviceControlManager = null;
+            append("===== strict ThermoVue startup clone finished sawFrame=" +
+                    sawFrame + " =====");
+        }
     }
 
     private void stopSdkLive() {
@@ -1200,6 +1668,7 @@ public class MainActivity extends Activity {
             dumpImportantClasses(loader, false);
             dumpTargetedReverseEngineeringHints(loader);
             dumpThermoVueClassIndex(loader);
+            invokeVendorPowerControl(loader, true, "AUTO preflight");
             inspectUsb();
             probeThermalUsbEndpoints();
 
@@ -1311,6 +1780,7 @@ public class MainActivity extends Activity {
             tryInvoke(usbMonitorManager, "destroyMonitor");
             tryInvoke(usbMonitorManager, "init");
             tryInvoke(usbMonitorManager, "registerMonitor");
+            invokeVendorPowerControl(loader, true, "ENGINE");
 
             Class<?> deviceControlManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
@@ -1370,6 +1840,339 @@ public class MainActivity extends Activity {
             liveUsbMonitorManager = null;
             liveDeviceControlManager = null;
             append("===== direct engine standalone probe finished sawFrame=" +
+                sawFrame + " =====");
+        }
+    }
+
+    private void runTargetedNativeCamProbe() {
+        append("===== targeted USB_DUAL_NATIVE_CAM probe start =====");
+        append("This calls the decompiled ThermoVue path only: DualUvcHandleParam -> IrcamEngine.Builder -> initHandle -> setIrFrameCallback -> startVideoStream.");
+        UsbProbeContext usbContext = null;
+        Object engine = null;
+        boolean sawFrame = false;
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            dumpImportantClasses(loader, false);
+            inspectUsb();
+
+            usbContext = openUsbProbeContext("NATIVECAM");
+            if (usbContext == null || usbContext.connection == null) {
+                append("NATIVECAM stop: no open USB context. Use shell grant while ThermoVue is foreground.");
+                setStatus("native cam no usb permission");
+                return;
+            }
+
+            Class<?> dualParamClass = Class.forName(
+                    "com.energy.ac020library.bean.DualUvcHandleParam", true, loader);
+            Object dualParam = dualParamClass.getDeclaredConstructor().newInstance();
+            configureSafeProbeTarget(dualParam, null, usbContext, "NATIVECAM");
+            dumpObjectState(dualParam, "NATIVECAM dualParam state");
+
+            Class<?> engineClass = Class.forName(
+                    "com.energy.ac020library.IrcamEngine", true, loader);
+            Class<?> driverTypeClass = Class.forName(
+                    "com.energy.ac020library.bean.CommonParams$DriverType", true, loader);
+            Class<?> logLevelClass = Class.forName(
+                    "com.energy.ac020library.bean.CommonParams$LogLevel", true, loader);
+            Object driverType = enumValue(driverTypeClass, "USB_DUAL_NATIVE_CAM");
+            Object logLevel = enumValue(logLevelClass, "SDK_LOG_DEBUG");
+
+            Object builder = engineClass.getMethod("Builder").invoke(null);
+            append("NATIVECAM builder=" + describeObject(builder) +
+                    " driverType=" + describeObject(driverType));
+            invokeWithLog(
+                    "NATIVECAM setLogLevel",
+                    builder,
+                    "setLogLevel",
+                    new Class[]{logLevelClass},
+                    logLevel);
+            invokeWithLog(
+                    "NATIVECAM setStreamWidth",
+                    builder,
+                    "setStreamWidth",
+                    new Class[]{int.class},
+                    THERMAL_WIDTH);
+            invokeWithLog(
+                    "NATIVECAM setStreamHeight",
+                    builder,
+                    "setStreamHeight",
+                    new Class[]{int.class},
+                    THERMAL_HEIGHT);
+            invokeWithLog(
+                    "NATIVECAM setDriverType",
+                    builder,
+                    "setDriverType",
+                    new Class[]{driverTypeClass},
+                    driverType);
+            invokeWithLog(
+                    "NATIVECAM setDualUvcHandleParam",
+                    builder,
+                    "setDualUvcHandleParam",
+                    new Class[]{dualParamClass},
+                    dualParam);
+            engine = invokeWithLog(
+                    "NATIVECAM build",
+                    builder,
+                    "build",
+                    new Class[0]);
+            if (engine == null) {
+                append("NATIVECAM stop: builder returned null engine");
+                setStatus("native cam build failed");
+                return;
+            }
+            dumpObjectState(engine, "NATIVECAM engine state");
+            setDeviceIrcmdManagerEngine(loader, engine, null, "NATIVECAM");
+
+            Object frameCallback = createIrFrameCallback(loader, "NATIVECAM");
+            CountDownLatch initLatch = new CountDownLatch(1);
+            boolean[] initOk = new boolean[]{false};
+            final Object engineRef = engine;
+            Class<?> initCallbackClass = Class.forName(
+                    "com.energy.ac020library.bean.HandleInitCallback", true, loader);
+            Object initCallback = Proxy.newProxyInstance(
+                    initCallbackClass.getClassLoader(),
+                    new Class[]{initCallbackClass},
+                    (proxy, method, args) -> {
+                        append("NATIVECAM HandleInitCallback." + method.getName() +
+                                " args=" + describeArgs(args));
+                        if ("onSuccess".equals(method.getName())) {
+                            initOk[0] = true;
+                            Object ircmdEngine = args != null && args.length > 0 ? args[0] : null;
+                            setDeviceIrcmdManagerEngine(loader, engineRef, ircmdEngine, "NATIVECAM");
+                        } else if ("onFail".equals(method.getName())) {
+                            initOk[0] = false;
+                        }
+                        initLatch.countDown();
+                        return defaultReturnValue(method.getReturnType());
+                    });
+
+            append("NATIVECAM invoking initHandle; if this blocks, the native driver is not accepting this process.");
+            invokeWithLog(
+                    "NATIVECAM initHandle",
+                    engine,
+                    "initHandle",
+                    new Class[]{initCallbackClass},
+                    initCallback);
+            boolean initReturned = initLatch.await(8000, TimeUnit.MILLISECONDS);
+            append("NATIVECAM init callback returned=" + initReturned +
+                    " ok=" + initOk[0]);
+            tryInstallFrameCallback(engine, frameCallback, "NATIVECAM engine");
+            Object startResult = invokeWithLog(
+                    "NATIVECAM startVideoStream",
+                    engine,
+                    "startVideoStream",
+                    new Class[0]);
+            append("NATIVECAM startVideoStream result=" + describeObject(startResult));
+
+            long startedAt = System.currentTimeMillis();
+            long deadline = startedAt + 9000;
+            long lastLogAt = 0;
+            while (System.currentTimeMillis() < deadline && running) {
+                if (latestThermalFrameAt >= startedAt) {
+                    sawFrame = true;
+                    break;
+                }
+                long now = System.currentTimeMillis();
+                if (now - lastLogAt > 1200) {
+                    lastLogAt = now;
+                    append("NATIVECAM waiting for IIrFrameCallback latestAgeMs=" +
+                            latestFrameAgeMs());
+                }
+                sleepMs(150);
+            }
+            append("NATIVECAM result sawFrame=" + sawFrame);
+            setStatus(sawFrame ? "native cam got frame" : "native cam no frames");
+        } catch (Throwable t) {
+            append("NATIVECAM FATAL " + formatThrowable(t));
+            setStatus("native cam failed");
+        } finally {
+            if (engine != null) {
+                tryInvoke(engine, "stopVideoStream");
+                tryInvoke(engine, "releaseVideoStream");
+                tryInvoke(engine, "destroyHandle");
+            }
+            closeUsbProbeContext(usbContext, "NATIVECAM");
+            running = false;
+            append("===== targeted USB_DUAL_NATIVE_CAM probe finished sawFrame=" +
+                    sawFrame + " =====");
+        }
+    }
+
+    private void runVendorControlBlockProbe() {
+        append("===== vendor USBMonitor ctrlBlock probe start =====");
+        append("This bypasses the permission-dialog loop: shell-granted app permission -> vendor USBMonitor.openDevice -> ThermoVue initHandleEngine(ctrlBlock,true).");
+        Object proxy = null;
+        Object usbMonitor = null;
+        Object deviceControlManager = null;
+        Object ctrlBlock = null;
+        boolean sawFrame = false;
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            dumpImportantClasses(loader, false);
+
+            UsbDevice thermal = inspectUsb();
+            if (thermal == null) {
+                append("CTRLBLOCK stop: thermal USB device is not visible. Launch ThermoVue first so it powers the module.");
+                setStatus("ctrlBlock no usb device");
+                return;
+            }
+
+            UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+            try {
+                attemptHiddenUsbGrant(manager, thermal);
+            } catch (Throwable t) {
+                append("CTRLBLOCK hidden grant attempt FAIL " + formatThrowable(t));
+            }
+            if (!manager.hasPermission(thermal)) {
+                append("CTRLBLOCK requesting app USB permission for " + describeUsbDevice(thermal));
+                requestUsbPermissionAndWait(manager, thermal);
+            }
+            append("CTRLBLOCK Android UsbManager.hasPermission=" + manager.hasPermission(thermal));
+            if (!manager.hasPermission(thermal)) {
+                append("CTRLBLOCK stop: app still has no USB permission");
+                setStatus("ctrlBlock no usb permission");
+                return;
+            }
+
+            Class<?> listenerClass = Class.forName(
+                    "com.energy.iruvccamera.usb.OnDeviceConnectListener", true, loader);
+            Object listener = Proxy.newProxyInstance(
+                    listenerClass.getClassLoader(),
+                    new Class[]{listenerClass},
+                    (listenerProxy, method, args) -> {
+                        append("CTRLBLOCK OnDeviceConnectListener." + method.getName() +
+                                " args=" + describeArgs(args));
+                        return defaultReturnValue(method.getReturnType());
+                    });
+            Class<?> usbMonitorClass = Class.forName(
+                    "com.energy.iruvccamera.usb.USBMonitor", true, loader);
+            Constructor<?> usbMonitorCtor = usbMonitorClass.getConstructor(
+                    Context.class,
+                    boolean.class,
+                    listenerClass);
+            usbMonitor = usbMonitorCtor.newInstance(this, false, listener);
+            liveUsbMonitorManager = usbMonitor;
+            invokeWithLog(
+                    "CTRLBLOCK vendor hasPermission",
+                    usbMonitor,
+                    "hasPermission",
+                    new Class[]{UsbDevice.class},
+                    thermal);
+            ctrlBlock = invokeWithLog(
+                    "CTRLBLOCK vendor openDevice",
+                    usbMonitor,
+                    "openDevice",
+                    new Class[]{UsbDevice.class},
+                    thermal);
+            if (ctrlBlock == null) {
+                append("CTRLBLOCK stop: vendor USBMonitor.openDevice returned null");
+                setStatus("ctrlBlock open failed");
+                return;
+            }
+            dumpObjectState(ctrlBlock, "CTRLBLOCK ctrlBlock state");
+            long delayBeforeInitMs = vendorCtrlBlockDelayBeforeInitMs;
+            if (delayBeforeInitMs > 0) {
+                append("CTRLBLOCK takeover delay " + delayBeforeInitMs +
+                        "ms before proxy init; force-stop ThermoVue from host now");
+                sleepMs(delayBeforeInitMs);
+                append("CTRLBLOCK takeover delay finished; USB state before proxy init follows");
+                inspectUsb();
+            }
+
+            Class<?> proxyClass = Class.forName(
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy", true, loader);
+            proxy = proxyClass.getMethod("getInstance").invoke(null);
+            liveProxy = proxy;
+            tryInvoke(proxy, "stopPreview");
+            tryInvoke(proxy, "releaseSource");
+            Method init = proxyClass.getMethod(
+                    "init",
+                    Context.class,
+                    int.class,
+                    int.class,
+                    float.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    int.class,
+                    int.class);
+            init.invoke(proxy, this, 256, 386, 1.0f, 25, "0", 1440, 1080, 25);
+            append("CTRLBLOCK proxy init OK");
+            tryInvoke(proxy, "initData");
+            tryInvoke(proxy, "resetIsFirstFrame");
+            tryInvoke(proxy, "cancelFrameDataCheck");
+            tryInvokeBoolean(proxy, "setHasAPPKilled", false);
+            tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
+            tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
+
+            Class<?> deviceControlManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    true,
+                    loader);
+            deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            liveDeviceControlManager = deviceControlManager;
+            tryInvoke(deviceControlManager, "release");
+            tryInvoke(deviceControlManager, "init");
+
+            Object callback = createIrFrameCallback(loader, "CTRLBLOCK");
+            tryInstallFrameCallback(proxy, callback, "CTRLBLOCK proxy");
+            tryInstallFrameCallback(deviceControlManager, callback, "CTRLBLOCK deviceControl");
+            installFrameCallbacksOnKnownSingletons(loader, callback, "CTRLBLOCK singleton");
+            attachPreviewSurfaceToThermoVueObjects(
+                    loader,
+                    "CTRLBLOCK",
+                    proxy,
+                    usbMonitor,
+                    deviceControlManager);
+
+            Class<?> ctrlBlockClass = Class.forName(
+                    "com.energy.iruvccamera.usb.USBMonitor$UsbControlBlock",
+                    false,
+                    loader);
+            Object initResult = invokeWithLog(
+                    "CTRLBLOCK proxy initHandleEngine(true)",
+                    proxy,
+                    "initHandleEngine",
+                    new Class[]{ctrlBlockClass, boolean.class},
+                    ctrlBlock,
+                    true);
+            append("CTRLBLOCK initHandleEngine returned " + describeObject(initResult));
+            sawFrame = pollNativeScenario(proxy, "CTRLBLOCK proxy", 12000);
+            if (!sawFrame) {
+                append("CTRLBLOCK no proxy fields yet; trying explicit startPreview");
+                tryInvoke(proxy, "startPreview");
+                sawFrame = pollNativeScenario(proxy, "CTRLBLOCK proxy explicit start", 6000);
+            }
+            if (!sawFrame) {
+                append("CTRLBLOCK controlled probe result: no frame; skipping broad direct fallback to avoid unsafe native vendor calls");
+            }
+            setStatus(sawFrame ? "ctrlBlock got frame" : "ctrlBlock no frames");
+        } catch (Throwable t) {
+            append("CTRLBLOCK FATAL " + formatThrowable(t));
+            setStatus("ctrlBlock failed");
+        } finally {
+            running = false;
+            if (proxy != null) {
+                tryInvoke(proxy, "stopPreview");
+                tryInvoke(proxy, "releaseSource");
+            }
+            if (deviceControlManager != null) {
+                tryInvoke(deviceControlManager, "release");
+            }
+            if (usbMonitor != null) {
+                tryInvoke(usbMonitor, "destroy");
+            }
+            liveProxy = null;
+            liveUsbMonitorManager = null;
+            liveDeviceControlManager = null;
+            vendorCtrlBlockDelayBeforeInitMs = 0;
+            append("===== vendor USBMonitor ctrlBlock probe finished sawFrame=" +
                     sawFrame + " =====");
         }
     }
@@ -1427,6 +2230,7 @@ public class MainActivity extends Activity {
             tryInvoke(usbMonitorManager, "destroyMonitor");
             tryInvoke(usbMonitorManager, "init");
             tryInvoke(usbMonitorManager, "registerMonitor");
+            invokeVendorPowerControl(loader, true, "AUTO scenario " + scenario);
 
             Class<?> deviceControlManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
@@ -1571,9 +2375,18 @@ public class MainActivity extends Activity {
                 label);
         addProbeTarget(targets, engine, label + " ircamEngine");
 
+        UsbProbeContext usbContext = null;
+        if (ctrlBlock == null) {
+            usbContext = openUsbProbeContext(label + " direct");
+        } else {
+            append(label + " direct using vendor ctrlBlock; USB fallback context not opened");
+        }
+
+        boolean sawFrame = false;
+        try {
         for (int i = 0; i < targets.size() && i < 40; i++) {
             Object target = targets.get(i);
-            populateProbeFields(target, ctrlBlock, handleParam, callback, "0", label);
+            populateProbeFields(target, ctrlBlock, handleParam, callback, usbContext, "0", label);
             tryInstallFrameCallback(target, callback, label + " direct callback");
             dumpObjectState(target, label + " direct state");
             List<Object> fieldObjects = collectInterestingFieldObjects(target, label);
@@ -1590,6 +2403,7 @@ public class MainActivity extends Activity {
                     ctrlBlock,
                     handleParam,
                     callback,
+                    usbContext,
                     "0",
                     label + " configure");
             for (Object product : products) {
@@ -1599,9 +2413,11 @@ public class MainActivity extends Activity {
 
         for (int i = 0; i < targets.size(); i++) {
             Object target = targets.get(i);
-            populateProbeFields(target, ctrlBlock, handleParam, callback, "0", label);
+            populateProbeFields(target, ctrlBlock, handleParam, callback, usbContext, "0", label);
             tryInstallFrameCallback(target, callback, label + " product callback");
         }
+
+        invokeTargetedPreviewStarts(targets, label + " targeted preview");
 
         for (Object target : new ArrayList<>(targets)) {
             invokeLikelyEngineStartMethods(
@@ -1609,13 +2425,17 @@ public class MainActivity extends Activity {
                     ctrlBlock,
                     handleParam,
                     callback,
+                    usbContext,
                     "0",
                     label + " start");
         }
 
-        boolean sawFrame = pollObjectsForFrames(targets, label + " direct objects", 6500);
+        sawFrame = pollObjectsForFrames(targets, label + " direct objects", 6500);
         append(label + " direct engine probe result sawFrame=" + sawFrame +
                 " targets=" + targets.size());
+        } finally {
+            closeUsbProbeContext(usbContext, label + " direct");
+        }
         return sawFrame;
     }
 
@@ -1701,6 +2521,7 @@ public class MainActivity extends Activity {
         String name = cls.getName();
         if (name.startsWith("java.") ||
                 name.startsWith("android.") ||
+                name.startsWith("com.yegmina.thermallivedebug.") ||
                 name.startsWith("kotlin.") ||
                 name.startsWith("dalvik.")) {
             return false;
@@ -1722,12 +2543,22 @@ public class MainActivity extends Activity {
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId,
             String label) {
         if (target == null) {
             return;
         }
         Class<?> cls = target.getClass();
+        if (!isSafeProbeFieldTarget(cls)) {
+            return;
+        }
+        if (requiresRealUsbIdentity(cls) && ctrlBlock == null && usbContext == null) {
+            append(label + " populateField skip " + cls.getName() +
+                    " because no real UsbControlBlock/USB context exists");
+            return;
+        }
+        configureSafeProbeTarget(target, ctrlBlock, usbContext, label);
         int writes = 0;
         for (Field field : cls.getDeclaredFields()) {
             int modifiers = field.getModifiers();
@@ -1740,6 +2571,7 @@ public class MainActivity extends Activity {
                     ctrlBlock,
                     handleParam,
                     callback,
+                    usbContext,
                     cameraId);
             if (value == null) {
                 continue;
@@ -1767,12 +2599,143 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean isSafeProbeFieldTarget(Class<?> cls) {
+        String name = cls.getName();
+        String lower = name.toLowerCase(Locale.US);
+        return name.equals("com.energy.ac020library.bean.DualUvcHandleParam") ||
+                name.equals("com.energy.ac020library.bean.DevHandleParam") ||
+                lower.endsWith("uvchandleparam") ||
+                lower.endsWith("devhandleparam") ||
+                (lower.contains("ircamenginebuilder") && lower.endsWith("builder"));
+    }
+
+    private boolean requiresRealUsbIdentity(Class<?> cls) {
+        String lower = cls.getName().toLowerCase(Locale.US);
+        return lower.contains("uvchandleparam") || lower.contains("devhandleparam");
+    }
+
+    private void configureSafeProbeTarget(
+            Object target,
+            Object ctrlBlock,
+            UsbProbeContext usbContext,
+            String label) {
+        if (target == null) {
+            return;
+        }
+        String lower = target.getClass().getName().toLowerCase(Locale.US);
+        if (!lower.contains("uvchandleparam") && !lower.contains("devhandleparam")) {
+            return;
+        }
+        if (ctrlBlock != null) {
+            tryInvokeWithAssignableArg(
+                    target,
+                    "setCtrlBlock",
+                    ctrlBlock,
+                    label + " configureHandleParam");
+        }
+        tryInvokeIntSetter(target, "setIrFps", 25, label);
+        tryInvokeFloatSetter(target, "setBandwidth", 1.0f, label);
+        tryInvokeBooleanSetter(target, "setMultiThreadEnable", true, label);
+        tryInvokeIntSetter(target, "setVlWidth", 1440, label);
+        tryInvokeIntSetter(target, "setVlHeight", 1080, label);
+        tryInvokeIntSetter(target, "setVlFps", 25, label);
+        if (usbContext != null && usbContext.device != null) {
+            tryInvokeIntSetter(target, "setVenderId", usbContext.device.getVendorId(), label);
+            tryInvokeIntSetter(target, "setVendorId", usbContext.device.getVendorId(), label);
+            tryInvokeIntSetter(target, "setProductId", usbContext.device.getProductId(), label);
+            if (usbContext.fileDescriptor >= 0) {
+                tryInvokeIntSetter(target, "setFileDescriptor", usbContext.fileDescriptor, label);
+            }
+            if (usbContext.busNum >= 0) {
+                tryInvokeIntSetter(target, "setBusNum", usbContext.busNum, label);
+            }
+            if (usbContext.devNum >= 0) {
+                tryInvokeIntSetter(target, "setDevNum", usbContext.devNum, label);
+            }
+            if (usbContext.usbFsName != null) {
+                tryInvokeStringSetter(target, "setUsbFSName", usbContext.usbFsName, label);
+            }
+        }
+    }
+
+    private void tryInvokeWithAssignableArg(
+            Object target,
+            String methodName,
+            Object arg,
+            String label) {
+        if (target == null || arg == null) {
+            return;
+        }
+        for (Method method : target.getClass().getMethods()) {
+            if (!method.getName().equals(methodName) ||
+                    method.getParameterTypes().length != 1 ||
+                    !method.getParameterTypes()[0].isInstance(arg)) {
+                continue;
+            }
+            try {
+                method.setAccessible(true);
+                Object result = method.invoke(target, arg);
+                append(label + " " + target.getClass().getName() + "." +
+                        describeMethod(method) + " OK result=" + describeObject(result));
+            } catch (Throwable t) {
+                append(label + " " + target.getClass().getName() + "." +
+                        describeMethod(method) + " FAIL " + formatThrowable(t));
+            }
+            return;
+        }
+    }
+
+    private void tryInvokeIntSetter(Object target, String methodName, int value, String label) {
+        tryInvokeTypedSetter(target, methodName, int.class, value, label);
+    }
+
+    private void tryInvokeFloatSetter(Object target, String methodName, float value, String label) {
+        tryInvokeTypedSetter(target, methodName, float.class, value, label);
+    }
+
+    private void tryInvokeBooleanSetter(
+            Object target,
+            String methodName,
+            boolean value,
+            String label) {
+        tryInvokeTypedSetter(target, methodName, boolean.class, value, label);
+    }
+
+    private void tryInvokeStringSetter(Object target, String methodName, String value, String label) {
+        tryInvokeTypedSetter(target, methodName, String.class, value, label);
+    }
+
+    private void tryInvokeTypedSetter(
+            Object target,
+            String methodName,
+            Class<?> type,
+            Object value,
+            String label) {
+        if (target == null || value == null) {
+            return;
+        }
+        try {
+            Method method = target.getClass().getMethod(methodName, type);
+            method.setAccessible(true);
+            Object result = method.invoke(target, value);
+            append(label + " configure " + target.getClass().getName() + "." +
+                    describeMethod(method) + "=" + describeObject(value) +
+                    " result=" + describeObject(result));
+        } catch (NoSuchMethodException ignored) {
+            // Some parameter beans use only a subset of these setters.
+        } catch (Throwable t) {
+            append(label + " configure " + target.getClass().getName() +
+                    "." + methodName + " FAIL " + formatThrowable(t));
+        }
+    }
+
     private Object probeValueForType(
             Class<?> type,
             String name,
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId) {
         if (ctrlBlock != null && type.isInstance(ctrlBlock)) {
             return ctrlBlock;
@@ -1782,6 +2745,14 @@ public class MainActivity extends Activity {
         }
         if (callback != null && type.isInstance(callback)) {
             return callback;
+        }
+        if (usbContext != null) {
+            if (usbContext.connection != null && type.isInstance(usbContext.connection)) {
+                return usbContext.connection;
+            }
+            if (usbContext.device != null && type.isInstance(usbContext.device)) {
+                return usbContext.device;
+            }
         }
         if (type.isInstance(this)) {
             return this;
@@ -1795,6 +2766,17 @@ public class MainActivity extends Activity {
         }
         if (type == String.class) {
             String lower = name.toLowerCase(Locale.US);
+            if (usbContext != null) {
+                if (lower.contains("usbfs") || lower.contains("usb_fs") ||
+                        lower.contains("usbpath") || lower.contains("fsname")) {
+                    return usbContext.usbFsName;
+                }
+                if (usbContext.device != null &&
+                        (lower.contains("devicename") || lower.contains("device_name") ||
+                                lower.contains("devpath") || lower.contains("path"))) {
+                    return usbContext.device.getDeviceName();
+                }
+            }
             if (lower.contains("camera") || lower.contains("id")) {
                 return cameraId;
             }
@@ -1803,15 +2785,34 @@ public class MainActivity extends Activity {
         if (type == Boolean.TYPE || type == Boolean.class) {
             String lower = name.toLowerCase(Locale.US);
             return !(lower.contains("kill") ||
+                    lower.contains("align") ||
+                    lower.contains("burn") ||
+                    lower.contains("capture") ||
                     lower.contains("destroy") ||
+                    lower.contains("flash") ||
+                    lower.contains("manual") ||
                     lower.contains("pause") ||
-                    lower.contains("stop"));
+                    lower.contains("photo") ||
+                    lower.contains("shutter") ||
+                    lower.contains("stop") ||
+                    lower.contains("taking") ||
+                    lower.contains("zoom"));
         }
         if (type == Integer.TYPE || type == Integer.class) {
-            return chooseProbeInt(name);
+            Integer usbInt = chooseUsbProbeInt(name, usbContext);
+            if (isUsbIdentityIntName(name)) {
+                return usbInt;
+            }
+            Integer synthetic = chooseSyntheticProbeInt(name);
+            return synthetic;
         }
         if (type == Long.TYPE || type == Long.class) {
-            return (long) chooseProbeInt(name);
+            Integer usbInt = chooseUsbProbeInt(name, usbContext);
+            if (isUsbIdentityIntName(name)) {
+                return usbInt == null ? null : usbInt.longValue();
+            }
+            Integer synthetic = chooseSyntheticProbeInt(name);
+            return synthetic == null ? null : synthetic.longValue();
         }
         if (type == Float.TYPE || type == Float.class) {
             return 1.0f;
@@ -1825,7 +2826,65 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    private int chooseProbeInt(String name) {
+    private boolean isUsbIdentityIntName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.contains("vender") ||
+                lower.contains("vendor") ||
+                lower.contains("product") ||
+                lower.contains("filedescriptor") ||
+                lower.contains("file_descriptor") ||
+                lower.equals("fd") ||
+                lower.endsWith("_fd") ||
+                lower.contains("descriptor") ||
+                lower.contains("busnum") ||
+                lower.contains("bus_num") ||
+                lower.equals("bus") ||
+                lower.endsWith("_bus") ||
+                lower.contains("devnum") ||
+                lower.contains("dev_num") ||
+                lower.contains("devicenumber") ||
+                lower.contains("device_number") ||
+                lower.equals("dev") ||
+                lower.endsWith("_dev");
+    }
+
+    private Integer chooseUsbProbeInt(String name, UsbProbeContext context) {
+        if (context == null) {
+            return null;
+        }
+        String lower = name.toLowerCase(Locale.US);
+        if (context.device != null &&
+                (lower.contains("vender") || lower.contains("vendor") ||
+                        lower.equals("vid") || lower.endsWith("_vid") ||
+                        lower.contains("vendorid") || lower.contains("venderid"))) {
+            return context.device.getVendorId();
+        }
+        if (context.device != null &&
+                (lower.contains("product") || lower.equals("pid") ||
+                        lower.endsWith("_pid") || lower.contains("productid"))) {
+            return context.device.getProductId();
+        }
+        if (context.fileDescriptor >= 0 &&
+                (lower.contains("filedescriptor") || lower.contains("file_descriptor") ||
+                        lower.equals("fd") || lower.endsWith("_fd") ||
+                        lower.contains("descriptor"))) {
+            return context.fileDescriptor;
+        }
+        if (context.busNum >= 0 &&
+                (lower.contains("busnum") || lower.contains("bus_num") ||
+                        lower.equals("bus") || lower.endsWith("_bus"))) {
+            return context.busNum;
+        }
+        if (context.devNum >= 0 &&
+                (lower.contains("devnum") || lower.contains("dev_num") ||
+                        lower.contains("devicenumber") || lower.contains("device_number") ||
+                        lower.equals("dev") || lower.endsWith("_dev"))) {
+            return context.devNum;
+        }
+        return null;
+    }
+
+    private Integer chooseSyntheticProbeInt(String name) {
         String lower = name.toLowerCase(Locale.US);
         if (lower.contains("thermal") && lower.contains("height")) {
             return THERMAL_HEIGHT;
@@ -1860,7 +2919,7 @@ public class MainActivity extends Activity {
         if (lower.contains("format")) {
             return 0;
         }
-        return 1;
+        return null;
     }
 
     private Object chooseEnumConstant(Class<?> enumType) {
@@ -1958,6 +3017,7 @@ public class MainActivity extends Activity {
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId,
             String label) {
         return invokeLikelyEngineMethodsInternal(
@@ -1965,6 +3025,7 @@ public class MainActivity extends Activity {
                 ctrlBlock,
                 handleParam,
                 callback,
+                usbContext,
                 cameraId,
                 label,
                 false);
@@ -1975,6 +3036,7 @@ public class MainActivity extends Activity {
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId,
             String label) {
         return invokeLikelyEngineMethodsInternal(
@@ -1982,6 +3044,7 @@ public class MainActivity extends Activity {
                 ctrlBlock,
                 handleParam,
                 callback,
+                usbContext,
                 cameraId,
                 label,
                 true);
@@ -1992,6 +3055,7 @@ public class MainActivity extends Activity {
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId,
             String label,
             boolean startPhase) {
@@ -2011,7 +3075,13 @@ public class MainActivity extends Activity {
             if (!isLikelyEngineProbeMethod(method, startPhase)) {
                 continue;
             }
-            Object[] args = buildProbeArgs(method, ctrlBlock, handleParam, callback, cameraId);
+            Object[] args = buildProbeArgs(
+                    method,
+                    ctrlBlock,
+                    handleParam,
+                    callback,
+                    usbContext,
+                    cameraId);
             if (args == null) {
                 continue;
             }
@@ -2045,6 +3115,89 @@ public class MainActivity extends Activity {
         return products;
     }
 
+    private void invokeTargetedPreviewStarts(List<Object> targets, String label) {
+        Surface surface = getVendorPreviewSurface();
+        for (Object target : new ArrayList<>(targets)) {
+            if (target == null) {
+                continue;
+            }
+            Set<String> seen = new HashSet<>();
+            int invoked = 0;
+            for (Method method : concatMethods(
+                    target.getClass().getDeclaredMethods(),
+                    target.getClass().getMethods())) {
+                String key = describeMethod(method);
+                if (!seen.add(key)) {
+                    continue;
+                }
+                List<Object[]> argSets = targetedPreviewArgSets(method, surface);
+                if (argSets.isEmpty()) {
+                    continue;
+                }
+                for (Object[] args : argSets) {
+                    try {
+                        method.setAccessible(true);
+                        Object result = method.invoke(target, args);
+                        invoked++;
+                        append(label + " OK " + target.getClass().getName() +
+                                "." + describeMethod(method) +
+                                " args=" + describeArgs(args) +
+                                " result=" + describeObject(result));
+                    } catch (Throwable t) {
+                        invoked++;
+                        append(label + " FAIL " + target.getClass().getName() +
+                                "." + describeMethod(method) +
+                                " args=" + describeArgs(args) +
+                                " " + formatThrowable(t));
+                    }
+                    if (invoked >= 10) {
+                        append(label + " truncated target=" + target.getClass().getName());
+                        break;
+                    }
+                    sleepMs(120);
+                }
+                if (invoked >= 10) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private List<Object[]> targetedPreviewArgSets(Method method, Surface surface) {
+        List<Object[]> argSets = new ArrayList<>();
+        String lower = method.getName().toLowerCase(Locale.US);
+        Class<?>[] types = method.getParameterTypes();
+        if (lower.equals("startdualpreview") &&
+                types.length == 4 &&
+                isSurfaceType(types[0]) &&
+                isIntType(types[1]) &&
+                isIntType(types[2]) &&
+                isBooleanType(types[3])) {
+            argSets.add(new Object[]{surface, 1440, 1080, true});
+            argSets.add(new Object[]{surface, 1440, 1080, false});
+            argSets.add(new Object[]{surface, 256, 386, true});
+            argSets.add(new Object[]{surface, THERMAL_WIDTH, THERMAL_HEIGHT, true});
+        }
+        return argSets;
+    }
+
+    private Object[] buildTargetedPreviewArgs(Method method) {
+        Surface surface = getVendorPreviewSurface();
+        List<Object[]> argSets = targetedPreviewArgSets(method, surface);
+        if (argSets.isEmpty()) {
+            return null;
+        }
+        return argSets.get(0);
+    }
+
+    private boolean isIntType(Class<?> type) {
+        return type == Integer.TYPE || type == Integer.class;
+    }
+
+    private boolean isBooleanType(Class<?> type) {
+        return type == Boolean.TYPE || type == Boolean.class;
+    }
+
     private Method[] concatMethods(Method[] a, Method[] b) {
         Method[] out = new Method[a.length + b.length];
         System.arraycopy(a, 0, out, 0, a.length);
@@ -2054,6 +3207,9 @@ public class MainActivity extends Activity {
 
     private boolean isLikelyEngineProbeMethod(Method method, boolean startPhase) {
         String lower = method.getName().toLowerCase(Locale.US);
+        if (isDangerousProbeMethod(method)) {
+            return false;
+        }
         if (lower.equals("wait") ||
                 lower.equals("equals") ||
                 lower.equals("hashcode") ||
@@ -2072,12 +3228,21 @@ public class MainActivity extends Activity {
             return false;
         }
         if (startPhase) {
-            return lower.contains("start") ||
-                    lower.contains("open") ||
-                    lower.contains("preview") ||
+            return lower.equals("startpreview") ||
+                    lower.equals("resumepreview") ||
+                    lower.equals("handlestartpreview") ||
+                    lower.equals("initpreview") ||
+                    lower.equals("initcamera") ||
+                    lower.equals("initvlcamera") ||
+                    lower.equals("inithandleengine") ||
+                    lower.equals("native_init_handle_engine") ||
+                    lower.equals("native_start_preview") ||
+                    lower.equals("native_start_stream") ||
+                    lower.equals("startdualpreview") ||
+                    lower.contains("openuvc") ||
+                    lower.contains("opencamera") ||
                     lower.contains("stream") ||
-                    lower.contains("run") ||
-                    lower.contains("handle");
+                    lower.contains("preview");
         }
         return lower.contains("set") ||
                 lower.contains("init") ||
@@ -2086,7 +3251,9 @@ public class MainActivity extends Activity {
                 lower.contains("callback") ||
                 lower.contains("listener") ||
                 lower.contains("param") ||
-                lower.contains("handle") ||
+                lower.equals("inithandleengine") ||
+                lower.equals("native_init_handle_engine") ||
+                lower.equals("updatedevhandleparam") ||
                 lower.contains("engine") ||
                 lower.contains("uvc") ||
                 lower.contains("data") ||
@@ -2096,12 +3263,49 @@ public class MainActivity extends Activity {
                 lower.contains("register");
     }
 
+    private boolean isDangerousProbeMethod(Method method) {
+        String lower = method.getName().toLowerCase(Locale.US);
+        if (lower.equals("handlestartpreview") ||
+                lower.equals("inithandleengine") ||
+                lower.equals("native_init_handle_engine") ||
+                lower.equals("updatedevhandleparam") ||
+                lower.equals("startdualpreview")) {
+            return false;
+        }
+        return lower.contains("align") ||
+                lower.contains("burn") ||
+                lower.contains("calfile") ||
+                lower.contains("calibration") ||
+                lower.contains("capture") ||
+                lower.contains("drag") ||
+                lower.contains("editpreview") ||
+                lower.contains("ffc") ||
+                lower.contains("flash") ||
+                lower.contains("gain") ||
+                lower.contains("gpu") ||
+                lower.contains("isothermal") ||
+                lower.contains("manual") ||
+                lower.contains("nuc") ||
+                lower.contains("palette") ||
+                lower.contains("photo") ||
+                lower.contains("save") ||
+                lower.contains("shutter") ||
+                lower.contains("swatch") ||
+                lower.contains("taking") ||
+                lower.contains("zoom");
+    }
+
     private Object[] buildProbeArgs(
             Method method,
             Object ctrlBlock,
             Object handleParam,
             Object callback,
+            UsbProbeContext usbContext,
             String cameraId) {
+        Object[] targeted = buildTargetedPreviewArgs(method);
+        if (targeted != null) {
+            return targeted;
+        }
         Class<?>[] types = method.getParameterTypes();
         Object[] args = new Object[types.length];
         for (int i = 0; i < types.length; i++) {
@@ -2111,6 +3315,7 @@ public class MainActivity extends Activity {
                     ctrlBlock,
                     handleParam,
                     callback,
+                    usbContext,
                     cameraId);
             if (value == null) {
                 return null;
@@ -2225,6 +3430,36 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             append(label + " frameCallbackProxy FAIL " + formatThrowable(t));
             return null;
+        }
+    }
+
+    private void setDeviceIrcmdManagerEngine(
+            ClassLoader loader,
+            Object ircamEngine,
+            Object ircmdEngine,
+            String label) {
+        try {
+            Class<?> managerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.DeviceIrcmdControlManager",
+                    true,
+                    loader);
+            Object manager = managerClass.getMethod("getInstance").invoke(null);
+            if (ircamEngine != null) {
+                tryInvokeWithAssignableArg(
+                        manager,
+                        "setIrcamEngine",
+                        ircamEngine,
+                        label + " DeviceIrcmdControlManager");
+            }
+            if (ircmdEngine != null) {
+                tryInvokeWithAssignableArg(
+                        manager,
+                        "setIrcmdEngine",
+                        ircmdEngine,
+                        label + " DeviceIrcmdControlManager");
+            }
+        } catch (Throwable t) {
+            append(label + " DeviceIrcmdControlManager FAIL " + formatThrowable(t));
         }
     }
 
@@ -2789,20 +4024,20 @@ public class MainActivity extends Activity {
 
     private byte[] chooseRenderableFrame(byte[] rawTemp, byte[] remapTemp) {
         if (rawTemp != null && rawTemp.length == THERMAL_U16_BYTES) {
-            return rawTemp;
+            return isUsefulThermalFrame(rawTemp) ? rawTemp : null;
         }
         if (rawTemp != null && rawTemp.length >= THERMAL_PACKET_TEMP_OFFSET + THERMAL_U16_BYTES) {
             byte[] plane = new byte[THERMAL_U16_BYTES];
             System.arraycopy(rawTemp, THERMAL_PACKET_TEMP_OFFSET, plane, 0, THERMAL_U16_BYTES);
-            return plane;
+            return isUsefulThermalFrame(plane) ? plane : null;
         }
         if (remapTemp != null && remapTemp.length == THERMAL_U16_BYTES) {
-            return remapTemp;
+            return isUsefulThermalFrame(remapTemp) ? remapTemp : null;
         }
         if (remapTemp != null && remapTemp.length >= THERMAL_U16_BYTES) {
             byte[] plane = new byte[THERMAL_U16_BYTES];
             System.arraycopy(remapTemp, 0, plane, 0, THERMAL_U16_BYTES);
-            return plane;
+            return isUsefulThermalFrame(plane) ? plane : null;
         }
         return null;
     }
@@ -2820,7 +4055,7 @@ public class MainActivity extends Activity {
                 frame[i * 2] = (byte) (sample & 0xff);
                 frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
             }
-            return frame;
+            return isUsefulThermalFrame(frame) ? frame : null;
         }
         if (value instanceof int[] && ((int[]) value).length >= count) {
             int[] source = (int[]) value;
@@ -2830,7 +4065,7 @@ public class MainActivity extends Activity {
                 frame[i * 2] = (byte) (sample & 0xff);
                 frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
             }
-            return frame;
+            return isUsefulThermalFrame(frame) ? frame : null;
         }
         if (value instanceof float[] && ((float[]) value).length >= count) {
             float[] source = (float[]) value;
@@ -2850,13 +4085,13 @@ public class MainActivity extends Activity {
                 frame[i * 2] = (byte) (sample & 0xff);
                 frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
             }
-            return frame;
+            return isUsefulThermalFrame(frame) ? frame : null;
         }
         return null;
     }
 
     private void renderThermal(byte[] frame, String label) {
-        if (frame == null || frame.length < THERMAL_U16_BYTES) {
+        if (frame == null || frame.length < THERMAL_U16_BYTES || !isUsefulThermalFrame(frame)) {
             append("renderThermal skipped invalid frame " + describeBytes(frame));
             return;
         }
@@ -2896,6 +4131,40 @@ public class MainActivity extends Activity {
             preview.setBitmap(bitmap);
             statusText.setText(status);
         });
+    }
+
+    private boolean isUsefulThermalFrame(byte[] frame) {
+        if (frame == null || frame.length < THERMAL_U16_BYTES) {
+            return false;
+        }
+        int count = THERMAL_WIDTH * THERMAL_HEIGHT;
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        int nonZero = 0;
+        int sampledUnique = 0;
+        int[] sampleValues = new int[16];
+        for (int i = 0; i < count; i++) {
+            int byteIndex = i * 2;
+            int value = (frame[byteIndex] & 0xff) | ((frame[byteIndex + 1] & 0xff) << 8);
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+            if (value != 0) {
+                nonZero++;
+            }
+            if (i % 3072 == 0 && sampledUnique < sampleValues.length) {
+                boolean seen = false;
+                for (int j = 0; j < sampledUnique; j++) {
+                    if (sampleValues[j] == value) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    sampleValues[sampledUnique++] = value;
+                }
+            }
+        }
+        return nonZero > 64 && max > min && sampledUnique > 1;
     }
 
     private int heatColor(int v) {
@@ -3103,9 +4372,30 @@ public class MainActivity extends Activity {
                 writeHttpText(output, 200, "OK", httpStatusJson(), "application/json");
             } else if ("/log".equals(path)) {
                 writeHttpText(output, 200, "OK", currentLogText(), "text/plain; charset=utf-8");
+            } else if ("/dump-vendor".equals(path)) {
+                startThread(this::dumpThermoVueArtifacts);
+                writeHttpText(output, 202, "Accepted", "vendor dump started\n", "text/plain");
+            } else if ("/power".equals(path)) {
+                startThread(this::tryPowerThermal);
+                writeHttpText(output, 202, "Accepted", "thermal power attempt started\n", "text/plain");
+            } else if ("/usb-probe".equals(path)) {
+                startThread(this::probeThermalUsbEndpoints);
+                writeHttpText(output, 202, "Accepted", "usb probe started\n", "text/plain");
             } else if ("/start-engine".equals(path)) {
                 runOnUiThread(this::startEngineProbe);
                 writeHttpText(output, 202, "Accepted", "engine probe started\n", "text/plain");
+            } else if ("/start-native-cam".equals(path)) {
+                runOnUiThread(this::startTargetedNativeCamProbe);
+                writeHttpText(output, 202, "Accepted", "targeted native cam started\n", "text/plain");
+            } else if ("/start-ctrlblock".equals(path)) {
+                runOnUiThread(this::startVendorControlBlockProbe);
+                writeHttpText(output, 202, "Accepted", "vendor ctrlBlock probe started\n", "text/plain");
+            } else if ("/start-ctrlblock-takeover".equals(path)) {
+                runOnUiThread(this::startVendorControlBlockTakeoverProbe);
+                writeHttpText(output, 202, "Accepted", "vendor ctrlBlock takeover started\n", "text/plain");
+            } else if ("/start-startup-clone".equals(path)) {
+                runOnUiThread(this::startStartupCloneTest);
+                writeHttpText(output, 202, "Accepted", "startup clone started\n", "text/plain");
             } else if ("/start-native-auto".equals(path)) {
                 runOnUiThread(this::startNativeAutoTest);
                 writeHttpText(output, 202, "Accepted", "native auto started\n", "text/plain");
@@ -3136,7 +4426,14 @@ public class MainActivity extends Activity {
                 "<p>Latest frame: <a href=\"/latest.raw\">raw</a> " +
                 "<a href=\"/latest.pgm\">pgm</a> " +
                 "<a href=\"/latest.png\">png</a></p>" +
+                "<p><a href=\"/dump-vendor\">Dump ThermoVue APKs/libs</a></p>" +
+                "<p><a href=\"/power\">Power Thermal</a></p>" +
+                "<p><a href=\"/usb-probe\">Probe USB</a></p>" +
+                "<p><a href=\"/start-startup-clone\">Start Startup Clone</a></p>" +
                 "<p><a href=\"/start-engine\">Start Engine Probe</a></p>" +
+                "<p><a href=\"/start-native-cam\">Start Targeted Native CAM</a></p>" +
+                "<p><a href=\"/start-ctrlblock\">Start Vendor CtrlBlock</a></p>" +
+                "<p><a href=\"/start-ctrlblock-takeover\">Start CtrlBlock Takeover</a></p>" +
                 "<p><a href=\"/start-native-auto\">Start Native Auto</a></p>" +
                 "<p><a href=\"/stop\">Stop</a></p>" +
                 "<pre>" + htmlEscape(currentLogText()) + "</pre>" +
