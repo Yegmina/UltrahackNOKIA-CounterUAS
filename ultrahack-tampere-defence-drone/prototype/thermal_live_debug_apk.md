@@ -19,6 +19,11 @@ live thermal frames into its own UI.
 6. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
 7. Tap `Start SDK`.
 
+To test whether ThermoVue stops its camera/thermal stream when it loses
+foreground, use `TVue FG Test` instead of `Launch TVue` + `Start SDK`. It starts
+the SDK polling thread first, then launches ThermoVue on top and keeps logging
+in the background. Wait 15-20 seconds, return to this app, then tap `Share Log`.
+
 If live thermal frames are available, the preview panel will show the real
 256x192 thermal value matrix rendered with a color palette, plus min/max/mean/FPS
 status. If not, the log panel should show where the path failed: USB visibility,

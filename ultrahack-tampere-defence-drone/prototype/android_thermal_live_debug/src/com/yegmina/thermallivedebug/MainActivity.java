@@ -82,6 +82,7 @@ public class MainActivity extends Activity {
     private volatile Object liveProxy;
     private volatile Object liveUsbMonitorManager;
     private volatile Object liveDeviceControlManager;
+    private volatile boolean foregroundThermoVueTest;
     private DexClassLoader thermoVueLoader;
 
     @Override
@@ -127,6 +128,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
         buttons.addView(button("Start SDK", view -> startSdkLive()));
+        buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
         buttons.addView(button("Stop", view -> stopSdkLive()));
         buttons.addView(button("Share Log", view -> shareLog()));
 
@@ -340,8 +342,22 @@ public class MainActivity extends Activity {
         startThread(this::runSdkLive);
     }
 
+    private void startThermoVueForegroundTest() {
+        if (running) {
+            append("foreground ThermoVue test already running");
+            return;
+        }
+        foregroundThermoVueTest = true;
+        running = true;
+        setStatus("starting ThermoVue foreground test");
+        append("===== ThermoVue foreground hypothesis test =====");
+        append("This starts SDK polling, then launches ThermoVue so ThermoVue remains foreground.");
+        startThread(this::runSdkLive);
+    }
+
     private void stopSdkLive() {
         running = false;
+        foregroundThermoVueTest = false;
         setStatus("stopping and closing USB monitor");
         Object proxy = liveProxy;
         if (proxy != null) {
@@ -370,6 +386,8 @@ public class MainActivity extends Activity {
         boolean explicitStartTried = false;
         boolean monitorClosedToStopDialogLoop = false;
         long sdkStartedAt = System.currentTimeMillis();
+        boolean shouldLaunchThermoVueForeground = foregroundThermoVueTest;
+        long noFrameTimeoutMs = shouldLaunchThermoVueForeground ? 20000 : 8000;
         try {
             DexClassLoader loader = getThermoVueClassLoader();
             initializeMmkv(loader);
@@ -412,6 +430,10 @@ public class MainActivity extends Activity {
             liveUsbMonitorManager = usbMonitorManager;
             tryInvoke(usbMonitorManager, "init");
             tryInvoke(usbMonitorManager, "registerMonitor");
+            if (shouldLaunchThermoVueForeground) {
+                append("foreground test: launching ThermoVue now; return after 15-20s and share log");
+                runOnUiThread(this::launchThermoVue);
+            }
 
             Class<?> deviceControlManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
@@ -501,11 +523,12 @@ public class MainActivity extends Activity {
                         tryInvoke(usbMonitorManager, "unregisterMonitor");
                         tryInvoke(usbMonitorManager, "destroyMonitor");
                     } else if (frame == null && !monitorClosedToStopDialogLoop &&
-                            now - sdkStartedAt > 8000) {
+                            now - sdkStartedAt > noFrameTimeoutMs) {
                         monitorClosedToStopDialogLoop = true;
                         fallbackAction = true;
                         setStatus("closing USB monitor after timeout");
-                        append("fallback: closing USB monitor after 8s without frames to stop repeated permission dialogs");
+                        append("fallback: closing USB monitor after " + noFrameTimeoutMs +
+                                "ms without frames to stop repeated permission dialogs");
                         tryInvoke(usbMonitorManager, "unregisterMonitor");
                         tryInvoke(usbMonitorManager, "destroyMonitor");
                     }
@@ -519,6 +542,7 @@ public class MainActivity extends Activity {
             setStatus("SDK failed");
         } finally {
             running = false;
+            foregroundThermoVueTest = false;
             liveProxy = null;
             liveUsbMonitorManager = null;
             liveDeviceControlManager = null;
