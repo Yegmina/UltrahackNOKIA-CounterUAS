@@ -39,17 +39,26 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -81,6 +90,7 @@ public class MainActivity extends Activity {
     private static final int THERMAL_HEIGHT = 192;
     private static final int THERMAL_U16_BYTES = THERMAL_WIDTH * THERMAL_HEIGHT * 2;
     private static final int THERMAL_PACKET_TEMP_OFFSET = THERMAL_U16_BYTES + 1024;
+    private static final int HTTP_PORT = 8088;
     private static final int REQUEST_PERMISSIONS = 41;
     private static final int REQUEST_MEDIA_PROJECTION = 42;
     private static final String TINY2C_USB_MODE_PATH =
@@ -99,6 +109,11 @@ public class MainActivity extends Activity {
     private volatile Object liveUsbMonitorManager;
     private volatile Object liveDeviceControlManager;
     private volatile boolean foregroundThermoVueTest;
+    private volatile byte[] latestThermalFrame;
+    private volatile String latestThermalLabel = "none";
+    private volatile long latestThermalFrameAt;
+    private volatile boolean httpServerRunning;
+    private volatile ServerSocket httpServerSocket;
     private DexClassLoader thermoVueLoader;
 
     @Override
@@ -114,6 +129,7 @@ public class MainActivity extends Activity {
         append("device=" + Build.MANUFACTURER + " " + Build.MODEL +
                 " sdk=" + Build.VERSION.SDK_INT);
         requestAppPermissions();
+        startHttpServer();
     }
 
     private void buildUi() {
@@ -152,6 +168,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("Load Cap", view -> showLatestScreenCapture()));
         buttons.addView(button("Stop Cap", view -> stopThermoVueScreenCapture()));
         buttons.addView(button("Stop", view -> stopSdkLive()));
+        buttons.addView(button("HTTP", view -> startHttpServer()));
         buttons.addView(button("Share Log", view -> shareLog()));
 
         HorizontalScrollView buttonScroll = new HorizontalScrollView(this);
@@ -175,6 +192,12 @@ public class MainActivity extends Activity {
         button.setMinWidth(dp(96));
         button.setOnClickListener(listener);
         return button;
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopHttpServer();
+        super.onDestroy();
     }
 
     private void requestAppPermissions() {
@@ -2495,6 +2518,16 @@ public class MainActivity extends Activity {
     }
 
     private void renderThermal(byte[] frame, String label) {
+        if (frame == null || frame.length < THERMAL_U16_BYTES) {
+            append("renderThermal skipped invalid frame " + describeBytes(frame));
+            return;
+        }
+        byte[] stored = new byte[THERMAL_U16_BYTES];
+        System.arraycopy(frame, 0, stored, 0, THERMAL_U16_BYTES);
+        latestThermalFrame = stored;
+        latestThermalLabel = label;
+        latestThermalFrameAt = System.currentTimeMillis();
+
         int count = THERMAL_WIDTH * THERMAL_HEIGHT;
         int[] values = new int[count];
         int min = Integer.MAX_VALUE;
@@ -2662,6 +2695,269 @@ public class MainActivity extends Activity {
             }
         }
         return count;
+    }
+
+    private synchronized void startHttpServer() {
+        if (httpServerRunning) {
+            append("HTTP server already running " + getHttpUrls());
+            return;
+        }
+        httpServerRunning = true;
+        Thread thread = new Thread(() -> {
+            try (ServerSocket server = new ServerSocket(HTTP_PORT)) {
+                httpServerSocket = server;
+                append("HTTP server listening " + getHttpUrls());
+                while (httpServerRunning) {
+                    Socket socket = server.accept();
+                    new Thread(() -> handleHttpClient(socket), "thermal-http-client").start();
+                }
+            } catch (Throwable t) {
+                if (httpServerRunning) {
+                    append("HTTP server FAIL " + formatThrowable(t));
+                }
+            } finally {
+                httpServerRunning = false;
+                httpServerSocket = null;
+                append("HTTP server stopped");
+            }
+        }, "thermal-http-server");
+        thread.start();
+    }
+
+    private synchronized void stopHttpServer() {
+        httpServerRunning = false;
+        ServerSocket server = httpServerSocket;
+        if (server != null) {
+            try {
+                server.close();
+            } catch (IOException ignored) {
+                // Closing best-effort only; app shutdown can continue.
+            }
+        }
+    }
+
+    private void handleHttpClient(Socket socket) {
+        try (Socket client = socket;
+             BufferedReader reader = new BufferedReader(
+                     new InputStreamReader(client.getInputStream()));
+             OutputStream output = client.getOutputStream()) {
+            String requestLine = reader.readLine();
+            if (requestLine == null) {
+                return;
+            }
+            String line;
+            while ((line = reader.readLine()) != null && line.length() > 0) {
+                // Drain headers; this tiny debug server only uses the path.
+            }
+            String[] parts = requestLine.split(" ");
+            if (parts.length < 2) {
+                writeHttpText(output, 400, "Bad Request", "bad request\n", "text/plain");
+                return;
+            }
+            String path = parts[1];
+            int queryIndex = path.indexOf('?');
+            if (queryIndex >= 0) {
+                path = path.substring(0, queryIndex);
+            }
+            if ("/".equals(path)) {
+                writeHttpText(output, 200, "OK", httpIndexHtml(), "text/html; charset=utf-8");
+            } else if ("/status".equals(path)) {
+                writeHttpText(output, 200, "OK", httpStatusJson(), "application/json");
+            } else if ("/log".equals(path)) {
+                writeHttpText(output, 200, "OK", currentLogText(), "text/plain; charset=utf-8");
+            } else if ("/start-engine".equals(path)) {
+                runOnUiThread(this::startEngineProbe);
+                writeHttpText(output, 202, "Accepted", "engine probe started\n", "text/plain");
+            } else if ("/start-native-auto".equals(path)) {
+                runOnUiThread(this::startNativeAutoTest);
+                writeHttpText(output, 202, "Accepted", "native auto started\n", "text/plain");
+            } else if ("/stop".equals(path)) {
+                runOnUiThread(this::stopSdkLive);
+                writeHttpText(output, 202, "Accepted", "stop requested\n", "text/plain");
+            } else if ("/latest.raw".equals(path)) {
+                writeLatestRaw(output);
+            } else if ("/latest.pgm".equals(path)) {
+                writeLatestPgm(output);
+            } else if ("/latest.png".equals(path)) {
+                writeLatestPng(output);
+            } else {
+                writeHttpText(output, 404, "Not Found", "not found\n", "text/plain");
+            }
+        } catch (Throwable t) {
+            append("HTTP client FAIL " + formatThrowable(t));
+        }
+    }
+
+    private String httpIndexHtml() {
+        return "<!doctype html><html><head><meta charset=\"utf-8\">" +
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+                "<title>Thermal Live Debug</title></head><body>" +
+                "<h1>Thermal Live Debug</h1>" +
+                "<p>Status: <a href=\"/status\">/status</a></p>" +
+                "<p>Log: <a href=\"/log\">/log</a></p>" +
+                "<p>Latest frame: <a href=\"/latest.raw\">raw</a> " +
+                "<a href=\"/latest.pgm\">pgm</a> " +
+                "<a href=\"/latest.png\">png</a></p>" +
+                "<p><a href=\"/start-engine\">Start Engine Probe</a></p>" +
+                "<p><a href=\"/start-native-auto\">Start Native Auto</a></p>" +
+                "<p><a href=\"/stop\">Stop</a></p>" +
+                "<pre>" + htmlEscape(currentLogText()) + "</pre>" +
+                "</body></html>";
+    }
+
+    private String httpStatusJson() {
+        byte[] frame = latestThermalFrame;
+        return "{" +
+                "\"running\":" + running + "," +
+                "\"httpPort\":" + HTTP_PORT + "," +
+                "\"latestFrameBytes\":" + (frame == null ? 0 : frame.length) + "," +
+                "\"latestFrameAgeMs\":" + latestFrameAgeMs() + "," +
+                "\"latestLabel\":\"" + jsonEscape(latestThermalLabel) + "\"," +
+                "\"logFile\":\"" + jsonEscape(logFile == null ? "" : logFile.getAbsolutePath()) + "\"" +
+                "}\n";
+    }
+
+    private long latestFrameAgeMs() {
+        long at = latestThermalFrameAt;
+        if (at <= 0) {
+            return -1;
+        }
+        return Math.max(0, System.currentTimeMillis() - at);
+    }
+
+    private String currentLogText() {
+        synchronized (logBuffer) {
+            return logBuffer.toString();
+        }
+    }
+
+    private void writeLatestRaw(OutputStream output) throws IOException {
+        byte[] frame = latestThermalFrame;
+        if (frame == null) {
+            writeHttpText(output, 404, "Not Found", "no frame\n", "text/plain");
+            return;
+        }
+        writeHttpBytes(output, 200, "OK", "application/octet-stream", frame);
+    }
+
+    private void writeLatestPgm(OutputStream output) throws IOException {
+        byte[] frame = latestThermalFrame;
+        if (frame == null) {
+            writeHttpText(output, 404, "Not Found", "no frame\n", "text/plain");
+            return;
+        }
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        String header = "P5\n" + THERMAL_WIDTH + " " + THERMAL_HEIGHT + "\n65535\n";
+        body.write(header.getBytes("US-ASCII"));
+        for (int i = 0; i < THERMAL_U16_BYTES; i += 2) {
+            int value = (frame[i] & 0xff) | ((frame[i + 1] & 0xff) << 8);
+            body.write((value >> 8) & 0xff);
+            body.write(value & 0xff);
+        }
+        writeHttpBytes(output, 200, "OK", "image/x-portable-graymap", body.toByteArray());
+    }
+
+    private void writeLatestPng(OutputStream output) throws IOException {
+        byte[] frame = latestThermalFrame;
+        if (frame == null) {
+            writeHttpText(output, 404, "Not Found", "no frame\n", "text/plain");
+            return;
+        }
+        Bitmap bitmap = thermalBitmapFromFrame(frame);
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, body);
+        writeHttpBytes(output, 200, "OK", "image/png", body.toByteArray());
+    }
+
+    private Bitmap thermalBitmapFromFrame(byte[] frame) {
+        int count = THERMAL_WIDTH * THERMAL_HEIGHT;
+        int[] values = new int[count];
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        for (int i = 0; i < count; i++) {
+            int byteIndex = i * 2;
+            int value = (frame[byteIndex] & 0xff) | ((frame[byteIndex + 1] & 0xff) << 8);
+            values[i] = value;
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        }
+        int range = Math.max(1, max - min);
+        int[] colors = new int[count];
+        for (int i = 0; i < count; i++) {
+            colors[i] = heatColor((values[i] - min) * 255 / range);
+        }
+        return Bitmap.createBitmap(colors, THERMAL_WIDTH, THERMAL_HEIGHT, Bitmap.Config.ARGB_8888);
+    }
+
+    private void writeHttpText(
+            OutputStream output,
+            int code,
+            String reason,
+            String body,
+            String contentType) throws IOException {
+        writeHttpBytes(output, code, reason, contentType, body.getBytes("UTF-8"));
+    }
+
+    private void writeHttpBytes(
+            OutputStream output,
+            int code,
+            String reason,
+            String contentType,
+            byte[] body) throws IOException {
+        String header = "HTTP/1.1 " + code + " " + reason + "\r\n" +
+                "Content-Type: " + contentType + "\r\n" +
+                "Content-Length: " + body.length + "\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n";
+        output.write(header.getBytes("US-ASCII"));
+        output.write(body);
+        output.flush();
+    }
+
+    private String getHttpUrls() {
+        List<String> urls = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                    continue;
+                }
+                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress address = addresses.nextElement();
+                    if (address instanceof Inet4Address && !address.isLoopbackAddress()) {
+                        urls.add("http://" + address.getHostAddress() + ":" + HTTP_PORT + "/");
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            append("HTTP url enumerate FAIL " + formatThrowable(t));
+        }
+        if (urls.isEmpty()) {
+            urls.add("http://PHONE_IP:" + HTTP_PORT + "/");
+        }
+        return urls.toString();
+    }
+
+    private String htmlEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;");
+    }
+
+    private String jsonEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
     }
 
     private void shareLog() {

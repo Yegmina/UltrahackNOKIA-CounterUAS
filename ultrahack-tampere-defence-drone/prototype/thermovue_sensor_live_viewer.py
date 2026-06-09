@@ -29,6 +29,8 @@ import sys
 import threading
 import time
 from typing import Iterable, Iterator
+import urllib.error
+import urllib.request
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
@@ -276,8 +278,12 @@ def read_exact(stream, size: int) -> bytes:
 
 
 def parse_packet(data: bytes, *, include_visible: bool = False) -> ThermoVuePacket:
+    if len(data) == IR_BYTES:
+        plane = np.frombuffer(data, dtype="<u2").reshape(IR_H, IR_W)
+        return ThermoVuePacket(ir=plane.copy(), info=b"", temp=plane.copy(), visible=None)
+
     if len(data) != PACKET_BYTES:
-        raise ValueError(f"Expected {PACKET_BYTES:,} bytes, got {len(data):,}.")
+        raise ValueError(f"Expected {PACKET_BYTES:,} or {IR_BYTES:,} bytes, got {len(data):,}.")
 
     offset = 0
     ir = np.frombuffer(data[offset : offset + IR_BYTES], dtype="<u2").reshape(IR_H, IR_W)
@@ -349,6 +355,39 @@ def file_source(path: Path, loop: bool) -> Iterator[bytes]:
                 yield chunk
         if not loop:
             return
+
+
+def http_latest_source(phone_url: str, fps: float) -> Iterator[bytes]:
+    base = phone_url.rstrip("/")
+    raw_url = base + "/latest.raw"
+    status_url = base + "/status"
+    interval = 1.0 / max(fps, 0.1)
+    last_message = ""
+    print(f"Polling Thermal Live Debug at {raw_url}")
+    while True:
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(raw_url, timeout=5.0) as response:
+                data = response.read()
+            if len(data) != IR_BYTES:
+                message = f"HTTP frame has {len(data):,} bytes, expected {IR_BYTES:,}; status={status_url}"
+                if message != last_message:
+                    print(message)
+                    last_message = message
+            else:
+                yield data
+        except urllib.error.HTTPError as exc:
+            message = f"HTTP {exc.code} from {raw_url}; open {status_url} or run Engine Probe"
+            if message != last_message:
+                print(message)
+                last_message = message
+        except Exception as exc:  # noqa: BLE001 - network failures should keep retrying
+            message = f"HTTP poll failed: {exc}"
+            if message != last_message:
+                print(message)
+                last_message = message
+        elapsed = time.perf_counter() - started
+        time.sleep(max(0.0, interval - elapsed))
 
 
 def synthetic_packet_source(fps: float) -> Iterator[bytes]:
@@ -567,6 +606,8 @@ class LiveViewer:
 def build_source(args: argparse.Namespace) -> Iterator[bytes]:
     if args.source == "demo":
         return synthetic_packet_source(args.demo_fps)
+    if args.source == "http-latest":
+        return http_latest_source(args.phone_url, args.http_poll_hz)
     if args.source == "file":
         if not args.packet_file:
             raise SystemExit("--packet-file is required with --source file")
@@ -597,13 +638,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        choices=("tcp-listen", "tcp-connect", "file", "demo"),
+        choices=("tcp-listen", "tcp-connect", "file", "demo", "http-latest"),
         default="tcp-listen",
         help="Where raw ThermoVue packets come from.",
     )
     parser.add_argument("--bind", default="0.0.0.0", help="Bind address for --source tcp-listen.")
     parser.add_argument("--host", default="127.0.0.1", help="Host for --source tcp-connect.")
     parser.add_argument("--port", type=int, default=7777, help="TCP port for raw packet bridge.")
+    parser.add_argument("--phone-url", default="http://127.0.0.1:8088", help="Thermal Live Debug base URL for --source http-latest.")
+    parser.add_argument("--http-poll-hz", type=float, default=5.0, help="Polling rate for --source http-latest.")
     parser.add_argument(
         "--protocol",
         choices=("fixed", "u32le"),

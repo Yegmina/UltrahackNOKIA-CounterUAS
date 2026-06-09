@@ -9,6 +9,11 @@ prototype/android_thermal_live_debug/build/thermal-live-debug.apk
 Purpose: run entirely on the phone and test whether a side-loaded app can get
 live thermal frames into its own UI.
 
+The app also starts a small HTTP debug server on port `8088`. This is important
+when USB/ADB is unreliable: open the URL shown in the app log/status from the
+laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
+`/latest.png`.
+
 ## Button Flow
 
 1. Install and open `Thermal Live Debug`.
@@ -23,6 +28,8 @@ live thermal frames into its own UI.
 8. Tap `Start SDK`.
 9. Tap `Engine Probe` for a focused direct-native attempt around
    `IrcamEngine`, `IrcamEngineBuilder`, and `DualUvcHandleParam`.
+10. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
+    from the laptop.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
 foreground, use `TVue FG Test` instead of `Launch TVue` + `Start SDK`. It starts
@@ -66,6 +73,18 @@ If live thermal frames are available, the preview panel will show the real
 status. If not, the log panel should show where the path failed: USB visibility,
 permission, ThermoVue package loading, native init, preview start, or frame
 polling.
+
+Laptop live viewer over Wi-Fi/HTTP:
+
+```powershell
+py -3 prototype\thermovue_sensor_live_viewer.py --source http-latest --phone-url http://PHONE_IP:8088
+```
+
+Headless one-frame check:
+
+```powershell
+py -3 prototype\thermovue_sensor_live_viewer.py --source http-latest --phone-url http://PHONE_IP:8088 --headless --frames 1
+```
 
 If the log shows `connected=true` with a non-null `UsbControlBlock`, USB access
 is at least partly working. If it still shows `frameCount=0 rawTemp=null`, the
