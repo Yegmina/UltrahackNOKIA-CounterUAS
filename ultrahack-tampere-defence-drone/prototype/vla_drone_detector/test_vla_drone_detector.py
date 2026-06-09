@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PIL import Image, ImageChops
 
 from vla_drone_detector import (
     Detection,
     build_prompt,
+    candidate_env_paths,
     detection_from_raw,
     detections_from_response,
     draw_boxes,
@@ -129,3 +132,13 @@ def test_build_prompts_include_required_terms_for_each_polarity_and_preset() -> 
             assert '"category": "drone"' in prompt
             assert "[ymin, xmin, ymax, xmax]" in prompt
             assert polarity.split("_")[0] in prompt or polarity == "visible_rgb"
+
+
+def test_candidate_env_paths_include_repo_root_and_worktree_sibling() -> None:
+    candidates = candidate_env_paths()
+    repo_root = Path(__file__).resolve().parents[2]
+
+    assert repo_root / ".env" in candidates
+    if "-" in repo_root.parent.name:
+        base_workspace = repo_root.parent.with_name(repo_root.parent.name.split("-", 1)[0])
+        assert base_workspace / repo_root.name / ".env" in candidates

@@ -62,6 +62,35 @@ class Detection:
         return record
 
 
+def candidate_env_paths() -> list[Path]:
+    module_path = Path(__file__).resolve()
+    repo_root = module_path.parents[2]
+    workspace_dir = repo_root.parent
+    candidates = [
+        Path.cwd() / ".env",
+        module_path.with_name(".env"),
+        repo_root / ".env",
+    ]
+
+    if "-" in workspace_dir.name:
+        base_workspace = workspace_dir.with_name(workspace_dir.name.split("-", 1)[0])
+        candidates.extend(
+            [
+                base_workspace / repo_root.name / ".env",
+                base_workspace / repo_root.name / "prototype" / "vla_drone_detector" / ".env",
+            ]
+        )
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
 def load_local_env() -> None:
     """Load a nearby .env file when python-dotenv is installed."""
 
@@ -70,12 +99,7 @@ def load_local_env() -> None:
     except ImportError:
         return
 
-    candidates = [
-        Path.cwd() / ".env",
-        Path(__file__).with_name(".env"),
-        Path(__file__).parents[2] / ".env",
-    ]
-    for candidate in candidates:
+    for candidate in candidate_env_paths():
         if candidate.exists():
             load_dotenv(candidate, override=False)
 
@@ -429,7 +453,7 @@ def load_api_client() -> Any:
     load_local_env()
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set. Add it to .env or the environment.")
+        raise RuntimeError("Detector credentials were not loaded from .env or the environment.")
 
     try:
         from google import genai

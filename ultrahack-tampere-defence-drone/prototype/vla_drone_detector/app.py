@@ -59,9 +59,6 @@ with st.sidebar:
         placeholder="Optional extra scene or sensor notes.",
     )
 
-if not os.environ.get("GEMINI_API_KEY"):
-    st.info("Add GEMINI_API_KEY to a local .env file before running detection.")
-
 tabs = st.tabs(["Image", "Video"])
 
 
