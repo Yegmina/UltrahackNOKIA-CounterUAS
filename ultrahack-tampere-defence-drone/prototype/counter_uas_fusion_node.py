@@ -8,6 +8,7 @@ logic is heuristic until a real drone model is dropped in.
 from __future__ import annotations
 
 import argparse
+import json
 import queue
 import socket
 import threading
@@ -337,7 +338,11 @@ def detect_thermal_candidate(frame: ThermalFrame | None) -> tuple[float, tuple[i
 
 
 def detect_rgb_motion(
-    frame: np.ndarray | None, previous_gray: np.ndarray | None
+    frame: np.ndarray | None,
+    previous_gray: np.ndarray | None,
+    min_area: float = 6.0,
+    max_area_ratio: float = 0.08,
+    threshold: int = 22,
 ) -> tuple[float, tuple[int, int] | None, int, np.ndarray | None]:
     if frame is None:
         return 0.0, None, 0, previous_gray
@@ -352,14 +357,14 @@ def detect_rgb_motion(
         return 0.0, None, 0, gray
 
     delta = cv2.absdiff(previous_gray, gray)
-    _, mask = cv2.threshold(delta, 22, 255, cv2.THRESH_BINARY)
+    _, mask = cv2.threshold(delta, threshold, 255, cv2.THRESH_BINARY)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best: tuple[float, tuple[int, int], int] | None = None
     frame_area = frame.shape[0] * frame.shape[1]
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 6 or area > frame_area * 0.08:
+        if area < min_area or area > frame_area * max_area_ratio:
             continue
         x, y, w, h = cv2.boundingRect(contour)
         aspect = max(w, h) / max(1, min(w, h))
@@ -375,14 +380,88 @@ def detect_rgb_motion(
     return best[0], best[1], best[2], gray
 
 
-def fuse(rgb_score: float, thermal_score: float, audio_score: float) -> float:
+def fuse(
+    rgb_score: float,
+    thermal_score: float,
+    audio_score: float,
+    rgb_weight: float = 0.60,
+    thermal_weight: float = 0.25,
+    audio_weight: float = 0.15,
+) -> float:
+    total_weight = max(1e-6, rgb_weight + thermal_weight + audio_weight)
     return float(
         np.clip(
-            0.60 * rgb_score + 0.25 * thermal_score + 0.15 * audio_score,
+            (
+                rgb_weight * rgb_score
+                + thermal_weight * thermal_score
+                + audio_weight * audio_score
+            )
+            / total_weight,
             0.0,
             1.0,
         )
     )
+
+
+def rounded(value: float | None, places: int = 3) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), places)
+
+
+def write_telemetry(
+    handle: Any,
+    frame_index: int,
+    timestamp: float,
+    fps: float,
+    state: DetectionState,
+    thermal_age: float | None,
+    thermal_fresh: bool,
+    audio_age: float | None,
+    audio_fresh: bool,
+    latest_audio: AudioScore | None,
+    mount_command: Any | None,
+) -> None:
+    target = None
+    if state.target_xy is not None:
+        target = {
+            "x": int(state.target_xy[0]),
+            "y": int(state.target_xy[1]),
+            "radius": int(state.target_radius),
+        }
+    mount = None
+    if mount_command is not None:
+        mount = {
+            "pan_speed": rounded(mount_command.pan_speed),
+            "tilt_speed": rounded(mount_command.tilt_speed),
+            "reason": mount_command.reason,
+        }
+    record = {
+        "timestamp": rounded(timestamp, 6),
+        "frame": frame_index,
+        "fps": rounded(fps, 2),
+        "status": state.status,
+        "scores": {
+            "rgb": rounded(state.rgb_score),
+            "thermal": rounded(state.thermal_score),
+            "audio": rounded(state.audio_score),
+            "fused": rounded(state.fused_score),
+        },
+        "target": target,
+        "thermal": {
+            "age_s": rounded(thermal_age),
+            "fresh": thermal_fresh,
+        },
+        "audio": {
+            "age_s": rounded(audio_age),
+            "fresh": audio_fresh,
+            "rms": None if latest_audio is None else rounded(latest_audio.rms),
+            "peak_hz": None if latest_audio is None else rounded(latest_audio.peak_hz, 1),
+            "band_ratio": None if latest_audio is None else rounded(latest_audio.band_ratio),
+        },
+        "mount": mount,
+    }
+    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 def open_rgb_source(source: str | None) -> Any:
@@ -504,9 +583,15 @@ def run(args: argparse.Namespace) -> None:
     latest_thermal: ThermalFrame | None = None
     latest_audio: AudioScore | None = None
     frame_index = 0
+    started_at = time.time()
     save_dir = Path(args.save_dir) if args.save_dir else None
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
+    telemetry_file = None
+    if args.telemetry_jsonl:
+        telemetry_path = Path(args.telemetry_jsonl)
+        telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+        telemetry_file = telemetry_path.open("a", encoding="utf-8", buffering=1)
 
     try:
         while True:
@@ -523,21 +608,54 @@ def run(args: argparse.Namespace) -> None:
 
             latest_thermal = read_latest(thermal_queue, latest_thermal)
             latest_audio = read_latest(audio_queue, latest_audio)
-            thermal_score, thermal_xy, thermal_radius = detect_thermal_candidate(latest_thermal)
-            rgb_score, rgb_xy, rgb_radius, previous_gray = detect_rgb_motion(rgb, previous_gray)
-            audio_age = None if latest_audio is None else time.time() - latest_audio.timestamp
-            audio_score = (
-                0.0
-                if latest_audio is None or audio_age is None or audio_age > args.audio_stale_seconds
-                else latest_audio.score
+            now = time.time()
+            thermal_age = None if latest_thermal is None else now - latest_thermal.timestamp
+            thermal_fresh = (
+                latest_thermal is not None
+                and thermal_age is not None
+                and thermal_age <= args.thermal_stale_seconds
             )
-            fused_score = fuse(rgb_score, thermal_score, audio_score)
+            if thermal_fresh:
+                thermal_score, thermal_xy, thermal_radius = detect_thermal_candidate(latest_thermal)
+            else:
+                thermal_score, thermal_xy, thermal_radius = 0.0, None, 0
+
+            rgb_score, rgb_xy, rgb_radius, previous_gray = detect_rgb_motion(
+                rgb,
+                previous_gray,
+                min_area=args.rgb_motion_min_area,
+                max_area_ratio=args.rgb_motion_max_area_ratio,
+                threshold=args.rgb_motion_threshold,
+            )
+            audio_age = None if latest_audio is None else now - latest_audio.timestamp
+            audio_fresh = (
+                latest_audio is not None
+                and audio_age is not None
+                and audio_age <= args.audio_stale_seconds
+            )
+            audio_score = latest_audio.score if audio_fresh and latest_audio is not None else 0.0
+            fused_score = fuse(
+                rgb_score,
+                thermal_score,
+                audio_score,
+                rgb_weight=args.fusion_rgb_weight,
+                thermal_weight=args.fusion_thermal_weight,
+                audio_weight=args.fusion_audio_weight,
+            )
             target_xy = rgb_xy
             target_radius = rgb_radius
-            if target_xy is None and thermal_xy is not None:
+            if target_xy is None and thermal_xy is not None and rgb is None:
                 target_xy = thermal_xy
                 target_radius = thermal_radius
-            status = "confirmed" if fused_score >= args.alert_threshold else "watching"
+            base_status = "confirmed" if fused_score >= args.alert_threshold else "watching"
+            live_sources = []
+            if rgb is not None:
+                live_sources.append("rgb")
+            if thermal_fresh:
+                live_sources.append("thermal")
+            if audio_fresh:
+                live_sources.append("audio")
+            status = f"{base_status} {'/'.join(live_sources) if live_sources else 'no-source'}"
             state = DetectionState(
                 rgb_score=rgb_score,
                 thermal_score=thermal_score,
@@ -547,15 +665,29 @@ def run(args: argparse.Namespace) -> None:
                 target_radius=target_radius,
                 status=status,
             )
+            mount_command = None
             if mount_client is not None:
-                frame_h, frame_w = (rgb.shape[:2] if rgb is not None else (360, 640))
-                mount_command = mount_controller.update(frame_w, frame_h, rgb_xy)
+                if rgb is not None:
+                    frame_h, frame_w = rgb.shape[:2]
+                    mount_target = rgb_xy
+                elif thermal_xy is not None:
+                    frame_w, frame_h = args.thermal_width, args.thermal_height
+                    mount_target = thermal_xy
+                else:
+                    frame_w, frame_h = 640, 360
+                    mount_target = None
+                mount_command = mount_controller.update(frame_w, frame_h, mount_target)
                 mount_client.send(mount_command)
                 if frame_index % 30 == 0:
                     print("mount", mount_command.as_line(), end="")
-            dashboard = make_dashboard(rgb, latest_thermal, state, args.no_window)
+            dashboard = make_dashboard(
+                rgb,
+                latest_thermal if thermal_fresh else None,
+                state,
+                args.no_window,
+            )
+            fps = (frame_index + 1) / max(0.001, time.time() - started_at)
             if frame_index % 30 == 0:
-                thermal_age = None if latest_thermal is None else time.time() - latest_thermal.timestamp
                 audio_text = (
                     "none"
                     if latest_audio is None
@@ -565,11 +697,28 @@ def run(args: argparse.Namespace) -> None:
                     )
                 )
                 print(
-                    f"frame={frame_index} fused={fused_score:.2f} "
+                    f"frame={frame_index} fps={fps:.1f} fused={fused_score:.2f} "
                     f"rgb={rgb_score:.2f} thermal={thermal_score:.2f} "
-                    f"thermal_age={thermal_age} audio={audio_text}"
+                    f"thermal_age={thermal_age} thermal_fresh={thermal_fresh} audio={audio_text}"
                 )
-            if save_dir and dashboard is not None and frame_index % args.save_every == 0:
+            if (
+                telemetry_file is not None
+                and frame_index % max(1, args.telemetry_every) == 0
+            ):
+                write_telemetry(
+                    telemetry_file,
+                    frame_index,
+                    now,
+                    fps,
+                    state,
+                    thermal_age,
+                    thermal_fresh,
+                    audio_age,
+                    audio_fresh,
+                    latest_audio,
+                    mount_command,
+                )
+            if save_dir and dashboard is not None and frame_index % max(1, args.save_every) == 0:
                 try:
                     import cv2
 
@@ -583,6 +732,8 @@ def run(args: argparse.Namespace) -> None:
         stop_event.set()
         if capture is not None:
             capture.release()
+        if telemetry_file is not None:
+            telemetry_file.close()
 
 
 def main() -> None:
@@ -592,16 +743,25 @@ def main() -> None:
     parser.add_argument("--thermal-port", type=int, default=25000)
     parser.add_argument("--thermal-width", type=int, default=256)
     parser.add_argument("--thermal-height", type=int, default=192)
+    parser.add_argument("--thermal-stale-seconds", type=float, default=2.0)
     parser.add_argument("--audio-wav-url", help="Streaming WAV URL, for example IP Webcam /audio.wav")
     parser.add_argument("--audio-chunk-bytes", type=int, default=8192)
     parser.add_argument("--audio-stale-seconds", type=float, default=2.0)
     parser.add_argument("--audio-demo", action="store_true", help="Use synthetic drone-like audio score.")
+    parser.add_argument("--rgb-motion-min-area", type=float, default=6.0)
+    parser.add_argument("--rgb-motion-max-area-ratio", type=float, default=0.08)
+    parser.add_argument("--rgb-motion-threshold", type=int, default=22)
+    parser.add_argument("--fusion-rgb-weight", type=float, default=0.60)
+    parser.add_argument("--fusion-thermal-weight", type=float, default=0.25)
+    parser.add_argument("--fusion-audio-weight", type=float, default=0.15)
     parser.add_argument("--alert-threshold", type=float, default=0.55)
     parser.add_argument("--demo", action="store_true", help="Use synthetic RGB when no source is provided.")
     parser.add_argument("--demo-fps", type=float, default=15.0)
     parser.add_argument("--no-window", action="store_true")
     parser.add_argument("--save-dir")
     parser.add_argument("--save-every", type=int, default=60)
+    parser.add_argument("--telemetry-jsonl")
+    parser.add_argument("--telemetry-every", type=int, default=1)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--mount-udp-host")
     parser.add_argument("--mount-udp-port", type=int, default=26000)

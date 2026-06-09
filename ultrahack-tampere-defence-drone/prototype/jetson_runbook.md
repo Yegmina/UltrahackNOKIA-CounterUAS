@@ -26,6 +26,19 @@ python -m pip install numpy pyserial
 python prototype/counter_uas_fusion_node.py --demo --audio-demo --no-window --max-frames 90
 ```
 
+With evidence logs and dashboard snapshots:
+
+```bash
+python prototype/counter_uas_fusion_node.py \
+  --demo \
+  --audio-demo \
+  --no-window \
+  --max-frames 90 \
+  --telemetry-jsonl prototype/logs/fusion_demo.jsonl \
+  --save-dir prototype/logs/fusion_dashboards \
+  --save-every 15
+```
+
 ## Phone RGB + Audio
 
 Start IP Webcam on the phone, then use either the phone network URL or ADB
@@ -35,7 +48,10 @@ forwarding:
 adb forward tcp:8080 tcp:8080
 python prototype/counter_uas_fusion_node.py \
   --rgb-source http://127.0.0.1:8080/video \
-  --audio-wav-url http://127.0.0.1:8080/audio.wav
+  --audio-wav-url http://127.0.0.1:8080/audio.wav \
+  --telemetry-jsonl prototype/logs/fusion_phone_rgb_audio.jsonl \
+  --save-dir prototype/logs/fusion_phone_dashboards \
+  --save-every 30
 ```
 
 ## Native Thermal UDP
@@ -47,7 +63,11 @@ with the default thermal UDP listener:
 python prototype/counter_uas_fusion_node.py \
   --rgb-source http://127.0.0.1:8080/video \
   --audio-wav-url http://127.0.0.1:8080/audio.wav \
-  --thermal-port 25000
+  --thermal-port 25000 \
+  --thermal-stale-seconds 2.0 \
+  --fusion-rgb-weight 0.55 \
+  --fusion-thermal-weight 0.30 \
+  --fusion-audio-weight 0.15
 ```
 
 Start the Android bridge with `-JetsonHost <jetson-ip> -JetsonPort 25000`.
