@@ -16,6 +16,11 @@ Normal side-loaded apps cannot:
 - write the Tiny2C power/mux sysfs nodes;
 - call `UsbManager.grantPermission(...)`;
 - keep the thermal USB device alive while asking Android's USB permission UI;
+- obtain permission from a background USB request while ThermoVue remains
+  foreground: SystemUI briefly creates `UsbPermissionActivity`, but the request
+  returns `EXTRA_PERMISSION_GRANTED=false`;
+- read `/dev/bus/usb/001/002` from ADB shell on the stock build because the node
+  is `root:usb` and shell is not in the `usb` group;
 - instrument ThermoVue, because target-package instrumentation requires a
   matching signature;
 - use `run-as`, because ThermoVue is not debuggable.

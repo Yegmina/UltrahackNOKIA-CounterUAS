@@ -55,7 +55,11 @@ Thermal is the high-value but privileged stream:
 - When our app is foreground, ThermoVue loses foreground and the internal
   thermal USB device disappears from normal app view. When ThermoVue stays
   foreground, the USB device stays visible, but Android rejects our background
-  USB permission request with `granted=false`.
+  USB permission request with `granted=false`; an ADB watcher confirmed
+  `UsbPermissionActivity` appears briefly, but the visible UI remains ThermoVue
+  and the grant still fails.
+- ADB shell cannot directly read `/dev/bus/usb/001/002` or write the Tiny2C
+  sysfs power/mux nodes on the stock phone.
 - FactoryMode can power/connect the module from its privileged thermal test,
   but the activity is not exported and the vendor `IChangeNode` HAL is blocked
   to shell/normal apps by SELinux.

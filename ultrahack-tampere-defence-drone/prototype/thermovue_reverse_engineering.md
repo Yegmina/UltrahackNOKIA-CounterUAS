@@ -147,11 +147,9 @@ Confirmed working:
 - ThermoVue itself streams real thermal packets. Logcat repeatedly shows
   `UvcNativeCamDualFusionPreviewManager$3.onFrame(...)` and
   `AC020library ... frame_callback memcpy: total_length=4863232`.
-- Android shell can grant the already-attached thermal USB device to our app
-  using `IUsbManager.grantDevicePermission(...)`.
-- Our app can open the real USB device through the vendor
-  `com.energy.iruvccamera.usb.USBMonitor.openDevice(...)`.
-- The resulting `USBMonitor.UsbControlBlock` reports:
+- With ThermoVue foreground, our side-loaded debug app can see the real USB
+  device in `UsbManager.getDeviceList()`.
+- The detected USB device reports:
 
   ```text
   device=/dev/bus/usb/001/002
@@ -166,6 +164,30 @@ Confirmed working:
   success, install an `IIrFrameCallback`, and call `startVideoStream`.
 
 Confirmed blockers:
+
+- The hidden framework grant path is blocked from the side-loaded app:
+
+  ```text
+  IUsbManager.grantDevicePermission(...) FAIL
+  java.lang.SecurityException: Access denied, requires: android.permission.MANAGE_USB
+  ```
+
+- Shell cannot bypass the Linux device-node gate either:
+
+  ```text
+  crw-rw---- 1 root usb u:object_r:usb_device:s0 189, 1 /dev/bus/usb/001/002
+  dd: /dev/bus/usb/001/002: Permission denied
+  ```
+
+- The background USB permission experiment keeps ThermoVue foreground and
+  triggers `UsbManager.requestPermission(...)` from the debug app. Activity
+  manager briefly shows `com.android.systemui/.usb.UsbPermissionActivity`, but
+  the UI hierarchy remains ThermoVue and the pending intent returns:
+
+  ```text
+  usbPermissionBroadcast granted=false device=/dev/bus/usb/001/002
+  CTRLBLOCK Android UsbManager.hasPermission=false
+  ```
 
 - With ThermoVue foreground, ThermoVue continues receiving frames but our
   process gets no `IIrFrameCallback` frames and no `Tiny2CDualFusionProxy`
@@ -193,11 +215,11 @@ One unsafe exploratory fallback caused a native crash in `libircmd020.so` after
 calling unrelated vendor control methods. The controlled APK path now avoids
 that broad reflection pass and only calls explainable startup methods.
 
-Practical conclusion: a normal side-loaded APK can reach USB permission and
-vendor object creation, but cannot keep the Tiny2C module alive or take over
-the active frame stream on this production phone. Raw thermal access requires a
-vendor-supported bridge, privileged/platform install, root, or an in-process
-hook inside ThermoVue.
+Practical conclusion: a normal side-loaded APK can discover the already-powered
+thermal USB device and load vendor classes, but it cannot obtain USB permission,
+keep the Tiny2C module alive, or take over the active frame stream on this
+production phone. Raw thermal access requires a vendor-supported bridge,
+privileged/platform install, root, or an in-process hook inside ThermoVue.
 
 ### 2026-06-09 Exact ThermoVue Pro Startup Clone
 
@@ -295,13 +317,22 @@ java.lang.SecurityException: Access denied, requires: android.permission.MANAGE_
 Permission android.permission.MANAGE_USB ... is not a changeable permission type
 ```
 
-The normal USB permission dialog also fails in practice. SystemUI starts `UsbPermissionActivity`, but the internal thermal USB device is removed while the dialog is up, then Android sends our pending intent with:
+The normal USB permission dialog also fails in practice. Two variants were
+tested:
+
+- foreground debug app: requesting permission interrupts ThermoVue and the
+  internal thermal USB device disappears;
+- background debug app while ThermoVue stays foreground: ActivityManager briefly
+  reports `UsbPermissionActivity`, but the visible UI remains ThermoVue and the
+  pending intent returns denial.
+
+The broadcast result is:
 
 ```text
 EXTRA_PERMISSION_GRANTED=false
 ```
 
-This likely happens because ThermoVue is paused/interrupted by the permission UI and powers down or cycles the internal module. Static USB filters therefore do not solve the side-loaded bridge case.
+Static USB filters therefore do not solve the side-loaded bridge case.
 
 ### OEM USB Framework Finding
 
@@ -541,8 +572,9 @@ Our probe app saw normal phone cameras and sensors, but no public thermal camera
 ## Current Bridge Strategy
 
 The active non-root prototype keeps ThermoVue in the foreground so it powers the
-internal Tiny2C thermal USB module, then uses the Android shell UID to grant our
-bridge app permission to the already-attached USB device.
+internal Tiny2C thermal USB module, then tests whether Android can hand that
+already-attached device to our bridge without pausing ThermoVue. On this stock
+phone, the answer is currently no.
 
 Important Android framework finding:
 
@@ -563,11 +595,11 @@ clear fixed USB handler
 start bridge watcher in background/behind ThermoVue
 launch ThermoVue
 wait for VID 0x3474 / PID 0x4321
-shell helper calls IUsbManager.grantDevicePermission(device, bridgeUid)
+Android permission or fixed-handler path grants the device
 bridge initializes vendor USBMonitorManager and Tiny2CDualFusionProxy
 ```
 
-The bridge now also has a no-display fixed-handler component:
+The bridge also has a no-display fixed-handler component:
 
 ```text
 com.yegmina.thermovuebridgeprobe/.HeadlessUsbAttachActivity
