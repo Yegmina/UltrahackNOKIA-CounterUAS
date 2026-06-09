@@ -79,6 +79,8 @@ public class MainActivity extends Activity {
     private File logFile;
     private volatile boolean running;
     private volatile Object liveProxy;
+    private volatile Object liveUsbMonitorManager;
+    private volatile Object liveDeviceControlManager;
     private DexClassLoader thermoVueLoader;
 
     @Override
@@ -338,11 +340,20 @@ public class MainActivity extends Activity {
 
     private void stopSdkLive() {
         running = false;
-        setStatus("stopping");
+        setStatus("stopping and closing USB monitor");
         Object proxy = liveProxy;
         if (proxy != null) {
             tryInvoke(proxy, "stopPreview");
             tryInvoke(proxy, "releaseSource");
+        }
+        Object deviceControl = liveDeviceControlManager;
+        if (deviceControl != null) {
+            tryInvoke(deviceControl, "release");
+        }
+        Object monitor = liveUsbMonitorManager;
+        if (monitor != null) {
+            tryInvoke(monitor, "unregisterMonitor");
+            tryInvoke(monitor, "destroyMonitor");
         }
     }
 
@@ -355,6 +366,8 @@ public class MainActivity extends Activity {
         int renderedFrames = 0;
         boolean explicitInitTried = false;
         boolean explicitStartTried = false;
+        boolean monitorClosedToStopDialogLoop = false;
+        long sdkStartedAt = System.currentTimeMillis();
         try {
             DexClassLoader loader = getThermoVueClassLoader();
             initializeMmkv(loader);
@@ -394,6 +407,7 @@ public class MainActivity extends Activity {
             Class<?> usbMonitorManagerClass = Class.forName(
                     "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
             usbMonitorManager = usbMonitorManagerClass.getMethod("getInstance").invoke(null);
+            liveUsbMonitorManager = usbMonitorManager;
             tryInvoke(usbMonitorManager, "init");
             tryInvoke(usbMonitorManager, "registerMonitor");
 
@@ -402,6 +416,7 @@ public class MainActivity extends Activity {
                     true,
                     loader);
             deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            liveDeviceControlManager = deviceControlManager;
             tryInvoke(deviceControlManager, "init");
 
             Class<?> modeClass = Class.forName(
@@ -474,6 +489,22 @@ public class MainActivity extends Activity {
                         setStatus("trying explicit startPreview");
                         append("fallback: explicit startPreview because engine init still has no frames");
                         tryInvoke(proxy, "startPreview");
+                    } else if (frame == null && explicitStartTried &&
+                            ctrlBlock != null && !monitorClosedToStopDialogLoop) {
+                        monitorClosedToStopDialogLoop = true;
+                        fallbackAction = true;
+                        setStatus("closing USB monitor to stop permission loop");
+                        append("fallback: closing USB monitor after ctrlBlock/no-frames state to stop repeated permission dialogs");
+                        tryInvoke(usbMonitorManager, "unregisterMonitor");
+                        tryInvoke(usbMonitorManager, "destroyMonitor");
+                    } else if (frame == null && !monitorClosedToStopDialogLoop &&
+                            now - sdkStartedAt > 8000) {
+                        monitorClosedToStopDialogLoop = true;
+                        fallbackAction = true;
+                        setStatus("closing USB monitor after timeout");
+                        append("fallback: closing USB monitor after 8s without frames to stop repeated permission dialogs");
+                        tryInvoke(usbMonitorManager, "unregisterMonitor");
+                        tryInvoke(usbMonitorManager, "destroyMonitor");
                     }
                     if (frame == null && !fallbackAction) {
                         setStatus("no thermal frames yet");
@@ -486,6 +517,8 @@ public class MainActivity extends Activity {
         } finally {
             running = false;
             liveProxy = null;
+            liveUsbMonitorManager = null;
+            liveDeviceControlManager = null;
             if (proxy != null) {
                 tryInvoke(proxy, "stopPreview");
                 tryInvoke(proxy, "releaseSource");

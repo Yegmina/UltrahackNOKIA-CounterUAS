@@ -29,6 +29,9 @@ If the log shows `connected=true` with a non-null `UsbControlBlock`, USB access
 is at least partly working. If it still shows `frameCount=0 rawTemp=null`, the
 app is blocked later in the ThermoVue/Tiny2C preview engine. The APK then tries
 explicit `initHandleEngine(ctrlBlock, true)` and `startPreview()` fallbacks.
+If Android keeps showing the USB permission dialog, tap `Stop`. Current builds
+also close ThermoVue's `USBMonitorManager` automatically after a short no-frame
+timeout so the dialog should not loop forever.
 
 `Share Log` sends the visible debug log text through Android's share sheet.
 
