@@ -149,6 +149,16 @@ Verified on the stock phone:
   because SELinux denies `hal_changenode_hwservice`.
 - FactoryMode can power/open the module, but its thermal activity is not
   exported and the stream cannot be reused by our side-loaded app.
+- When `Thermal Live Debug` is foreground, ThermoVue loses foreground and the
+  internal thermal USB device disappears from normal app view
+  (`usbDeviceCount=0`).
+- When ThermoVue stays foreground, the same USB device remains visible
+  (`/dev/bus/usb/001/002`, VID/PID `0x3474:0x4321`), but Android rejects the
+  side-loaded app's background USB permission request:
+  `usbPermissionBroadcast granted=false`.
+- Hidden `UsbManager` grant attempts fail because `MANAGE_USB` is not granted to
+  the side-loaded APK, and `cmd usb` exposes no shell permission command on this
+  build.
 
 ## Best Next Live Routes
 

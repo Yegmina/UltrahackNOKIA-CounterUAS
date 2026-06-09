@@ -89,6 +89,16 @@ frame=1 file=1780999983637.jpg plane=temp_u16le min=18448 max=18780 mean=18607.2
 frame=2 file=1780999985261.jpg plane=temp_u16le min=18472 max=18804 mean=18628.2 latency=1.75s
 ```
 
+Fastest repeated capture test on 2026-06-09 with `--interval 0.0`:
+
+```text
+frame=1 file=1781001190933.jpg plane=temp_u16le min=17932 max=18608 mean=18094.8 latency=1.68s
+frame=2 file=1781001192669.jpg plane=temp_u16le min=17932 max=18608 mean=18098.1 latency=1.89s
+frame=3 file=1781001194579.jpg plane=temp_u16le min=18360 max=18980 mean=18499.5 latency=1.95s
+frame=4 file=1781001196525.jpg plane=temp_u16le min=18332 max=18960 mean=18478.4 latency=1.87s
+frame=5 file=1781001198626.jpg plane=temp_u16le min=18220 max=18884 mean=18390.5 latency=2.15s
+```
+
 Forward extracted frames to the existing UDP receiver / Jetson path:
 
 ```powershell
