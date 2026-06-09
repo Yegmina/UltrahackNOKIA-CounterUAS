@@ -785,6 +785,46 @@ normal APK steals or reuses the stream. The remaining clean routes are
 platform/vendor signing, root/in-process instrumentation, or an official SDK/API
 that runs in the same privilege class as ThermoVue/FactoryMode.
 
+## Confirmed IJPEG Raw Thermal Path
+
+ThermoVue Pro's normal photo capture writes public files under:
+
+```text
+/sdcard/Pictures/thermo_tc2c/*.jpg
+```
+
+Those files are not plain preview-only JPEGs. A confirmed capture from
+2026-06-09 contains:
+
+```text
+APP2 IJPEG descriptor
+APP3 payload total = 6,417,408 bytes
+APP3 split:
+  ir_u16le    256x192 uint16 =    98,304 bytes
+  temp_u16le  256x192 uint16 =    98,304 bytes
+  rgba       1080x1440 RGBA = 6,220,800 bytes
+```
+
+`prototype/thermovue_ijpeg_extract.py` parses the JPEG marker stream directly,
+extracts these planes without Android/native libraries, and writes raw `.u16le`
+frames plus optional previews.
+
+`prototype/thermovue_ijpeg_live_pull.py` uses ThermoVue as the privileged
+capture process: it launches ThermoVue, taps the photo button through ADB, pulls
+the new IJPEG, extracts `temp_u16le`, visualizes it, and can forward the frame
+with the existing `YEGMINA_THERMAL_RAW_V1` UDP packet format.
+
+Confirmed short run:
+
+```text
+frame=1 file=1780999983637.jpg plane=temp_u16le min=18448 max=18780 mean=18607.2 latency=1.76s
+frame=2 file=1780999985261.jpg plane=temp_u16le min=18472 max=18804 mean=18628.2 latency=1.75s
+```
+
+This is real raw thermal data, but it is still a capture-pull-extract loop, not
+a native live callback. It is suitable for low-rate fusion tests and for proving
+the thermal detection path while the privileged bridge is pursued.
+
 ## Practical Next Steps
 
 Best clean route:

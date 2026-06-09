@@ -44,6 +44,11 @@ Thermal is the high-value but privileged stream:
 
 - ThermoVue proves the raw module produces 256x192 thermal planes at about
   25 fps inside the vendor app.
+- ThermoVue IJPEG photo captures now prove we can extract real 256x192 `uint16`
+  IR and temperature planes from `/sdcard/Pictures/thermo_tc2c/*.jpg`.
+- `thermovue_ijpeg_live_pull.py` gives a low-rate ADB bridge by triggering
+  ThermoVue captures, pulling the IJPEG, extracting `temp_u16le`, and forwarding
+  the same UDP frame format the Jetson receiver already understands.
 - The latest bridge APK matches ThermoVue Pro's startup order, but a normal
   side-loaded APK still runs as `untrusted_app` and cannot read/write the Tiny2C
   sysfs power/mux nodes.
@@ -58,8 +63,8 @@ Thermal is the high-value but privileged stream:
   production phone by no root, no debuggable target, and no usable frida-server.
 - Production-quality raw thermal requires a vendor SDK/API, root, platform
   signing, or an in-process ThermoVue hook.
-- Screen capture of ThermoVue can be used only as a demo fallback, not as raw
-  temperature data.
+- Screen capture of ThermoVue can be used only as a visual fallback, not as raw
+  temperature data. Prefer IJPEG extraction for any thermal algorithm tests.
 
 ## Fusion Logic
 
@@ -96,14 +101,16 @@ can rotate:
 4. Keep thermal work as a parallel track:
    - ask mentors/vendor for privileged ThermoVue SDK access;
    - show current evidence that side-loaded direct thermal is blocked;
+   - use the IJPEG ADB bridge for low-rate real raw thermal fusion tests;
    - use ThermoVue screen capture only if a thermal visual is needed for demo.
 5. If time remains, connect pan/tilt commands to a prebuilt programmable holder
    or simple microcontroller mount.
 
 ## Current Thermal Decision
 
-Do not depend on raw thermal for the first demo milestone. The real thermal
-feed is technically reachable only past a privilege boundary on the current
-phone firmware. Build and demo RGB + audio + tracking first, and keep the
-thermal UDP/raw-frame receiver as the integration point for vendor/platform
-access.
+Do not depend on high-FPS native raw thermal for the first demo milestone. The
+phone can now provide real low-rate raw thermal through ThermoVue IJPEG capture,
+but the true live feed still requires crossing the vendor/platform privilege
+boundary. Build and demo RGB + audio + tracking first, use IJPEG thermal when
+latency is acceptable, and keep the thermal UDP/raw-frame receiver as the
+integration point for vendor/platform access.

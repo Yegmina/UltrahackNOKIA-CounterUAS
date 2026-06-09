@@ -19,6 +19,7 @@ Keep large datasets out of git unless explicitly needed.
 - [direct_thermal_sensor_attempt.md](direct_thermal_sensor_attempt.md) documents the direct Android sensor/USB/Camera2 access attempt.
 - [phone_sensor_capability_20260608.md](phone_sensor_capability_20260608.md) records the latest sound/camera/thermal simultaneity test on the connected phone.
 - [thermovue_reverse_engineering.md](thermovue_reverse_engineering.md) maps ThermoVue's internal thermal USB/native pipeline and likely raw frame layout.
+- [thermovue_ijpeg_extraction.md](thermovue_ijpeg_extraction.md) documents the confirmed ThermoVue IJPEG raw thermal extraction path.
 - [thermovue_sensor_live_viewer.md](thermovue_sensor_live_viewer.md) documents the laptop-side raw thermal packet visualizer.
 - [thermovue_frida_bridge.md](thermovue_frida_bridge.md) documents the Frida-based phone-side raw packet bridge path.
 - [jetson_runbook.md](jetson_runbook.md) gives the Jetson/laptop setup and run commands for the fusion node.
@@ -181,6 +182,27 @@ Inspect pulled ThermoVue APK/native-library dumps:
 
 ```powershell
 py -3 prototype\inspect_vendor_dump.py prototype\mtp_pulled_logs --out prototype\logs\vendor_dump_report.md
+```
+
+Extract real raw thermal frames from a ThermoVue IJPEG photo:
+
+```powershell
+py -3 prototype\thermovue_ijpeg_extract.py prototype\logs\ijpeg_probe\1780999642030.jpg --out-dir prototype\logs\ijpeg_probe\extracted
+```
+
+Use ThermoVue as the privileged capture process and pull near-live thermal
+frames through ADB:
+
+```powershell
+py -3 prototype\thermovue_ijpeg_live_pull.py --max-frames 2 --no-window --interval 1.0
+```
+
+Forward that extracted 256x192 `uint16` thermal plane into the existing UDP
+receiver / Jetson path:
+
+```powershell
+py -3 prototype\thermal_udp_receiver.py --host 0.0.0.0 --port 25000 --save-dir prototype\logs\thermal_udp_frames
+py -3 prototype\thermovue_ijpeg_live_pull.py --udp-host 127.0.0.1 --udp-port 25000
 ```
 
 Pan/tilt command scaffold:
