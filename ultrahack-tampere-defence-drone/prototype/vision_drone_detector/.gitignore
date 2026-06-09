@@ -1,0 +1,10 @@
+models/*.pt
+outputs/
+.venv*/
+__pycache__/
+*.py[cod]
+*.log
+*.mp4
+*.mov
+*.avi
+*.mkv

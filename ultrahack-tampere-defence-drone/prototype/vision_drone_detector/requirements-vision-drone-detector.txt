@@ -1,0 +1,6 @@
+numpy>=1.26,<2.3
+opencv-python
+pandas
+pillow
+streamlit
+ultralytics
