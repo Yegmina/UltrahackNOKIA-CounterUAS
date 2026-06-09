@@ -122,6 +122,7 @@ public class MainActivity extends Activity {
         buttons.setPadding(dp(6), dp(6), dp(6), dp(6));
         buttons.addView(button("Self Test", view -> showSyntheticFrame()));
         buttons.addView(button("Scan", view -> scanAll()));
+        buttons.addView(button("Dump Classes", view -> startThread(this::dumpClassesOnly)));
         buttons.addView(button("Request USB", view -> requestThermalUsb()));
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
@@ -374,7 +375,7 @@ public class MainActivity extends Activity {
             initializeMmkv(loader);
             initializeBlankjUtils(loader);
             initializeRxBaseApplication(loader);
-            dumpImportantClasses(loader);
+            dumpImportantClasses(loader, false);
 
             UsbDevice thermal = inspectUsb();
             if (thermal != null) {
@@ -426,6 +427,7 @@ public class MainActivity extends Activity {
             proxyClass.getMethod("handleStartPreview", modeClass).invoke(proxy, mode);
             append("handleStartPreview MODE_DUAL_FUSION invoked");
             setStatus("waiting for vendor worker");
+            append("SDK poll loop entering");
 
             long lastLogAt = 0;
             while (running) {
@@ -656,6 +658,19 @@ public class MainActivity extends Activity {
     }
 
     private void dumpImportantClasses(ClassLoader loader) {
+        dumpImportantClasses(loader, true);
+    }
+
+    private void dumpClassesOnly() {
+        append("===== manual class dump =====");
+        try {
+            dumpImportantClasses(getThermoVueClassLoader(), true);
+        } catch (Throwable t) {
+            append("manual class dump FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void dumpImportantClasses(ClassLoader loader, boolean verbose) {
         String[] classes = new String[]{
                 "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
                 "com.energy.dualmodule.sdk.uvc.USBMonitorManager",
@@ -669,7 +684,12 @@ public class MainActivity extends Activity {
         for (String name : classes) {
             try {
                 Class<?> cls = Class.forName(name, false, loader);
-                append("classLoad OK " + name);
+                append("classLoad OK " + name +
+                        " methods=" + cls.getDeclaredMethods().length +
+                        " fields=" + cls.getDeclaredFields().length);
+                if (!verbose) {
+                    continue;
+                }
                 int count = 0;
                 for (Method method : cls.getDeclaredMethods()) {
                     append("classMethod " + name + " " + describeMethod(method));
