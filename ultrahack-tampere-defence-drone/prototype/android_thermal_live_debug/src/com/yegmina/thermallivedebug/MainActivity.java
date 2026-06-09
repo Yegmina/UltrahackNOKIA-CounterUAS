@@ -22,6 +22,7 @@ import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
 import android.os.Process;
 import android.util.Log;
 import android.view.Gravity;
@@ -570,6 +571,25 @@ public class MainActivity extends Activity {
     }
 
     private void initializeBlankjUtils(ClassLoader loader) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            CountDownLatch latch = new CountDownLatch(1);
+            runOnUiThread(() -> {
+                try {
+                    initializeBlankjUtils(loader);
+                } finally {
+                    latch.countDown();
+                }
+            });
+            try {
+                if (!latch.await(5, TimeUnit.SECONDS)) {
+                    append("Blankj Utils init FAIL main-thread timeout");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                append("Blankj Utils init FAIL interrupted");
+            }
+            return;
+        }
         try {
             Application app = new Application();
             Method attach = ContextWrapper.class.getDeclaredMethod("attachBaseContext", Context.class);
