@@ -30,6 +30,18 @@ launches ThermoVue. Leave ThermoVue foreground so its thermal stream stays alive
 Return to this app and tap `Load Cap` to show the latest captured ThermoVue
 screen. This is real ThermoVue display capture, not raw sensor bytes.
 
+For native/full-clone reverse engineering, use `Native Auto`. It runs a matrix
+of ThermoVue-like startup sequences:
+
+- multiple visible camera IDs (`0`, `1`, `2`, `3`, and empty);
+- `UvcNativeCamDualDeviceControlManager.handleStartPreview(...)`;
+- `Tiny2CDualFusionProxy.handleStartPreview(...)`;
+- explicit `initHandleEngine(ctrlBlock, true)` plus `startPreview()`;
+- targeted method/field dumps for preview, frame, callback, calibration, and
+  temperature APIs.
+
+Wait until it prints `native clone autotest finished`, then tap `Share Log`.
+
 If live thermal frames are available, the preview panel will show the real
 256x192 thermal value matrix rendered with a color palette, plus min/max/mean/FPS
 status. If not, the log panel should show where the path failed: USB visibility,

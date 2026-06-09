@@ -20,6 +20,7 @@ import android.graphics.Paint;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
@@ -64,6 +65,8 @@ public class MainActivity extends Activity {
             "com.yegmina.thermallivedebug.USB_PERMISSION";
     private static final int THERMAL_VENDOR_ID = 0x3474;
     private static final int THERMAL_PRODUCT_ID = 0x4321;
+    private static final int ALT_THERMAL_VENDOR_ID = 0x0ecb;
+    private static final int ALT_THERMAL_PRODUCT_ID = 0x20f6;
     private static final int THERMAL_WIDTH = 256;
     private static final int THERMAL_HEIGHT = 192;
     private static final int THERMAL_U16_BYTES = THERMAL_WIDTH * THERMAL_HEIGHT * 2;
@@ -131,6 +134,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
         buttons.addView(button("Start SDK", view -> startSdkLive()));
+        buttons.addView(button("Native Auto", view -> startNativeAutoTest()));
         buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
         buttons.addView(button("Cap TVue", view -> requestThermoVueScreenCapture()));
         buttons.addView(button("Load Cap", view -> showLatestScreenCapture()));
@@ -275,6 +279,14 @@ public class MainActivity extends Activity {
                 append("usb " + describeUsbDevice(device) +
                         " hasPermission=" + manager.hasPermission(device) +
                         " thermal=" + isThermal);
+                for (int i = 0; i < device.getInterfaceCount(); i++) {
+                    UsbInterface iface = device.getInterface(i);
+                    append("usbInterface index=" + i +
+                            " class=" + iface.getInterfaceClass() +
+                            " subclass=" + iface.getInterfaceSubclass() +
+                            " protocol=" + iface.getInterfaceProtocol() +
+                            " endpoints=" + iface.getEndpointCount());
+                }
                 if (isThermal) {
                     thermal = device;
                 }
@@ -434,6 +446,17 @@ public class MainActivity extends Activity {
         append("===== ThermoVue foreground hypothesis test =====");
         append("This starts SDK polling, then launches ThermoVue so ThermoVue remains foreground.");
         startThread(this::runSdkLive);
+    }
+
+    private void startNativeAutoTest() {
+        if (running) {
+            append("native autotest already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        running = true;
+        setStatus("native autotest running");
+        startThread(this::runNativeAutoTest);
     }
 
     private void stopSdkLive() {
@@ -642,6 +665,308 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void runNativeAutoTest() {
+        append("===== native clone autotest start =====");
+        append("Goal: reproduce ThermoVue startup without using ThermoVue's foreground feed.");
+        boolean anyFrame = false;
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            dumpImportantClasses(loader, false);
+            dumpTargetedReverseEngineeringHints(loader);
+            inspectUsb();
+
+            Class<?> modeClass = Class.forName(
+                    "com.energy.dualmodule.sdk.service.task.DualPreviewMode", true, loader);
+            Object[] modes = modeClass.getEnumConstants();
+            if (modes == null || modes.length == 0) {
+                append("AUTO FAIL no DualPreviewMode enum constants");
+                return;
+            }
+            List<String> cameraIds = getCameraIdCandidates();
+            String[] strategies = new String[]{
+                    "deviceControlHandle",
+                    "proxyHandle",
+                    "explicitEngine",
+                    "deviceControlThenExplicitStart"
+            };
+            int scenario = 0;
+            for (String cameraId : cameraIds) {
+                for (Object mode : modes) {
+                    String modeName = enumName(mode);
+                    if (!modeName.toLowerCase(Locale.US).contains("fusion") &&
+                            !modeName.toLowerCase(Locale.US).contains("dual")) {
+                        append("AUTO skip mode=" + modeName);
+                        continue;
+                    }
+                    for (String strategy : strategies) {
+                        if (!running) {
+                            append("AUTO stopped by user");
+                            return;
+                        }
+                        scenario++;
+                        boolean saw = runNativeScenario(
+                                loader,
+                                scenario,
+                                cameraId,
+                                modeClass,
+                                mode,
+                                modeName,
+                                strategy);
+                        anyFrame = anyFrame || saw;
+                        if (saw) {
+                            append("AUTO SUCCESS strategy=" + strategy +
+                                    " cameraId=" + cameraId +
+                                    " mode=" + modeName);
+                            setStatus("native autotest got frame");
+                            return;
+                        }
+                    }
+                }
+            }
+            append("AUTO RESULT no raw frames in tested native clone matrix");
+            setStatus("native autotest no frames");
+        } catch (Throwable t) {
+            append("AUTO FATAL " + formatThrowable(t));
+            setStatus("native autotest failed");
+        } finally {
+            running = false;
+            foregroundThermoVueTest = false;
+            cleanupLiveObjects();
+            append("===== native clone autotest finished anyFrame=" + anyFrame + " =====");
+        }
+    }
+
+    private boolean runNativeScenario(
+            ClassLoader loader,
+            int scenario,
+            String cameraId,
+            Class<?> modeClass,
+            Object mode,
+            String modeName,
+            String strategy) {
+        append("AUTO scenario " + scenario +
+                " cameraId=" + cameraId +
+                " mode=" + modeName +
+                " strategy=" + strategy);
+        Object proxy = null;
+        Object usbMonitorManager = null;
+        Object deviceControlManager = null;
+        try {
+            Class<?> proxyClass = Class.forName(
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy", true, loader);
+            proxy = proxyClass.getMethod("getInstance").invoke(null);
+            liveProxy = proxy;
+            tryInvoke(proxy, "stopPreview");
+            tryInvoke(proxy, "releaseSource");
+
+            Method init = proxyClass.getMethod(
+                    "init",
+                    Context.class,
+                    int.class,
+                    int.class,
+                    float.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    int.class,
+                    int.class);
+            init.invoke(proxy, this, 256, 386, 1.0f, 25, cameraId, 1440, 1080, 25);
+            append("AUTO init OK cameraId=" + cameraId);
+            tryInvoke(proxy, "cancelRestartTimer");
+            tryInvoke(proxy, "startRestartTimer");
+            tryInvoke(proxy, "initData");
+            tryInvokeBoolean(proxy, "setHasAPPKilled", false);
+            tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
+            tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
+            tryInvoke(proxy, "resetIsFirstFrame");
+
+            Class<?> usbMonitorManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
+            usbMonitorManager = usbMonitorManagerClass.getMethod("getInstance").invoke(null);
+            liveUsbMonitorManager = usbMonitorManager;
+            tryInvoke(usbMonitorManager, "destroyMonitor");
+            tryInvoke(usbMonitorManager, "init");
+            tryInvoke(usbMonitorManager, "registerMonitor");
+
+            Class<?> deviceControlManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    true,
+                    loader);
+            deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            liveDeviceControlManager = deviceControlManager;
+            tryInvoke(deviceControlManager, "release");
+            tryInvoke(deviceControlManager, "init");
+
+            Object connected = waitForUsbConnected(usbMonitorManager, 3500);
+            Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
+            append("AUTO USB connected=" + describeObject(connected) +
+                    " ctrlBlock=" + describeObject(ctrlBlock));
+
+            if ("deviceControlHandle".equals(strategy)) {
+                invokeWithLog(
+                        "AUTO deviceControl.handleStartPreview",
+                        deviceControlManager,
+                        "handleStartPreview",
+                        new Class[]{modeClass},
+                        mode);
+            } else if ("proxyHandle".equals(strategy)) {
+                invokeWithLog(
+                        "AUTO proxy.handleStartPreview",
+                        proxy,
+                        "handleStartPreview",
+                        new Class[]{modeClass},
+                        mode);
+            } else if ("explicitEngine".equals(strategy)) {
+                explicitInitAndStart(loader, proxy, ctrlBlock);
+            } else if ("deviceControlThenExplicitStart".equals(strategy)) {
+                invokeWithLog(
+                        "AUTO deviceControl.handleStartPreview",
+                        deviceControlManager,
+                        "handleStartPreview",
+                        new Class[]{modeClass},
+                        mode);
+                sleepMs(1500);
+                tryInvoke(proxy, "startPreview");
+            }
+
+            boolean sawFrame = pollNativeScenario(proxy, "AUTO scenario " + scenario, 5000);
+            append("AUTO scenario " + scenario + " result sawFrame=" + sawFrame);
+            return sawFrame;
+        } catch (Throwable t) {
+            append("AUTO scenario " + scenario + " FAIL " + formatThrowable(t));
+            return false;
+        } finally {
+            if (proxy != null) {
+                tryInvoke(proxy, "stopPreview");
+                tryInvoke(proxy, "releaseSource");
+            }
+            if (deviceControlManager != null) {
+                tryInvoke(deviceControlManager, "release");
+            }
+            if (usbMonitorManager != null) {
+                tryInvoke(usbMonitorManager, "unregisterMonitor");
+                tryInvoke(usbMonitorManager, "destroyMonitor");
+            }
+            liveProxy = null;
+            liveDeviceControlManager = null;
+            liveUsbMonitorManager = null;
+            sleepMs(800);
+        }
+    }
+
+    private void explicitInitAndStart(ClassLoader loader, Object proxy, Object ctrlBlock) {
+        if (ctrlBlock == null) {
+            append("AUTO explicit init skipped ctrlBlock=null");
+            return;
+        }
+        tryInvoke(proxy, "initData");
+        try {
+            Class<?> ctrlBlockClass = Class.forName(
+                    "com.energy.iruvccamera.usb.USBMonitor$UsbControlBlock",
+                    false,
+                    loader);
+            Object result = invoke(
+                    proxy,
+                    "initHandleEngine",
+                    new Class[]{ctrlBlockClass, boolean.class},
+                    ctrlBlock,
+                    true);
+            append("AUTO initHandleEngine(true) OK result=" + describeObject(result));
+        } catch (Throwable t) {
+            append("AUTO initHandleEngine(true) FAIL " + formatThrowable(t));
+        }
+        sleepMs(800);
+        tryInvoke(proxy, "startPreview");
+    }
+
+    private Object waitForUsbConnected(Object usbMonitorManager, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        Object connected = null;
+        while (System.currentTimeMillis() < deadline) {
+            connected = tryInvokeQuiet(usbMonitorManager, "isDeviceConnected");
+            Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
+            if (Boolean.TRUE.equals(connected) && ctrlBlock != null) {
+                return connected;
+            }
+            sleepMs(150);
+        }
+        return connected;
+    }
+
+    private boolean pollNativeScenario(Object proxy, String label, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long lastLogAt = 0;
+        while (System.currentTimeMillis() < deadline && running) {
+            sleepMs(250);
+            Object frameCount = tryInvokeQuiet(proxy, "getFrameCount");
+            Object firstFrame = tryInvokeQuiet(proxy, "getFirstFrameFlag");
+            byte[] rawTemp = (byte[]) tryInvokeQuiet(proxy, "getRawTempData");
+            byte[] remapTemp = (byte[]) tryInvokeQuiet(proxy, "getRemapTempData");
+            byte[] frame = chooseRenderableFrame(rawTemp, remapTemp);
+            if (frame != null) {
+                append(label + " FRAME frameCount=" + frameCount +
+                        " firstFrame=" + firstFrame +
+                        " rawTemp=" + describeBytes(rawTemp) +
+                        " remapTemp=" + describeBytes(remapTemp));
+                renderThermal(frame, label + " frame=" + frameCount);
+                return true;
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastLogAt > 1200) {
+                lastLogAt = now;
+                append(label + " poll frameCount=" + frameCount +
+                        " firstFrame=" + firstFrame +
+                        " rawTemp=" + describeBytes(rawTemp) +
+                        " remapTemp=" + describeBytes(remapTemp));
+            }
+        }
+        return false;
+    }
+
+    private List<String> getCameraIdCandidates() {
+        List<String> ids = new ArrayList<>();
+        try {
+            CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
+            for (String id : manager.getCameraIdList()) {
+                if (!ids.contains(id)) {
+                    ids.add(id);
+                }
+            }
+        } catch (Throwable t) {
+            append("AUTO camera id list FAIL " + formatThrowable(t));
+        }
+        for (String fallback : new String[]{"1", "0", "2", "3", ""}) {
+            if (!ids.contains(fallback)) {
+                ids.add(fallback);
+            }
+        }
+        append("AUTO cameraIdCandidates=" + ids);
+        return ids;
+    }
+
+    private void cleanupLiveObjects() {
+        Object proxy = liveProxy;
+        if (proxy != null) {
+            tryInvoke(proxy, "stopPreview");
+            tryInvoke(proxy, "releaseSource");
+        }
+        Object deviceControl = liveDeviceControlManager;
+        if (deviceControl != null) {
+            tryInvoke(deviceControl, "release");
+        }
+        Object monitor = liveUsbMonitorManager;
+        if (monitor != null) {
+            tryInvoke(monitor, "unregisterMonitor");
+            tryInvoke(monitor, "destroyMonitor");
+        }
+        liveProxy = null;
+        liveDeviceControlManager = null;
+        liveUsbMonitorManager = null;
+    }
+
     private synchronized DexClassLoader getThermoVueClassLoader() throws Exception {
         if (thermoVueLoader != null) {
             return thermoVueLoader;
@@ -807,6 +1132,72 @@ public class MainActivity extends Activity {
             } catch (Throwable t) {
                 append("classLoad FAIL " + name + " " + formatThrowable(t));
             }
+        }
+    }
+
+    private void dumpTargetedReverseEngineeringHints(ClassLoader loader) {
+        append("===== targeted reverse-engineering hints =====");
+        String[] classes = new String[]{
+                "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager",
+                "com.energy.ac020library.IrcamEngine",
+                "com.energy.ac020library.IrcamEngineBuilder",
+                "com.energy.ac020library.bean.DualUvcHandleParam",
+                "com.energy.iruvccamera.usb.USBMonitor"
+        };
+        for (String name : classes) {
+            try {
+                Class<?> cls = Class.forName(name, false, loader);
+                for (Method method : cls.getDeclaredMethods()) {
+                    String lower = method.getName().toLowerCase(Locale.US);
+                    if (lower.contains("preview") ||
+                            lower.contains("frame") ||
+                            lower.contains("surface") ||
+                            lower.contains("callback") ||
+                            lower.contains("handle") ||
+                            lower.contains("cal") ||
+                            lower.contains("data") ||
+                            lower.contains("temp") ||
+                            lower.contains("fusion") ||
+                            lower.contains("listener") ||
+                            lower.contains("restart")) {
+                        append("targetMethod " + name + " " + describeMethod(method));
+                    }
+                }
+                for (Field field : cls.getDeclaredFields()) {
+                    String lower = field.getName().toLowerCase(Locale.US);
+                    if (lower.contains("preview") ||
+                            lower.contains("frame") ||
+                            lower.contains("surface") ||
+                            lower.contains("callback") ||
+                            lower.contains("handle") ||
+                            lower.contains("cal") ||
+                            lower.contains("data") ||
+                            lower.contains("temp") ||
+                            lower.contains("fusion") ||
+                            lower.contains("listener") ||
+                            lower.contains("ir") ||
+                            lower.contains("uvc")) {
+                        append("targetField " + name + " " + describeField(field));
+                    }
+                }
+            } catch (Throwable t) {
+                append("targetDump FAIL " + name + " " + formatThrowable(t));
+            }
+        }
+        try {
+            Class<?> modeClass = Class.forName(
+                    "com.energy.dualmodule.sdk.service.task.DualPreviewMode", false, loader);
+            Object[] constants = modeClass.getEnumConstants();
+            if (constants != null) {
+                for (Object constant : constants) {
+                    append("targetEnum DualPreviewMode " + enumName(constant) +
+                            " value=" + describeObject(tryInvokeQuiet(constant, "getMode")));
+                }
+            }
+        } catch (Throwable t) {
+            append("targetEnum FAIL " + formatThrowable(t));
         }
     }
 
@@ -1058,9 +1449,32 @@ public class MainActivity extends Activity {
         }
     }
 
+    private Object invokeWithLog(
+            String label,
+            Object target,
+            String name,
+            Class<?>[] parameterTypes,
+            Object... args) {
+        try {
+            Object result = invoke(target, name, parameterTypes, args);
+            append(label + " OK result=" + describeObject(result));
+            return result;
+        } catch (Throwable t) {
+            append(label + " FAIL " + formatThrowable(t));
+            return null;
+        }
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     private Object enumValue(Class<?> enumClass, String value) {
         return Enum.valueOf((Class<? extends Enum>) enumClass.asSubclass(Enum.class), value);
+    }
+
+    private String enumName(Object mode) {
+        if (mode instanceof Enum) {
+            return ((Enum<?>) mode).name();
+        }
+        return String.valueOf(mode);
     }
 
     private void recreateDir(File dir) throws IOException {
@@ -1100,8 +1514,10 @@ public class MainActivity extends Activity {
     }
 
     private boolean isThermalDevice(UsbDevice device) {
-        return device.getVendorId() == THERMAL_VENDOR_ID &&
-                device.getProductId() == THERMAL_PRODUCT_ID;
+        return (device.getVendorId() == THERMAL_VENDOR_ID &&
+                device.getProductId() == THERMAL_PRODUCT_ID) ||
+                (device.getVendorId() == ALT_THERMAL_VENDOR_ID &&
+                        device.getProductId() == ALT_THERMAL_PRODUCT_ID);
     }
 
     private String describeUsbDevice(UsbDevice device) {
@@ -1150,6 +1566,10 @@ public class MainActivity extends Activity {
             builder.append(types[i].getName());
         }
         return builder.append(')').toString();
+    }
+
+    private String describeField(Field field) {
+        return field.getType().getName() + " " + field.getName();
     }
 
     private String formatThrowable(Throwable throwable) {
