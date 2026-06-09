@@ -44,9 +44,11 @@ import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -144,6 +146,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
         buttons.addView(button("Start SDK", view -> startSdkLive()));
         buttons.addView(button("Native Auto", view -> startNativeAutoTest()));
+        buttons.addView(button("Engine Probe", view -> startEngineProbe()));
         buttons.addView(button("TVue FG Test", view -> startThermoVueForegroundTest()));
         buttons.addView(button("Cap TVue", view -> requestThermoVueScreenCapture()));
         buttons.addView(button("Load Cap", view -> showLatestScreenCapture()));
@@ -624,6 +627,17 @@ public class MainActivity extends Activity {
         startThread(this::runNativeAutoTest);
     }
 
+    private void startEngineProbe() {
+        if (running) {
+            append("engine probe already running");
+            return;
+        }
+        foregroundThermoVueTest = false;
+        running = true;
+        setStatus("engine probe running");
+        startThread(this::runStandaloneEngineProbe);
+    }
+
     private void stopSdkLive() {
         running = false;
         foregroundThermoVueTest = false;
@@ -861,7 +875,8 @@ public class MainActivity extends Activity {
                     "deviceControlHandle",
                     "proxyHandle",
                     "explicitEngine",
-                    "deviceControlThenExplicitStart"
+                    "deviceControlThenExplicitStart",
+                    "directEngineProbe"
             };
             int scenario = 0;
             for (String cameraId : cameraIds) {
@@ -907,6 +922,109 @@ public class MainActivity extends Activity {
             foregroundThermoVueTest = false;
             cleanupLiveObjects();
             append("===== native clone autotest finished anyFrame=" + anyFrame + " =====");
+        }
+    }
+
+    private void runStandaloneEngineProbe() {
+        append("===== direct engine standalone probe start =====");
+        Object proxy = null;
+        Object usbMonitorManager = null;
+        Object deviceControlManager = null;
+        boolean sawFrame = false;
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            dumpTargetedReverseEngineeringHints(loader);
+            inspectUsb();
+
+            Class<?> proxyClass = Class.forName(
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy", true, loader);
+            proxy = proxyClass.getMethod("getInstance").invoke(null);
+            liveProxy = proxy;
+            tryInvoke(proxy, "stopPreview");
+            tryInvoke(proxy, "releaseSource");
+            Method init = proxyClass.getMethod(
+                    "init",
+                    Context.class,
+                    int.class,
+                    int.class,
+                    float.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    int.class,
+                    int.class);
+            init.invoke(proxy, this, 256, 386, 1.0f, 25, "0", 1440, 1080, 25);
+            append("ENGINE proxy init OK");
+            tryInvoke(proxy, "initData");
+            tryInvokeBoolean(proxy, "setHasAPPKilled", false);
+            tryInvokeBoolean(proxy, "setHasPreviewSurfaceDestroy", false);
+            tryInvokeBoolean(proxy, "setPausePreviewEnable", false);
+            tryInvoke(proxy, "resetIsFirstFrame");
+
+            Class<?> usbMonitorManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.USBMonitorManager", true, loader);
+            usbMonitorManager = usbMonitorManagerClass.getMethod("getInstance").invoke(null);
+            liveUsbMonitorManager = usbMonitorManager;
+            tryInvoke(usbMonitorManager, "destroyMonitor");
+            tryInvoke(usbMonitorManager, "init");
+            tryInvoke(usbMonitorManager, "registerMonitor");
+
+            Class<?> deviceControlManagerClass = Class.forName(
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    true,
+                    loader);
+            deviceControlManager = deviceControlManagerClass.getMethod("getInstance").invoke(null);
+            liveDeviceControlManager = deviceControlManager;
+            tryInvoke(deviceControlManager, "release");
+            tryInvoke(deviceControlManager, "init");
+
+            Object callback = createIrFrameCallback(loader, "ENGINE");
+            tryInstallFrameCallback(proxy, callback, "ENGINE proxy");
+            tryInstallFrameCallback(deviceControlManager, callback, "ENGINE deviceControl");
+            installFrameCallbacksOnKnownSingletons(loader, callback, "ENGINE singleton");
+
+            Object connected = waitForUsbConnected(usbMonitorManager, 4000);
+            Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
+            append("ENGINE USB connected=" + describeObject(connected) +
+                    " ctrlBlock=" + describeObject(ctrlBlock));
+
+            sawFrame = runDirectEngineProbe(
+                    loader,
+                    proxy,
+                    usbMonitorManager,
+                    deviceControlManager,
+                    ctrlBlock,
+                    callback,
+                    "ENGINE");
+            if (!sawFrame) {
+                tryInvoke(proxy, "startPreview");
+                sawFrame = pollNativeScenario(proxy, "ENGINE proxy after direct", 6000);
+            }
+            setStatus(sawFrame ? "engine probe got frame" : "engine probe no frames");
+        } catch (Throwable t) {
+            append("ENGINE FATAL " + formatThrowable(t));
+            setStatus("engine probe failed");
+        } finally {
+            running = false;
+            if (proxy != null) {
+                tryInvoke(proxy, "stopPreview");
+                tryInvoke(proxy, "releaseSource");
+            }
+            if (deviceControlManager != null) {
+                tryInvoke(deviceControlManager, "release");
+            }
+            if (usbMonitorManager != null) {
+                tryInvoke(usbMonitorManager, "unregisterMonitor");
+                tryInvoke(usbMonitorManager, "destroyMonitor");
+            }
+            liveProxy = null;
+            liveUsbMonitorManager = null;
+            liveDeviceControlManager = null;
+            append("===== direct engine standalone probe finished sawFrame=" +
+                    sawFrame + " =====");
         }
     }
 
@@ -979,6 +1097,9 @@ public class MainActivity extends Activity {
             Object ctrlBlock = tryInvokeQuiet(usbMonitorManager, "getCtrlBlock");
             append("AUTO USB connected=" + describeObject(connected) +
                     " ctrlBlock=" + describeObject(ctrlBlock));
+            dumpObjectState(proxy, "AUTO proxy state");
+            dumpObjectState(usbMonitorManager, "AUTO usbMonitor state");
+            dumpObjectState(deviceControlManager, "AUTO deviceControl state");
 
             if ("deviceControlHandle".equals(strategy)) {
                 invokeWithLog(
@@ -1005,6 +1126,15 @@ public class MainActivity extends Activity {
                         mode);
                 sleepMs(1500);
                 tryInvoke(proxy, "startPreview");
+            } else if ("directEngineProbe".equals(strategy)) {
+                runDirectEngineProbe(
+                        loader,
+                        proxy,
+                        usbMonitorManager,
+                        deviceControlManager,
+                        ctrlBlock,
+                        frameCallback,
+                        "AUTO direct scenario " + scenario);
             }
 
             boolean sawFrame = pollNativeScenario(proxy, "AUTO scenario " + scenario, 5000);
@@ -1055,6 +1185,661 @@ public class MainActivity extends Activity {
         }
         sleepMs(800);
         tryInvoke(proxy, "startPreview");
+    }
+
+    private boolean runDirectEngineProbe(
+            ClassLoader loader,
+            Object proxy,
+            Object usbMonitorManager,
+            Object deviceControlManager,
+            Object ctrlBlock,
+            Object callback,
+            String label) {
+        append(label + " direct engine probe start");
+        List<Object> targets = new ArrayList<>();
+        addProbeTarget(targets, proxy, label + " proxy");
+        addProbeTarget(targets, usbMonitorManager, label + " usbMonitor");
+        addProbeTarget(targets, deviceControlManager, label + " deviceControl");
+
+        Object handleParam = createProbeObject(
+                loader,
+                "com.energy.ac020library.bean.DualUvcHandleParam",
+                label);
+        addProbeTarget(targets, handleParam, label + " dualUvcHandleParam");
+
+        Object builder = createProbeObject(
+                loader,
+                "com.energy.ac020library.IrcamEngineBuilder",
+                label);
+        addProbeTarget(targets, builder, label + " ircamBuilder");
+
+        Object engine = createProbeObject(
+                loader,
+                "com.energy.ac020library.IrcamEngine",
+                label);
+        addProbeTarget(targets, engine, label + " ircamEngine");
+
+        for (int i = 0; i < targets.size() && i < 40; i++) {
+            Object target = targets.get(i);
+            populateProbeFields(target, ctrlBlock, handleParam, callback, "0", label);
+            tryInstallFrameCallback(target, callback, label + " direct callback");
+            dumpObjectState(target, label + " direct state");
+            List<Object> fieldObjects = collectInterestingFieldObjects(target, label);
+            for (Object fieldObject : fieldObjects) {
+                addProbeTarget(targets, fieldObject, label + " fieldObject");
+            }
+        }
+
+        int initialCount = targets.size();
+        for (int i = 0; i < initialCount && i < targets.size(); i++) {
+            Object target = targets.get(i);
+            List<Object> products = invokeLikelyEngineMethods(
+                    target,
+                    ctrlBlock,
+                    handleParam,
+                    callback,
+                    "0",
+                    label + " configure");
+            for (Object product : products) {
+                addProbeTarget(targets, product, label + " product");
+            }
+        }
+
+        for (int i = 0; i < targets.size(); i++) {
+            Object target = targets.get(i);
+            populateProbeFields(target, ctrlBlock, handleParam, callback, "0", label);
+            tryInstallFrameCallback(target, callback, label + " product callback");
+        }
+
+        for (Object target : new ArrayList<>(targets)) {
+            invokeLikelyEngineStartMethods(
+                    target,
+                    ctrlBlock,
+                    handleParam,
+                    callback,
+                    "0",
+                    label + " start");
+        }
+
+        boolean sawFrame = pollObjectsForFrames(targets, label + " direct objects", 6500);
+        append(label + " direct engine probe result sawFrame=" + sawFrame +
+                " targets=" + targets.size());
+        return sawFrame;
+    }
+
+    private Object createProbeObject(ClassLoader loader, String className, String label) {
+        try {
+            Class<?> cls = Class.forName(className, true, loader);
+            for (Method method : cls.getDeclaredMethods()) {
+                int modifiers = method.getModifiers();
+                if (!Modifier.isStatic(modifiers) || method.getParameterTypes().length != 0) {
+                    continue;
+                }
+                if (!cls.isAssignableFrom(method.getReturnType())) {
+                    continue;
+                }
+                String lower = method.getName().toLowerCase(Locale.US);
+                if (!lower.equals("getinstance") &&
+                        !lower.contains("instance") &&
+                        !lower.contains("create") &&
+                        !lower.contains("build")) {
+                    continue;
+                }
+                try {
+                    method.setAccessible(true);
+                    Object result = method.invoke(null);
+                    append(label + " createProbeObject static " + className +
+                            "." + describeMethod(method) +
+                            " result=" + describeObject(result));
+                    if (result != null) {
+                        return result;
+                    }
+                } catch (Throwable t) {
+                    append(label + " createProbeObject static FAIL " + className +
+                            "." + describeMethod(method) + " " + formatThrowable(t));
+                }
+            }
+            for (Constructor<?> constructor : cls.getDeclaredConstructors()) {
+                if (constructor.getParameterTypes().length != 0) {
+                    continue;
+                }
+                try {
+                    constructor.setAccessible(true);
+                    Object result = constructor.newInstance();
+                    append(label + " createProbeObject ctor " + className +
+                            " result=" + describeObject(result));
+                    return result;
+                } catch (Throwable t) {
+                    append(label + " createProbeObject ctor FAIL " + className +
+                            " " + formatThrowable(t));
+                }
+            }
+            append(label + " createProbeObject no no-arg path " + className);
+        } catch (Throwable t) {
+            append(label + " createProbeObject FAIL " + className + " " + formatThrowable(t));
+        }
+        return null;
+    }
+
+    private void addProbeTarget(List<Object> targets, Object target, String label) {
+        if (target == null || !isInterestingProbeObject(target)) {
+            return;
+        }
+        if (targets.size() >= 60) {
+            append(label + " target skip cap target=" + describeObject(target));
+            return;
+        }
+        for (Object existing : targets) {
+            if (existing == target) {
+                return;
+            }
+        }
+        targets.add(target);
+        append(label + " target add " + describeObject(target));
+    }
+
+    private boolean isInterestingProbeObject(Object object) {
+        if (object == null) {
+            return false;
+        }
+        Class<?> cls = object.getClass();
+        if (cls.isArray() || cls.isPrimitive()) {
+            return false;
+        }
+        String name = cls.getName();
+        if (name.startsWith("java.") ||
+                name.startsWith("android.") ||
+                name.startsWith("kotlin.") ||
+                name.startsWith("dalvik.")) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.US);
+        return lower.contains("energy") ||
+                lower.contains("ircam") ||
+                lower.contains("uvc") ||
+                lower.contains("thermal") ||
+                lower.contains("tiny2c") ||
+                lower.contains("fusion") ||
+                lower.contains("preview") ||
+                lower.contains("handle") ||
+                lower.contains("engine");
+    }
+
+    private void populateProbeFields(
+            Object target,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId,
+            String label) {
+        if (target == null) {
+            return;
+        }
+        Class<?> cls = target.getClass();
+        int writes = 0;
+        for (Field field : cls.getDeclaredFields()) {
+            int modifiers = field.getModifiers();
+            if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
+                continue;
+            }
+            Object value = probeValueForType(
+                    field.getType(),
+                    field.getName(),
+                    ctrlBlock,
+                    handleParam,
+                    callback,
+                    cameraId);
+            if (value == null) {
+                continue;
+            }
+            try {
+                field.setAccessible(true);
+                Object current = field.get(target);
+                if (current != null && !isPrimitiveOrBoxed(field.getType())) {
+                    continue;
+                }
+                field.set(target, value);
+                writes++;
+                append(label + " populateField OK " + cls.getName() +
+                        "." + describeField(field) +
+                        "=" + describeObject(value));
+                if (writes >= 28) {
+                    append(label + " populateField truncated " + cls.getName());
+                    return;
+                }
+            } catch (Throwable t) {
+                append(label + " populateField FAIL " + cls.getName() +
+                        "." + describeField(field) +
+                        " " + formatThrowable(t));
+            }
+        }
+    }
+
+    private Object probeValueForType(
+            Class<?> type,
+            String name,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId) {
+        if (ctrlBlock != null && type.isInstance(ctrlBlock)) {
+            return ctrlBlock;
+        }
+        if (handleParam != null && type.isInstance(handleParam)) {
+            return handleParam;
+        }
+        if (callback != null && type.isInstance(callback)) {
+            return callback;
+        }
+        if (type.isInstance(this)) {
+            return this;
+        }
+        if (type == String.class) {
+            String lower = name.toLowerCase(Locale.US);
+            if (lower.contains("camera") || lower.contains("id")) {
+                return cameraId;
+            }
+            return null;
+        }
+        if (type == Boolean.TYPE || type == Boolean.class) {
+            String lower = name.toLowerCase(Locale.US);
+            return !(lower.contains("kill") ||
+                    lower.contains("destroy") ||
+                    lower.contains("pause") ||
+                    lower.contains("stop"));
+        }
+        if (type == Integer.TYPE || type == Integer.class) {
+            return chooseProbeInt(name);
+        }
+        if (type == Long.TYPE || type == Long.class) {
+            return (long) chooseProbeInt(name);
+        }
+        if (type == Float.TYPE || type == Float.class) {
+            return 1.0f;
+        }
+        if (type == Double.TYPE || type == Double.class) {
+            return 1.0d;
+        }
+        if (type.isEnum()) {
+            return chooseEnumConstant(type);
+        }
+        return null;
+    }
+
+    private int chooseProbeInt(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        if (lower.contains("thermal") && lower.contains("height")) {
+            return THERMAL_HEIGHT;
+        }
+        if (lower.contains("thermal") && lower.contains("width")) {
+            return THERMAL_WIDTH;
+        }
+        if (lower.contains("ir") && lower.contains("height")) {
+            return 386;
+        }
+        if (lower.contains("ir") && lower.contains("width")) {
+            return THERMAL_WIDTH;
+        }
+        if (lower.contains("visible") && lower.contains("height")) {
+            return 1080;
+        }
+        if (lower.contains("visible") && lower.contains("width")) {
+            return 1440;
+        }
+        if (lower.contains("height")) {
+            return THERMAL_HEIGHT;
+        }
+        if (lower.contains("width")) {
+            return THERMAL_WIDTH;
+        }
+        if (lower.contains("fps") || lower.contains("rate")) {
+            return 25;
+        }
+        if (lower.contains("mode")) {
+            return 1;
+        }
+        if (lower.contains("format")) {
+            return 0;
+        }
+        return 1;
+    }
+
+    private Object chooseEnumConstant(Class<?> enumType) {
+        Object[] constants = enumType.getEnumConstants();
+        if (constants == null || constants.length == 0) {
+            return null;
+        }
+        for (Object constant : constants) {
+            String lower = enumName(constant).toLowerCase(Locale.US);
+            if (lower.contains("dual") || lower.contains("fusion") || lower.contains("tiny2c")) {
+                return constant;
+            }
+        }
+        return constants[0];
+    }
+
+    private void dumpObjectState(Object target, String label) {
+        if (target == null) {
+            append(label + " objectState null");
+            return;
+        }
+        Class<?> cls = target.getClass();
+        append(label + " objectState class=" + cls.getName());
+        int count = 0;
+        for (Field field : cls.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) {
+                continue;
+            }
+            String lower = field.getName().toLowerCase(Locale.US) + " " +
+                    field.getType().getName().toLowerCase(Locale.US);
+            if (!lower.contains("frame") &&
+                    !lower.contains("temp") &&
+                    !lower.contains("data") &&
+                    !lower.contains("preview") &&
+                    !lower.contains("callback") &&
+                    !lower.contains("handle") &&
+                    !lower.contains("engine") &&
+                    !lower.contains("uvc") &&
+                    !lower.contains("usb") &&
+                    !lower.contains("ctrl") &&
+                    !lower.contains("surface") &&
+                    !lower.contains("width") &&
+                    !lower.contains("height") &&
+                    !lower.contains("fps")) {
+                continue;
+            }
+            try {
+                field.setAccessible(true);
+                Object value = field.get(target);
+                append(label + " field " + describeField(field) +
+                        "=" + describeProbeValue(value));
+                count++;
+                if (count >= 40) {
+                    append(label + " objectState truncated");
+                    return;
+                }
+            } catch (Throwable t) {
+                append(label + " field FAIL " + describeField(field) +
+                        " " + formatThrowable(t));
+            }
+        }
+    }
+
+    private List<Object> collectInterestingFieldObjects(Object target, String label) {
+        List<Object> objects = new ArrayList<>();
+        if (target == null) {
+            return objects;
+        }
+        for (Field field : target.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) {
+                continue;
+            }
+            try {
+                field.setAccessible(true);
+                Object value = field.get(target);
+                if (isInterestingProbeObject(value)) {
+                    objects.add(value);
+                    append(label + " collectFieldObject " +
+                            target.getClass().getName() + "." + field.getName() +
+                            "=" + describeObject(value));
+                }
+            } catch (Throwable ignored) {
+                // Some vendor fields are not safely readable; keep probing others.
+            }
+            if (objects.size() >= 16) {
+                append(label + " collectFieldObject truncated");
+                break;
+            }
+        }
+        return objects;
+    }
+
+    private List<Object> invokeLikelyEngineMethods(
+            Object target,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId,
+            String label) {
+        return invokeLikelyEngineMethodsInternal(
+                target,
+                ctrlBlock,
+                handleParam,
+                callback,
+                cameraId,
+                label,
+                false);
+    }
+
+    private List<Object> invokeLikelyEngineStartMethods(
+            Object target,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId,
+            String label) {
+        return invokeLikelyEngineMethodsInternal(
+                target,
+                ctrlBlock,
+                handleParam,
+                callback,
+                cameraId,
+                label,
+                true);
+    }
+
+    private List<Object> invokeLikelyEngineMethodsInternal(
+            Object target,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId,
+            String label,
+            boolean startPhase) {
+        List<Object> products = new ArrayList<>();
+        if (target == null) {
+            return products;
+        }
+        Set<String> seen = new HashSet<>();
+        Method[] declared = target.getClass().getDeclaredMethods();
+        Method[] publicMethods = target.getClass().getMethods();
+        int invoked = 0;
+        for (Method method : concatMethods(declared, publicMethods)) {
+            String key = describeMethod(method);
+            if (!seen.add(key)) {
+                continue;
+            }
+            if (!isLikelyEngineProbeMethod(method, startPhase)) {
+                continue;
+            }
+            Object[] args = buildProbeArgs(method, ctrlBlock, handleParam, callback, cameraId);
+            if (args == null) {
+                continue;
+            }
+            try {
+                method.setAccessible(true);
+                Object result = method.invoke(target, args);
+                invoked++;
+                append(label + " invoke OK " + target.getClass().getName() +
+                        "." + describeMethod(method) +
+                        " args=" + describeArgs(args) +
+                        " result=" + describeObject(result));
+                if (isInterestingProbeObject(result)) {
+                    products.add(result);
+                }
+                if (invoked >= 55) {
+                    append(label + " invoke truncated " + target.getClass().getName());
+                    break;
+                }
+            } catch (Throwable t) {
+                invoked++;
+                append(label + " invoke FAIL " + target.getClass().getName() +
+                        "." + describeMethod(method) +
+                        " args=" + describeArgs(args) +
+                        " " + formatThrowable(t));
+                if (invoked >= 55) {
+                    append(label + " invoke truncated " + target.getClass().getName());
+                    break;
+                }
+            }
+        }
+        return products;
+    }
+
+    private Method[] concatMethods(Method[] a, Method[] b) {
+        Method[] out = new Method[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+
+    private boolean isLikelyEngineProbeMethod(Method method, boolean startPhase) {
+        String lower = method.getName().toLowerCase(Locale.US);
+        if (lower.equals("wait") ||
+                lower.equals("equals") ||
+                lower.equals("hashcode") ||
+                lower.equals("tostring") ||
+                lower.contains("stop") ||
+                lower.contains("release") ||
+                lower.contains("destroy") ||
+                lower.contains("unregister") ||
+                lower.contains("close") ||
+                lower.contains("cancel") ||
+                lower.contains("pause") ||
+                lower.contains("free")) {
+            return false;
+        }
+        if (method.getParameterTypes().length > 4) {
+            return false;
+        }
+        if (startPhase) {
+            return lower.contains("start") ||
+                    lower.contains("open") ||
+                    lower.contains("preview") ||
+                    lower.contains("stream") ||
+                    lower.contains("run") ||
+                    lower.contains("handle");
+        }
+        return lower.contains("set") ||
+                lower.contains("init") ||
+                lower.contains("build") ||
+                lower.contains("create") ||
+                lower.contains("callback") ||
+                lower.contains("listener") ||
+                lower.contains("param") ||
+                lower.contains("handle") ||
+                lower.contains("engine") ||
+                lower.contains("uvc") ||
+                lower.contains("data") ||
+                lower.contains("frame") ||
+                lower.contains("temp") ||
+                lower.contains("config") ||
+                lower.contains("register");
+    }
+
+    private Object[] buildProbeArgs(
+            Method method,
+            Object ctrlBlock,
+            Object handleParam,
+            Object callback,
+            String cameraId) {
+        Class<?>[] types = method.getParameterTypes();
+        Object[] args = new Object[types.length];
+        for (int i = 0; i < types.length; i++) {
+            Object value = probeValueForType(
+                    types[i],
+                    method.getName() + "_" + i,
+                    ctrlBlock,
+                    handleParam,
+                    callback,
+                    cameraId);
+            if (value == null) {
+                return null;
+            }
+            args[i] = value;
+        }
+        return args;
+    }
+
+    private boolean pollObjectsForFrames(List<Object> targets, String label, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long lastLogAt = 0;
+        while (System.currentTimeMillis() < deadline && running) {
+            for (Object target : targets) {
+                byte[] frame = findFrameInObject(target, label);
+                if (frame != null) {
+                    append(label + " FRAME target=" + describeObject(target));
+                    renderThermal(frame, label + " frame");
+                    return true;
+                }
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastLogAt > 1500) {
+                lastLogAt = now;
+                append(label + " poll no frame targets=" + targets.size());
+            }
+            sleepMs(250);
+        }
+        return false;
+    }
+
+    private byte[] findFrameInObject(Object target, String label) {
+        if (target == null) {
+            return null;
+        }
+        for (Field field : target.getClass().getDeclaredFields()) {
+            String lower = field.getName().toLowerCase(Locale.US);
+            if (!lower.contains("frame") &&
+                    !lower.contains("temp") &&
+                    !lower.contains("raw") &&
+                    !lower.contains("remap") &&
+                    !lower.contains("data")) {
+                continue;
+            }
+            try {
+                field.setAccessible(true);
+                byte[] frame = chooseRenderableFrameFromValue(field.get(target));
+                if (frame != null) {
+                    append(label + " frameFromField " + target.getClass().getName() +
+                            "." + describeField(field));
+                    return frame;
+                }
+            } catch (Throwable ignored) {
+                // Keep polling other fields and methods.
+            }
+        }
+        Set<String> seen = new HashSet<>();
+        for (Method method : concatMethods(
+                target.getClass().getDeclaredMethods(),
+                target.getClass().getMethods())) {
+            String key = describeMethod(method);
+            if (!seen.add(key)) {
+                continue;
+            }
+            if (method.getParameterTypes().length != 0) {
+                continue;
+            }
+            String lower = method.getName().toLowerCase(Locale.US);
+            if (!lower.contains("frame") &&
+                    !lower.contains("temp") &&
+                    !lower.contains("raw") &&
+                    !lower.contains("remap") &&
+                    !lower.contains("data")) {
+                continue;
+            }
+            try {
+                method.setAccessible(true);
+                byte[] frame = chooseRenderableFrameFromValue(method.invoke(target));
+                if (frame != null) {
+                    append(label + " frameFromMethod " + target.getClass().getName() +
+                            "." + describeMethod(method));
+                    return frame;
+                }
+            } catch (Throwable ignored) {
+                // Some getters require initialized state; keep polling others.
+            }
+        }
+        return null;
     }
 
     private Object createIrFrameCallback(ClassLoader loader, String label) {
@@ -1661,6 +2446,54 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    private byte[] chooseRenderableFrameFromValue(Object value) {
+        if (value instanceof byte[]) {
+            return chooseRenderableFrame((byte[]) value, null);
+        }
+        int count = THERMAL_WIDTH * THERMAL_HEIGHT;
+        if (value instanceof short[] && ((short[]) value).length >= count) {
+            short[] source = (short[]) value;
+            byte[] frame = new byte[THERMAL_U16_BYTES];
+            for (int i = 0; i < count; i++) {
+                int sample = source[i] & 0xffff;
+                frame[i * 2] = (byte) (sample & 0xff);
+                frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
+            }
+            return frame;
+        }
+        if (value instanceof int[] && ((int[]) value).length >= count) {
+            int[] source = (int[]) value;
+            byte[] frame = new byte[THERMAL_U16_BYTES];
+            for (int i = 0; i < count; i++) {
+                int sample = source[i] & 0xffff;
+                frame[i * 2] = (byte) (sample & 0xff);
+                frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
+            }
+            return frame;
+        }
+        if (value instanceof float[] && ((float[]) value).length >= count) {
+            float[] source = (float[]) value;
+            int min = Integer.MAX_VALUE;
+            int max = Integer.MIN_VALUE;
+            int[] scaled = new int[count];
+            for (int i = 0; i < count; i++) {
+                int sample = Math.round(source[i] * 100.0f);
+                scaled[i] = sample;
+                min = Math.min(min, sample);
+                max = Math.max(max, sample);
+            }
+            int offset = min < 0 ? -min : 0;
+            byte[] frame = new byte[THERMAL_U16_BYTES];
+            for (int i = 0; i < count; i++) {
+                int sample = Math.max(0, Math.min(0xffff, scaled[i] + offset));
+                frame[i * 2] = (byte) (sample & 0xff);
+                frame[i * 2 + 1] = (byte) ((sample >> 8) & 0xff);
+            }
+            return frame;
+        }
+        return null;
+    }
+
     private void renderThermal(byte[] frame, String label) {
         int count = THERMAL_WIDTH * THERMAL_HEIGHT;
         int[] values = new int[count];
@@ -2027,7 +2860,45 @@ public class MainActivity extends Activity {
         if (object instanceof byte[]) {
             return describeBytes((byte[]) object);
         }
+        if (object instanceof short[]) {
+            return "short[]{len=" + ((short[]) object).length + "}";
+        }
+        if (object instanceof int[]) {
+            return "int[]{len=" + ((int[]) object).length + "}";
+        }
+        if (object instanceof float[]) {
+            return "float[]{len=" + ((float[]) object).length + "}";
+        }
         return object.getClass().getName() + ":" + object;
+    }
+
+    private String describeProbeValue(Object object) {
+        if (object == null) {
+            return "null";
+        }
+        if (object instanceof byte[] ||
+                object instanceof short[] ||
+                object instanceof int[] ||
+                object instanceof float[]) {
+            return describeObject(object);
+        }
+        if (isPrimitiveOrBoxed(object.getClass()) || object instanceof String) {
+            return String.valueOf(object);
+        }
+        return object.getClass().getName() + "@" +
+                Integer.toHexString(System.identityHashCode(object));
+    }
+
+    private boolean isPrimitiveOrBoxed(Class<?> type) {
+        return type.isPrimitive() ||
+                type == Boolean.class ||
+                type == Byte.class ||
+                type == Short.class ||
+                type == Integer.class ||
+                type == Long.class ||
+                type == Float.class ||
+                type == Double.class ||
+                type == Character.class;
     }
 
     private String describeArgs(Object[] args) {
@@ -2062,11 +2933,9 @@ public class MainActivity extends Activity {
             return null;
         }
         for (Object arg : args) {
-            if (arg instanceof byte[]) {
-                byte[] frame = chooseRenderableFrame((byte[]) arg, null);
-                if (frame != null) {
-                    return frame;
-                }
+            byte[] frame = chooseRenderableFrameFromValue(arg);
+            if (frame != null) {
+                return frame;
             }
         }
         return null;

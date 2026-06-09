@@ -21,6 +21,8 @@ live thermal frames into its own UI.
    appears.
 7. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
 8. Tap `Start SDK`.
+9. Tap `Engine Probe` for a focused direct-native attempt around
+   `IrcamEngine`, `IrcamEngineBuilder`, and `DualUvcHandleParam`.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
 foreground, use `TVue FG Test` instead of `Launch TVue` + `Start SDK`. It starts
@@ -39,14 +41,25 @@ of ThermoVue-like startup sequences:
 - direct USB endpoint descriptor/read probing;
 - relevant ThermoVue DEX class index logging;
 - attempted `IIrFrameCallback` registration on known SDK singletons;
+- private field-state dumps from live proxy, USB monitor, and preview-control
+  objects;
+- direct `IrcamEngine`/builder/handle-param probing with heuristic field
+  population and likely init/start method calls;
 - multiple visible camera IDs (`0`, `1`, `2`, `3`, and empty);
 - `UvcNativeCamDualDeviceControlManager.handleStartPreview(...)`;
 - `Tiny2CDualFusionProxy.handleStartPreview(...)`;
 - explicit `initHandleEngine(ctrlBlock, true)` plus `startPreview()`;
+- generic polling of frame/temp/raw/remap fields and zero-argument getters,
+  including `byte[]`, `short[]`, `int[]`, and `float[]` frame matrices;
 - targeted method/field dumps for preview, frame, callback, calibration, and
   temperature APIs.
 
 Wait until it prints `native clone autotest finished`, then tap `Share Log`.
+
+If you only have time for one native-clone diagnostic, run `Engine Probe` and
+share the log. It performs the same ThermoVue bootstrap, waits for a
+`UsbControlBlock`, then tries the direct engine path without walking the full
+camera/mode matrix.
 
 If live thermal frames are available, the preview panel will show the real
 256x192 thermal value matrix rendered with a color palette, plus min/max/mean/FPS
