@@ -1,0 +1,7 @@
+google-genai>=1.0.0
+numpy
+opencv-python
+pandas
+pillow
+python-dotenv>=1.0.0
+streamlit
