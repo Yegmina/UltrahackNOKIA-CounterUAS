@@ -21,6 +21,8 @@ laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
 3. Tap `Scan` to list Camera2 IDs, USB devices, and ThermoVue package status.
 4. Tap `USB Probe` to log USB descriptors, interfaces, endpoints, and short
    read attempts from readable IN endpoints.
+   If bytes are read, the app also saves them under the current debug session's
+   `usb_probe/` folder so they can be pulled later with the MTP helper.
 5. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
 6. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
    appears.
@@ -115,6 +117,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prototype\mtp_phone_helper.p
 
 `CopyApk` only places the APK in the phone `Download` folder. Install/open it on
 the phone, then use `PullLogs` to bring the debug sessions back to the laptop.
+`PullLogs` copies the whole `thermal_live_debug_*` session folder, including
+logs and any `usb_probe/*.bin` endpoint captures.
 
 Current Windows observation for the Ulefone connection:
 

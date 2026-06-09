@@ -134,6 +134,12 @@ py -3 prototype\thermal_frame_evidence_validator.py --npy prototype\logs\thermal
 py -3 prototype\thermal_frame_evidence_validator.py --self-test
 ```
 
+Analyze raw USB endpoint captures pulled from the debug APK:
+
+```powershell
+py -3 prototype\analyze_usb_probe_capture.py prototype\mtp_pulled_logs --write-pgm prototype\logs\usb_probe_previews
+```
+
 Pan/tilt command scaffold:
 
 ```powershell

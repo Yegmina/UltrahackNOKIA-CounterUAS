@@ -79,7 +79,8 @@ import dalvik.system.DexFile;
 
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
-    private static final String BUILD_MARKER = "thermal-live-debug 2026-06-09 mtp-http-engine-probe";
+    private static final String BUILD_MARKER =
+            "thermal-live-debug 2026-06-09 usb-attach-endpoint-capture";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String ACTION_USB_PERMISSION =
             "com.yegmina.thermallivedebug.USB_PERMISSION";
@@ -133,6 +134,7 @@ public class MainActivity extends Activity {
                 " sdk=" + Build.VERSION.SDK_INT);
         requestAppPermissions();
         startHttpServer();
+        handleUsbAttachIntent(getIntent(), "onCreate");
     }
 
     private void appendSelfPackageInfo() {
@@ -216,6 +218,30 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         stopHttpServer();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleUsbAttachIntent(intent, "onNewIntent");
+    }
+
+    private void handleUsbAttachIntent(Intent intent, String source) {
+        if (intent == null) {
+            return;
+        }
+        String action = intent.getAction();
+        if (!UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+            append(source + " intent action=" + action);
+            return;
+        }
+        UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        append(source + " USB_DEVICE_ATTACHED " + describeUsbDevice(device) +
+                " thermal=" + (device != null && isThermalDevice(device)));
+        if (device != null && isThermalDevice(device)) {
+            startThread(this::probeThermalUsbEndpoints);
+        }
     }
 
     private void requestAppPermissions() {
@@ -471,6 +497,7 @@ public class MainActivity extends Activity {
         int maxPacket = Math.max(64, endpoint.getMaxPacketSize());
         int bufferLength = Math.max(64, Math.min(64 * 1024, maxPacket * 128));
         byte[] buffer = new byte[bufferLength];
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
         boolean sawBytes = false;
         for (int attempt = 1; attempt <= 8; attempt++) {
             int read;
@@ -490,6 +517,7 @@ public class MainActivity extends Activity {
                     " buffer=" + buffer.length);
             if (read > 0) {
                 sawBytes = true;
+                captured.write(buffer, 0, read);
                 append("USB probe data iface=" + interfaceIndex +
                         " endpoint=" + endpointIndex +
                         " read=" + read +
@@ -503,7 +531,88 @@ public class MainActivity extends Activity {
             }
             sleepMs(80);
         }
+        if (sawBytes) {
+            byte[] data = captured.toByteArray();
+            saveUsbProbeBytes(interfaceIndex, endpointIndex, data);
+            byte[] frame = chooseUsbProbeFrame(data);
+            if (frame != null) {
+                renderThermal(frame, "usb endpoint collected");
+            }
+        }
         return sawBytes;
+    }
+
+    private void saveUsbProbeBytes(int interfaceIndex, int endpointIndex, byte[] data) {
+        if (data == null || data.length == 0) {
+            return;
+        }
+        try {
+            File dir = new File(logFile.getParentFile(), "usb_probe");
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            String name = "iface" + interfaceIndex + "_ep" + endpointIndex + "_" +
+                    System.currentTimeMillis() + ".bin";
+            File file = new File(dir, name);
+            try (FileOutputStream output = new FileOutputStream(file)) {
+                output.write(data);
+            }
+            append("USB probe saved bytes path=" + file.getAbsolutePath() +
+                    " bytes=" + data.length +
+                    " checksum=" + checksumHex(data, data.length));
+        } catch (Throwable t) {
+            append("USB probe save bytes FAIL " + formatThrowable(t));
+        }
+    }
+
+    private byte[] chooseUsbProbeFrame(byte[] data) {
+        if (data == null || data.length < THERMAL_U16_BYTES) {
+            return null;
+        }
+        int[] starts = new int[]{
+                0,
+                THERMAL_PACKET_TEMP_OFFSET,
+                Math.max(0, data.length - THERMAL_U16_BYTES)
+        };
+        for (int start : starts) {
+            byte[] frame = copyThermalWindowIfUseful(data, start);
+            if (frame != null) {
+                append("USB probe render candidate start=" + start);
+                return frame;
+            }
+        }
+        int maxStart = data.length - THERMAL_U16_BYTES;
+        int step = Math.max(512, THERMAL_U16_BYTES / 16);
+        for (int start = 0; start <= maxStart; start += step) {
+            byte[] frame = copyThermalWindowIfUseful(data, start);
+            if (frame != null) {
+                append("USB probe render scanned start=" + start);
+                return frame;
+            }
+        }
+        append("USB probe no renderable collected frame bytes=" + data.length);
+        return null;
+    }
+
+    private byte[] copyThermalWindowIfUseful(byte[] data, int start) {
+        if (start < 0 || data == null || start + THERMAL_U16_BYTES > data.length) {
+            return null;
+        }
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        int stride = 97;
+        int count = THERMAL_WIDTH * THERMAL_HEIGHT;
+        for (int i = 0; i < count; i += stride) {
+            int byteIndex = start + i * 2;
+            int value = (data[byteIndex] & 0xff) | ((data[byteIndex + 1] & 0xff) << 8);
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        }
+        if (max - min < 8) {
+            return null;
+        }
+        byte[] frame = new byte[THERMAL_U16_BYTES];
+        System.arraycopy(data, start, frame, 0, frame.length);
+        return frame;
     }
 
     private void inspectThermoVuePackage() {
