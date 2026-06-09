@@ -52,8 +52,10 @@ Thermal is the high-value but privileged stream:
 - The latest bridge APK matches ThermoVue Pro's startup order, but a normal
   side-loaded APK still runs as `untrusted_app` and cannot read/write the Tiny2C
   sysfs power/mux nodes.
-- Latest side-loaded exact-startup test still ended with `ctrlBlock=null`,
-  `frameCount=0`, `rawTemp=null`, and `remapTemp=null`.
+- When our app is foreground, ThermoVue loses foreground and the internal
+  thermal USB device disappears from normal app view. When ThermoVue stays
+  foreground, the USB device stays visible, but Android rejects our background
+  USB permission request with `granted=false`.
 - FactoryMode can power/connect the module from its privileged thermal test,
   but the activity is not exported and the vendor `IChangeNode` HAL is blocked
   to shell/normal apps by SELinux.
@@ -65,6 +67,30 @@ Thermal is the high-value but privileged stream:
   signing, or an in-process ThermoVue hook.
 - Screen capture of ThermoVue can be used only as a visual fallback, not as raw
   temperature data. Prefer IJPEG extraction for any thermal algorithm tests.
+
+## Thermal Access Modes
+
+Use one stable Jetson interface: `YEGMINA_THERMAL_RAW_V1` UDP frames containing
+one 256x192 little-endian `uint16` plane.
+
+Mode A, preferred live mode:
+
+- source: platform-signed/vendor bridge or in-process ThermoVue hook;
+- rate: target 20-25 fps;
+- status: mapped, but blocked on stock phone permissions.
+
+Mode B, working raw fallback:
+
+- source: ThermoVue foreground + ADB photo trigger + IJPEG extraction;
+- rate: about one frame every 1.7-2.2 seconds in current tests;
+- status: working and raw, good for calibration and slow fusion evidence.
+
+Mode C, visual fallback:
+
+- source: ThermoVue screen capture or normal RGB capture of ThermoVue UI;
+- rate: near-live visual feed possible;
+- status: useful for a demo display or visual detector, but not raw thermal
+  temperature data.
 
 ## Fusion Logic
 
@@ -95,15 +121,18 @@ can rotate:
 
 ## Recommended Hackathon Path
 
-1. Get RGB stream from phone to Jetson working.
-2. Run drone detector on Jetson and show live boxes/latency.
+1. Get RGB stream from phone to Jetson working with an IP camera app or our
+   custom phone app.
+2. Run a drone detector on Jetson and show live boxes/latency.
 3. Add phone microphone stream and audio confidence.
-4. Keep thermal work as a parallel track:
+4. Start the Jetson fusion node with the thermal UDP listener even if no thermal
+   packets are present yet.
+5. Keep thermal work as a parallel track:
    - ask mentors/vendor for privileged ThermoVue SDK access;
    - show current evidence that side-loaded direct thermal is blocked;
    - use the IJPEG ADB bridge for low-rate real raw thermal fusion tests;
    - use ThermoVue screen capture only if a thermal visual is needed for demo.
-5. If time remains, connect pan/tilt commands to a prebuilt programmable holder
+6. If time remains, connect pan/tilt commands to a prebuilt programmable holder
    or simple microcontroller mount.
 
 ## Current Thermal Decision

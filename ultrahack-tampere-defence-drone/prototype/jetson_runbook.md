@@ -56,8 +56,8 @@ python prototype/counter_uas_fusion_node.py \
 
 ## Native Thermal UDP
 
-When the Android thermal bridge validates real frames, run the same fusion node
-with the default thermal UDP listener:
+The fusion node always listens for thermal UDP frames. Use the same Jetson
+command for either a future native bridge or the current raw-IJPEG fallback:
 
 ```bash
 python prototype/counter_uas_fusion_node.py \
@@ -70,7 +70,22 @@ python prototype/counter_uas_fusion_node.py \
   --fusion-audio-weight 0.15
 ```
 
-Start the Android bridge with `-JetsonHost <jetson-ip> -JetsonPort 25000`.
+For a future native Android bridge, start the Android bridge with
+`-JetsonHost <jetson-ip> -JetsonPort 25000`.
+
+For the current working raw-IJPEG bridge, keep ThermoVue foreground on the phone
+and run this from the laptop connected by ADB:
+
+```powershell
+py -3 prototype\thermovue_ijpeg_live_pull.py `
+  --udp-host <jetson-ip> `
+  --udp-port 25000 `
+  --interval 0.0 `
+  --no-window
+```
+
+Current measured raw-IJPEG rate is about one real 256x192 `temp_u16le` frame
+every 1.7-2.2 seconds. It is raw thermal data, but not high-FPS live video.
 
 ## Mount Control
 
