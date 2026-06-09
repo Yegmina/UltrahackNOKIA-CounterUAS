@@ -83,7 +83,7 @@ import dalvik.system.DexFile;
 public class MainActivity extends Activity {
     private static final String TAG = "ThermalLiveDebug";
     private static final String BUILD_MARKER =
-            "thermal-live-debug 2026-06-09 vendor-ctrlblock-takeover";
+            "thermal-live-debug 2026-06-09 thermovue-privilege-audit";
     private static final String THERMOVUE_PACKAGE = "com.energy.tc2c";
     private static final String THERMOVUE_SOP_PACKAGE = "com.energy.tc2c.sop";
     private static final String ACTION_USB_PERMISSION =
@@ -124,6 +124,7 @@ public class MainActivity extends Activity {
     private SurfaceTexture vendorSurfaceTexture;
     private Surface vendorSurface;
     private DexClassLoader thermoVueLoader;
+    private DexClassLoader thermoVueSopLoader;
 
     private static final class UsbProbeContext {
         UsbDevice device;
@@ -195,6 +196,7 @@ public class MainActivity extends Activity {
         buttons.addView(button("USB Probe", view -> startThread(this::probeThermalUsbEndpoints)));
         buttons.addView(button("Dump Classes", view -> startThread(this::dumpClassesOnly)));
         buttons.addView(button("Dump APKs", view -> startThread(this::dumpThermoVueArtifacts)));
+        buttons.addView(button("Priv Audit", view -> startThread(this::runPrivilegeCloneAudit)));
         buttons.addView(button("Request USB", view -> requestThermalUsb()));
         buttons.addView(button("Power Try", view -> startThread(this::tryPowerThermal)));
         buttons.addView(button("Launch TVue", view -> launchThermoVue()));
@@ -1104,6 +1106,131 @@ public class MainActivity extends Activity {
         inspectUsb();
     }
 
+    private void runPrivilegeCloneAudit() {
+        append("===== ThermoVue privilege + clone audit =====");
+        append("self uid=" + Process.myUid() +
+                " package=" + getPackageName() +
+                " context=" + readSmallTextFile("/proc/self/attr/current"));
+        auditPackage(THERMOVUE_PACKAGE, "ThermoVue Pro");
+        auditPackage(THERMOVUE_SOP_PACKAGE, "ThermoVue SOP");
+        auditSysfsPath(TINY2C_USB_MODE_PATH, "Pro/SOP GPIOUtils tiny2c_usb_mode");
+        auditSysfsPath(TINY2C_EXTCON_MODE_PATH, "Pro/SOP GPIOUtils tiny2c_mode");
+        auditSysfsPath(
+                "/sys/devices/platform/yft_tiny2c_usb/sensor_id",
+                "Tiny2C sensor_id");
+        inspectUsb();
+        auditThermoVueCloneClasses();
+        append("CLONE_SEQUENCE Pro normal live path:");
+        append("  1 USBMonitorManager.init/registerMonitor");
+        append("  2 GPIOUtils.powerUpControl writes tiny2c_usb_mode=1 and tiny2c_mode=1");
+        append("  3 wait up to 9000 ms for USBMonitorManager.isDeviceConnected");
+        append("  4 MImageUtils init + MNN_SR_TINY2C warm-up");
+        append("  5 Tiny2CDualFusionProxy.initData");
+        append("  6 initHandleEngine(USBMonitorManager.getCtrlBlock(), true)");
+        append("  7 IrcamEngine.setIrFrameCallback + startVideoStream");
+        append("  8 IIrFrameCallback gives [ir 98304][info 1024][temp 98304][vl 4665600]");
+        append("CLONE_BLOCKER if normal app: sysfs nodes are hidden from shell/normal app; ThermoVue runs as platform_app.");
+        setStatus("privilege audit finished");
+    }
+
+    private void auditPackage(String packageName, String label) {
+        append("AUDIT_PACKAGE " + label + " package=" + packageName);
+        try {
+            PackageInfo packageInfo = getPackageManager().getPackageInfo(packageName, 0);
+            ApplicationInfo appInfo = packageInfo.applicationInfo;
+            int privateFlags = getIntField(appInfo, "privateFlags", -1);
+            append("  sourceDir=" + appInfo.sourceDir);
+            append("  nativeLibraryDir=" + appInfo.nativeLibraryDir);
+            append("  uid=" + appInfo.uid +
+                    " flags=0x" + Integer.toHexString(appInfo.flags) +
+                    " privateFlags=0x" + Integer.toHexString(privateFlags));
+            append("  system=" + ((appInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0) +
+                    " updatedSystem=" +
+                    ((appInfo.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) +
+                    " debug=" + ((appInfo.flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0));
+            append("  version=" + packageInfo.versionName +
+                    " code=" + getLongVersionCode(packageInfo));
+        } catch (Throwable t) {
+            append("  package audit FAIL " + formatThrowable(t));
+        }
+    }
+
+    private void auditSysfsPath(String path, String label) {
+        File file = new File(path);
+        append("AUDIT_SYSFS " + label + " path=" + path);
+        append("  exists=" + file.exists() +
+                " canRead=" + file.canRead() +
+                " canWrite=" + file.canWrite() +
+                " canExecute=" + file.canExecute());
+        append("  value=" + readSmallTextFile(path));
+        writeSysfs(path, "1\n");
+    }
+
+    private void auditThermoVueCloneClasses() {
+        append("AUDIT_CLASSES ThermoVue clone entry points");
+        try {
+            DexClassLoader loader = getThermoVueClassLoader();
+            initializeMmkv(loader);
+            initializeBlankjUtils(loader);
+            initializeRxBaseApplication(loader);
+            String[] proClasses = new String[]{
+                    "com.energy.dualmodule.sdk.util.GPIOUtils",
+                    "com.energy.dualmodule.sdk.service.task.StartPreviewTask",
+                    "com.energy.dualmodule.sdk.Tiny2CDualFusionProxy",
+                    "com.energy.dualmodule.sdk.uvc.USBMonitorManager",
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualDeviceControlManager",
+                    "com.energy.dualmodule.sdk.uvc.UvcNativeCamDualFusionPreviewManager",
+                    "com.energy.ac020library.IrcamEngine",
+                    "com.energy.ac020library.bean.DualUvcHandleParam"
+            };
+            append("AUDIT_CLASSES Pro APK");
+            for (String className : proClasses) {
+                auditClass(loader, className);
+            }
+
+            DexClassLoader sopLoader = getThermoVueSopClassLoader();
+            String[] sopClasses = new String[]{
+                    "com.energy.tc2c.sop.utils.GPIOUtils",
+                    "com.energy.tc2c.sop.camera.UvcNativeCamDualCalManager",
+                    "com.energy.tc2c.sop.camera.USBMonitorManager"
+            };
+            append("AUDIT_CLASSES SOP APK");
+            for (String className : sopClasses) {
+                auditClass(sopLoader, className);
+            }
+        } catch (Throwable t) {
+            append("AUDIT_CLASSES fatal " + formatThrowable(t));
+        }
+    }
+
+    private void auditClass(ClassLoader loader, String className) {
+        try {
+            Class<?> cls = Class.forName(className, false, loader);
+            append("  class OK " + className);
+            for (Method method : cls.getDeclaredMethods()) {
+                String name = method.getName();
+                if (name.equals("powerUpControl") ||
+                        name.equals("powerDownControl") ||
+                        name.equals("init") ||
+                        name.equals("initData") ||
+                        name.equals("initHandleEngine") ||
+                        name.equals("startPreview") ||
+                        name.equals("startVideoStream") ||
+                        name.equals("setIrFrameCallback") ||
+                        name.equals("getRawTempData") ||
+                        name.equals("getRemapTempData") ||
+                        name.equals("getFrameCount") ||
+                        name.equals("isDeviceConnected") ||
+                        name.equals("getCtrlBlock") ||
+                        name.equals("registerMonitor")) {
+                    append("    method " + describeMethod(method));
+                }
+            }
+        } catch (Throwable t) {
+            append("  class FAIL " + className + " " + formatThrowable(t));
+        }
+    }
+
     private boolean invokeVendorPowerControl(ClassLoader loader, boolean powerUp, String label) {
         String wanted = powerUp ? "powerupcontrol" : "powerdowncontrol";
         String[] classNames = new String[]{
@@ -1164,6 +1291,29 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             append("sysfsWrite FAIL path=" + path + " value=" + value.trim() +
                     " " + formatThrowable(t));
+        }
+    }
+
+    private String readSmallTextFile(String path) {
+        File file = new File(path);
+        if (!file.exists()) {
+            return "missing";
+        }
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new FileInputStream(file)))) {
+            StringBuilder builder = new StringBuilder();
+            String line;
+            int lines = 0;
+            while ((line = reader.readLine()) != null && lines < 4) {
+                if (builder.length() > 0) {
+                    builder.append(" | ");
+                }
+                builder.append(line);
+                lines++;
+            }
+            return builder.length() == 0 ? "empty" : builder.toString();
+        } catch (Throwable t) {
+            return "read FAIL " + formatThrowable(t);
         }
     }
 
@@ -3648,21 +3798,36 @@ public class MainActivity extends Activity {
         if (thermoVueLoader != null) {
             return thermoVueLoader;
         }
-        PackageInfo packageInfo = getPackageManager().getPackageInfo(THERMOVUE_PACKAGE, 0);
+        thermoVueLoader = buildPackageClassLoader(THERMOVUE_PACKAGE, "thermovue");
+        return thermoVueLoader;
+    }
+
+    private synchronized DexClassLoader getThermoVueSopClassLoader() throws Exception {
+        if (thermoVueSopLoader != null) {
+            return thermoVueSopLoader;
+        }
+        thermoVueSopLoader = buildPackageClassLoader(THERMOVUE_SOP_PACKAGE, "thermovue_sop");
+        return thermoVueSopLoader;
+    }
+
+    private DexClassLoader buildPackageClassLoader(String packageName, String cachePrefix)
+            throws Exception {
+        PackageInfo packageInfo = getPackageManager().getPackageInfo(packageName, 0);
         ApplicationInfo appInfo = packageInfo.applicationInfo;
-        File libDir = new File(getCodeCacheDir(), "thermovue_libs");
-        File dexDir = new File(getCodeCacheDir(), "thermovue_dex");
+        File libDir = new File(getCodeCacheDir(), cachePrefix + "_libs");
+        File dexDir = new File(getCodeCacheDir(), cachePrefix + "_dex");
         recreateDir(libDir);
         recreateDir(dexDir);
         int libs = extractNativeLibraries(appInfo.sourceDir, libDir);
-        append("ThermoVue classloader sourceDir=" + appInfo.sourceDir);
-        append("ThermoVue extractedNativeLibs=" + libs + " to " + libDir.getAbsolutePath());
-        thermoVueLoader = new DexClassLoader(
+        append("package classloader package=" + packageName +
+                " sourceDir=" + appInfo.sourceDir);
+        append("package classloader extractedNativeLibs=" + libs +
+                " to " + libDir.getAbsolutePath());
+        return new DexClassLoader(
                 appInfo.sourceDir,
                 dexDir.getAbsolutePath(),
                 libDir.getAbsolutePath(),
                 getClassLoader());
-        return thermoVueLoader;
     }
 
     private void initializeMmkv(ClassLoader loader) {
@@ -4375,6 +4540,9 @@ public class MainActivity extends Activity {
             } else if ("/dump-vendor".equals(path)) {
                 startThread(this::dumpThermoVueArtifacts);
                 writeHttpText(output, 202, "Accepted", "vendor dump started\n", "text/plain");
+            } else if ("/priv-audit".equals(path)) {
+                startThread(this::runPrivilegeCloneAudit);
+                writeHttpText(output, 202, "Accepted", "privilege audit started\n", "text/plain");
             } else if ("/power".equals(path)) {
                 startThread(this::tryPowerThermal);
                 writeHttpText(output, 202, "Accepted", "thermal power attempt started\n", "text/plain");
@@ -4427,6 +4595,7 @@ public class MainActivity extends Activity {
                 "<a href=\"/latest.pgm\">pgm</a> " +
                 "<a href=\"/latest.png\">png</a></p>" +
                 "<p><a href=\"/dump-vendor\">Dump ThermoVue APKs/libs</a></p>" +
+                "<p><a href=\"/priv-audit\">Privilege Clone Audit</a></p>" +
                 "<p><a href=\"/power\">Power Thermal</a></p>" +
                 "<p><a href=\"/usb-probe\">Probe USB</a></p>" +
                 "<p><a href=\"/start-startup-clone\">Start Startup Clone</a></p>" +
@@ -4639,6 +4808,19 @@ public class MainActivity extends Activity {
             return invoke(target, name);
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    private int getIntField(Object target, String fieldName, int fallback) {
+        if (target == null) {
+            return fallback;
+        }
+        try {
+            Field field = target.getClass().getField(fieldName);
+            field.setAccessible(true);
+            return field.getInt(target);
+        } catch (Throwable ignored) {
+            return fallback;
         }
     }
 

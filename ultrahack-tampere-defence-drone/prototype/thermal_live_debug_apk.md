@@ -13,7 +13,8 @@ The app also starts a small HTTP debug server on port `8088`. This is important
 when USB/ADB is unreliable: open the URL shown in the app log/status from the
 laptop browser to read `/log`, `/status`, `/latest.raw`, `/latest.pgm`, and
 `/latest.png`. Use `/dump-vendor` to start the ThermoVue APK/native-library dump
-from the laptop if the app is already open and reachable.
+from the laptop if the app is already open and reachable. Use `/priv-audit` for
+the current Tiny2C privilege/clone diagnostic.
 
 ## Button Flow
 
@@ -27,26 +28,28 @@ from the laptop if the app is already open and reachable.
 5. Tap `Dump APKs` to copy ThermoVue Pro and ThermoVue SOP APK/native-library
    artifacts into the current debug session's `vendor_dump/` folder. This is
    the non-ADB path for decompiling the real system app on the laptop.
-6. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
-7. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
+6. Tap `Priv Audit` to log app SELinux context, ThermoVue package privilege,
+   Tiny2C sysfs access, USB visibility, and Pro/SOP clone entry classes.
+7. Tap `Power Try` to try direct sysfs and vendor GPIO power paths.
+8. Tap `Request USB` if USB VID/PID `0x3474:0x4321` or `0x0ecb:0x20f6`
    appears.
-8. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
-9. Tap `Start SDK`.
-10. Tap `Engine Probe` for a focused direct-native attempt around
+9. Tap `Launch TVue`, wait for ThermoVue to open, then return to this app.
+10. Tap `Start SDK`.
+11. Tap `Engine Probe` for a focused direct-native attempt around
    `IrcamEngine`, `IrcamEngineBuilder`, and `DualUvcHandleParam`.
    Current builds also create a hidden `SurfaceTexture`/`Surface` and
    reflectively attach it to vendor preview objects before starting the native
    preview path.
-11. Tap `Native CAM` to call the decompiled ThermoVue native path directly:
+12. Tap `Native CAM` to call the decompiled ThermoVue native path directly:
    `DualUvcHandleParam -> IrcamEngine.Builder -> initHandle ->
    setIrFrameCallback -> startVideoStream`.
-12. Tap `CtrlBlock` to shell-grant the thermal USB device first, then create a
+13. Tap `CtrlBlock` to shell-grant the thermal USB device first, then create a
    real vendor `USBMonitor.UsbControlBlock` and call
    `Tiny2CDualFusionProxy.initHandleEngine(ctrlBlock, true)`.
-13. Tap `Takeover` for a controlled ownership-transition test. It opens the
+14. Tap `Takeover` for a controlled ownership-transition test. It opens the
    vendor `UsbControlBlock` while ThermoVue has powered the module, waits six
    seconds so the host can stop ThermoVue, then tries the same proxy startup.
-14. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
+15. If ADB is unavailable, use the HTTP URL printed in the log to fetch results
     from the laptop.
 
 To test whether ThermoVue stops its camera/thermal stream when it loses
@@ -117,6 +120,22 @@ timeout so the dialog should not loop forever.
 2026-06-09 connected-phone tests reached the vendor USB/native boundary but did
 not obtain frames inside our side-loaded app:
 
+- `Priv Audit` shows this APK runs as
+  `u:r:untrusted_app:s0:c59,c257,c512,c768`; ThermoVue Pro runs as a system
+  package in `u:r:platform_app:s0:c512,c768`.
+- The Tiny2C sysfs nodes used by ThermoVue exist but are not readable/writable
+  from the side-loaded app:
+  `/sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode`,
+  `/sys/class/yft_extcon/tiny2c_mode`, and
+  `/sys/devices/platform/yft_tiny2c_usb/sensor_id`.
+- When ThermoVue is foreground, `Priv Audit` sees the internal thermal USB
+  device `/dev/bus/usb/001/002` with VID/PID `0x3474:0x4321`; without ThermoVue
+  powering the module, the normal app sees `usbDeviceCount=0`.
+- The audit can load the Pro clone classes
+  `Tiny2CDualFusionProxy`, `USBMonitorManager`,
+  `UvcNativeCamDualDeviceControlManager`, `UvcNativeCamDualFusionPreviewManager`,
+  `IrcamEngine`, and `DualUvcHandleParam`, plus the SOP classes
+  `GPIOUtils`, `UvcNativeCamDualCalManager`, and `USBMonitorManager`.
 - ThermoVue streaming is real: logcat shows repeated
   `UvcNativeCamDualFusionPreviewManager$3.onFrame(...)` callbacks and
   `AC020library ... total_length=4863232`.
@@ -145,6 +164,14 @@ it is not raw sensor access.
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\build_thermal_live_debug.ps1
 ```
+
+Run the privilege/clone audit from the laptop:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_privilege_audit.ps1
+```
+
+Use `-NoLaunchThermoVue` to capture the no-powered-module case.
 
 ## USB Without ADB
 

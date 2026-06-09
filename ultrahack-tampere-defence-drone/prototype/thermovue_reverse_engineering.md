@@ -517,7 +517,31 @@ grant and immediately finish. A separate watcher bridge can remain running and
 observe whether the permission appeared without interrupting ThermoVue's preview
 lifecycle.
 
-Smali-confirmed vendor startup sequence:
+2026-06-09 privilege audit from `Thermal Live Debug`:
+
+```text
+self context:
+  u:r:untrusted_app:s0:c59,c257,c512,c768
+
+ThermoVue Pro package:
+  /system/app/M190infisens/M190infisens.apk
+  system app, runtime process observed as u:r:platform_app:s0:c512,c768
+
+Tiny2C sysfs paths from normal side-loaded app:
+  /sys/devices/platform/yft_tiny2c_usb/tiny2c_usb_mode  exists, EACCES
+  /sys/class/yft_extcon/tiny2c_mode                    exists, EACCES
+  /sys/devices/platform/yft_tiny2c_usb/sensor_id       exists, EACCES
+
+USB visibility:
+  without ThermoVue powering module: usbDeviceCount=0
+  with ThermoVue foreground: /dev/bus/usb/001/002 VID=0x3474 PID=0x4321
+```
+
+The audit also proves the side-loaded APK can load the important Pro and SOP
+classes through `DexClassLoader`; the remaining blocker is privilege over the
+Tiny2C sysfs power/mux path and live USB stream ownership, not class discovery.
+
+JADX-confirmed vendor startup sequence:
 
 ```text
 StartPreviewTask.run(MODE_DUAL_FUSION)

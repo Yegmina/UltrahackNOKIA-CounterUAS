@@ -57,6 +57,12 @@ Run the diagnostic watch/grant test after the phone is authorized in ADB:
 powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_bridge_watch_test.ps1
 ```
 
+Run the side-loaded APK privilege/clone audit and pull the log:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File prototype\run_thermal_privilege_audit.ps1
+```
+
 The watch and shell bridge runners invoke `thermal_frame_evidence_validator.py`
 after pulling their logs, so a real run reports whether the saved output proves
 live, non-empty thermal frames.
