@@ -43,6 +43,7 @@ class MotionConfig:
     trail_frames: int = 3
     max_motion_ratio: float = 0.10
     analysis_scale: float = 0.5
+    overlay_merge_distance: float = 0.0
     shake_protection: bool = True
     shake_min_shift: float = 1.5
     shake_consensus: float = 0.72
@@ -88,6 +89,7 @@ class MotionConfig:
             trail_frames=max(0, int(self.trail_frames)),
             max_motion_ratio=max(0.0, float(self.max_motion_ratio)),
             analysis_scale=float(np.clip(self.analysis_scale, 0.05, 1.0)),
+            overlay_merge_distance=max(0.0, float(self.overlay_merge_distance)),
             shake_protection=bool(self.shake_protection),
             shake_min_shift=max(0.0, float(self.shake_min_shift)),
             shake_consensus=float(np.clip(self.shake_consensus, 0.0, 1.0)),
@@ -1982,6 +1984,85 @@ def render_motion_only(frame_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return output
 
 
+def overlay_detection_color(detection: MotionDetection) -> tuple[int, int, int]:
+    if detection.semantic_action == "penalize":
+        return (255, 80, 255)
+    if detection.roi_action == "penalize":
+        return (0, 165, 255)
+    return (0, 255, 255)
+
+
+def overlay_color_priority(color: tuple[int, int, int]) -> int:
+    if color == (255, 80, 255):
+        return 2
+    if color == (0, 165, 255):
+        return 1
+    return 0
+
+
+def detections_close_for_overlay(
+    first: MotionDetection,
+    second: MotionDetection,
+    merge_distance: float,
+) -> bool:
+    if box_intersection_area(
+        first.x1,
+        first.y1,
+        first.x2,
+        first.y2,
+        second.x1,
+        second.y1,
+        second.x2,
+        second.y2,
+    ) > 0.0:
+        return True
+
+    merge_distance = max(0.0, float(merge_distance))
+    if merge_distance <= 0.0:
+        return False
+
+    horizontal_gap = max(first.x1 - second.x2, second.x1 - first.x2, 0.0)
+    vertical_gap = max(first.y1 - second.y2, second.y1 - first.y2, 0.0)
+    return float(np.hypot(horizontal_gap, vertical_gap)) <= merge_distance
+
+
+def merged_overlay_detection_boxes(
+    detections: list[MotionDetection],
+    merge_distance: float,
+) -> list[tuple[float, float, float, float, tuple[int, int, int]]]:
+    remaining = list(detections)
+    merged: list[tuple[float, float, float, float, tuple[int, int, int]]] = []
+
+    while remaining:
+        group = [remaining.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            next_remaining: list[MotionDetection] = []
+            for candidate in remaining:
+                if any(
+                    detections_close_for_overlay(candidate, existing, merge_distance)
+                    for existing in group
+                ):
+                    group.append(candidate)
+                    changed = True
+                else:
+                    next_remaining.append(candidate)
+            remaining = next_remaining
+
+        x1 = min(detection.x1 for detection in group)
+        y1 = min(detection.y1 for detection in group)
+        x2 = max(detection.x2 for detection in group)
+        y2 = max(detection.y2 for detection in group)
+        color = max(
+            (overlay_detection_color(detection) for detection in group),
+            key=overlay_color_priority,
+        )
+        merged.append((x1, y1, x2, y2, color))
+
+    return merged
+
+
 def render_overlay(
     frame_bgr: np.ndarray,
     detections: list[MotionDetection],
@@ -2004,6 +2085,7 @@ def render_overlay(
     semantic_active: bool = False,
     semantic_rejected_count: int = 0,
     semantic_penalized_count: int = 0,
+    overlay_merge_distance: float = 0.0,
 ) -> np.ndarray:
     output = frame_bgr.copy()
     semantic_detections = semantic_detections or []
@@ -2028,16 +2110,16 @@ def render_overlay(
             1,
             cv2.LINE_AA,
         )
-    for detection in detections:
+    for box_x1, box_y1, box_x2, box_y2, color in merged_overlay_detection_boxes(
+        detections,
+        overlay_merge_distance,
+    ):
         x1, y1, x2, y2 = (
-            int(round(detection.x1)),
-            int(round(detection.y1)),
-            int(round(detection.x2)),
-            int(round(detection.y2)),
+            int(round(box_x1)),
+            int(round(box_y1)),
+            int(round(box_x2)),
+            int(round(box_y2)),
         )
-        color = (0, 165, 255) if detection.roi_action == "penalize" else (0, 255, 255)
-        if detection.semantic_action == "penalize":
-            color = (255, 80, 255)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         label = "drone"
         label_y = max(18, y1 - 6)
@@ -2126,6 +2208,7 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "trail_frames": config.trail_frames,
         "max_motion_ratio": config.max_motion_ratio,
         "analysis_scale": config.analysis_scale,
+        "overlay_merge_distance": config.overlay_merge_distance,
         "shake_protection": config.shake_protection,
         "shake_min_shift": config.shake_min_shift,
         "shake_consensus": config.shake_consensus,
@@ -2304,6 +2387,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         trail_frames=args.trail_frames,
         max_motion_ratio=args.max_motion_ratio,
         analysis_scale=args.analysis_scale,
+        overlay_merge_distance=args.overlay_merge_distance,
         shake_protection=not args.disable_shake_protection,
         shake_min_shift=args.shake_min_shift,
         shake_consensus=args.shake_consensus,
@@ -2680,6 +2764,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         semantic_active=semantic_detector is not None,
                         semantic_rejected_count=semantic_rejected_count,
                         semantic_penalized_count=semantic_penalized_count,
+                        overlay_merge_distance=config.overlay_merge_distance,
                     )
                 )
 
@@ -2874,6 +2959,12 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--trail-frames", type=int, default=3 if not duplicate else default)
     parser.add_argument("--max-motion-ratio", type=float, default=0.10 if not duplicate else default)
     parser.add_argument("--analysis-scale", type=float, default=0.5 if not duplicate else default)
+    parser.add_argument(
+        "--overlay-merge-distance",
+        type=float,
+        default=0.0 if not duplicate else default,
+        help="Merge overlay drone boxes that overlap or are within this many pixels.",
+    )
     parser.add_argument(
         "--backend",
         choices=sorted(PROCESSING_BACKENDS),

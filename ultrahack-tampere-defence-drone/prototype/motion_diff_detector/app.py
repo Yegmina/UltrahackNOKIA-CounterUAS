@@ -55,6 +55,7 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "trail_frames": 3,
     "max_motion_ratio": 0.10,
     "analysis_scale": 0.50,
+    "overlay_merge_distance": 0.0,
     "processing_backend": "auto",
     "cuda_device": 0,
     "write_overlay_video": True,
@@ -123,6 +124,7 @@ SETTING_RANGES: dict[str, tuple[float, float]] = {
     "trail_frames": (0, 30),
     "max_motion_ratio": (0.01, 1.0),
     "analysis_scale": (0.10, 1.0),
+    "overlay_merge_distance": (0.0, 500.0),
     "cuda_device": (0, 64),
     "start_frame": (0, 1000000000),
     "max_frames": (1, 1000000000),
@@ -468,6 +470,15 @@ with st.sidebar:
         0.05,
         key=setting_key("analysis_scale"),
         help="Downscale factor for motion analysis. Lower is faster; higher preserves tiny objects.",
+    )
+    overlay_merge_distance = st.slider(
+        "Merge nearby box distance",
+        0.0,
+        500.0,
+        setting_value("overlay_merge_distance"),
+        5.0,
+        key=setting_key("overlay_merge_distance"),
+        help="Overlay-only cleanup. Drone boxes that overlap or are within this pixel distance are drawn as one box.",
     )
     st.divider()
     st.caption("Performance / outputs")
@@ -956,6 +967,7 @@ with st.sidebar:
         "trail_frames": int(trail_frames),
         "max_motion_ratio": float(max_motion_ratio),
         "analysis_scale": float(analysis_scale),
+        "overlay_merge_distance": float(overlay_merge_distance),
         "processing_backend": processing_backend,
         "cuda_device": int(cuda_device),
         "write_overlay_video": bool(write_overlay_video),
@@ -1385,6 +1397,8 @@ def common_cli_args(
         str(float(max_motion_ratio)),
         "--analysis-scale",
         str(float(analysis_scale)),
+        "--overlay-merge-distance",
+        str(float(overlay_merge_distance)),
         "--backend",
         processing_backend,
         "--cuda-device",

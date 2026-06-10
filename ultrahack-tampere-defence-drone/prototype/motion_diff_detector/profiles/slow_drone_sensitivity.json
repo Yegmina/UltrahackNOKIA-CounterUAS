@@ -62,7 +62,8 @@
     "semantic_imgsz": 1280,
     "semantic_model_repo": "devanshty/WingID",
     "semantic_model_file": "yolo11l.pt",
-    "semantic_weights": ""
+    "semantic_weights": "",
+    "overlay_merge_distance": 12.0
   },
   "roi_mask": {
     "version": 1,

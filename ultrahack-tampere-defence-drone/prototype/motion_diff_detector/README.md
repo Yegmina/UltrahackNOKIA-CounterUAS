@@ -48,6 +48,9 @@ shows the cumulative output video, and stores a `resume_manifest.json` under the
 Use `Continue from frame ...` in the latest output panel to process the next segment and rebuild
 the combined overlay/motion videos without starting from frame 0.
 
+`Merge nearby box distance` is an overlay-only display cleanup: overlapping drone boxes always
+draw as one box, and boxes within the configured pixel distance are merged visually too.
+
 Preset files live in `prototype/motion_diff_detector/profiles/` and can be imported from the
 `Parameter profile` panel. `slow_drone_sensitivity.json` is tuned from the aggressive IR profile
 to keep slow, intermittent drone tracks alive longer while preserving the same top ROI mask.

@@ -18,6 +18,7 @@ from motion_diff_detector import (
     cuda_is_available,
     filter_candidates_by_semantics,
     load_roi_mask,
+    merged_overlay_detection_boxes,
     prepare_gray,
     process_video,
     progress_payload,
@@ -669,6 +670,25 @@ def test_progress_payload_reports_recent_speed() -> None:
     assert payload["recent_fps"] == 10.0
     assert payload["recent_ms_per_frame"] == 100.0
     assert payload["remaining_frames"] == 90
+
+
+def test_overlay_boxes_merge_when_overlapping_or_close() -> None:
+    overlapping = [
+        make_detection(10, 10),
+        make_detection(16, 10),
+    ]
+    close = [
+        make_detection(10, 10),
+        make_detection(24, 10),
+    ]
+    separate = [
+        make_detection(10, 10),
+        make_detection(80, 10),
+    ]
+
+    assert len(merged_overlay_detection_boxes(overlapping, merge_distance=0)) == 1
+    assert len(merged_overlay_detection_boxes(close, merge_distance=4)) == 1
+    assert len(merged_overlay_detection_boxes(separate, merge_distance=4)) == 2
 
 
 def test_shake_estimator_reuses_between_stride_frames() -> None:
