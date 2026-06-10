@@ -16,6 +16,7 @@ from motion_diff_detector import (
     analyze_gray_pair,
     cuda_is_available,
     filter_candidates_by_semantics,
+    load_roi_mask,
     prepare_gray,
     process_video,
     progress_payload,
@@ -240,6 +241,19 @@ def test_roi_normalized_points_scale_to_video_size() -> None:
     assert points.tolist() == [[0.0, 0.0], [200.0, 0.0], [100.0, 50.0]]
 
 
+def test_roi_mask_loader_accepts_utf8_bom(tmp_path) -> None:
+    mask_path = tmp_path / "roi_mask.json"
+    mask_path.write_text(
+        '{"version":1,"mode":"fixed","zones":[{"name":"left","type":"ignore","points":[[0,0],[1,0],[1,1],[0,1]]}]}',
+        encoding="utf-8-sig",
+    )
+
+    roi_mask = load_roi_mask(mask_path)
+
+    assert roi_mask is not None
+    assert roi_mask.zones[0].name == "left"
+
+
 def test_roi_ignore_zone_rejects_detection() -> None:
     config = MotionConfig(
         diff_threshold=18,
@@ -258,6 +272,28 @@ def test_roi_ignore_zone_rejects_detection() -> None:
     assert analysis.roi_rejected_count == 1
     assert analysis.detections == []
     assert np.count_nonzero(analysis.accepted_mask) == 0
+
+
+def test_roi_ignore_zone_clips_motion_without_dropping_remaining_pixels() -> None:
+    config = MotionConfig(
+        diff_threshold=18,
+        min_area=20,
+        morph_kernel=1,
+        shake_protection=False,
+    )
+    previous = np.zeros((100, 100), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (20, 30), (69, 44), 255, thickness=cv2.FILLED)
+    roi_mask = make_roi_mask("ignore", [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]])
+
+    analysis = analyze_gray_pair(previous, current, config, 100, 100, roi_mask=roi_mask)
+
+    assert analysis.raw_detection_count == 1
+    assert analysis.roi_rejected_count == 0
+    assert len(analysis.detections) == 1
+    assert analysis.detections[0].x1 >= 50.0
+    assert np.count_nonzero(analysis.accepted_mask[:, :50]) == 0
+    assert np.count_nonzero(analysis.accepted_mask[:, 50:]) > 0
 
 
 def test_roi_flight_zone_rejects_detection_outside_flight_space() -> None:

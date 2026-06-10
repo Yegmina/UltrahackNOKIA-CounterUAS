@@ -164,6 +164,10 @@ Use:
 - `penalty` for regions that may contain useful motion but should be lower confidence.
 - `flight` for valid flight space. If any flight zones exist, detections outside them are rejected.
 
+`ignore` and `flight` zones are applied directly to the motion mask before contours are extracted.
+This clips moving pixels at ROI boundaries instead of dropping a whole bounding box just because it touched an ignored area.
+`penalty` zones are applied after contour extraction so the detection can stay visible and be tagged in JSON/overlay output.
+
 Mask modes:
 
 - `fixed` means the normalized mask represents arena/world regions in a static view.

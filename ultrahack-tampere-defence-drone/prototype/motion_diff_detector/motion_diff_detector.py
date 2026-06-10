@@ -547,7 +547,7 @@ def load_roi_mask(path: str | Path | None) -> RoiMask | None:
     if not path:
         return None
     mask_path = Path(path)
-    payload = json.loads(mask_path.read_text(encoding="utf-8"))
+    payload = json.loads(mask_path.read_text(encoding="utf-8-sig"))
     return parse_roi_mask(payload)
 
 
@@ -562,6 +562,55 @@ def roi_zone_points_pixels(zone: RoiZone, image_width: int, image_height: int) -
         ],
         dtype=np.float32,
     )
+
+
+def roi_zone_points_mask(zone: RoiZone, mask_width: int, mask_height: int) -> np.ndarray:
+    if mask_width <= 0 or mask_height <= 0:
+        raise ValueError("ROI mask dimensions must be positive.")
+    points = roi_zone_points_pixels(zone, mask_width, mask_height)
+    points[:, 0] = np.clip(np.round(points[:, 0]), 0, mask_width - 1)
+    points[:, 1] = np.clip(np.round(points[:, 1]), 0, mask_height - 1)
+    return points.astype(np.int32)
+
+
+def rasterize_roi_zones(
+    roi_mask: RoiMask | None,
+    mask_width: int,
+    mask_height: int,
+    zone_types: set[str],
+) -> np.ndarray | None:
+    if roi_mask is None or not roi_mask.zones:
+        return None
+    selected_zones = [zone for zone in roi_mask.zones if zone.type in zone_types]
+    if not selected_zones:
+        return None
+
+    zone_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+    for zone in selected_zones:
+        polygon = roi_zone_points_mask(zone, mask_width, mask_height)
+        cv2.fillPoly(zone_mask, [polygon], 255)
+    return zone_mask
+
+
+def apply_roi_pixel_mask(raw_mask: np.ndarray, roi_mask: RoiMask | None) -> tuple[np.ndarray, bool]:
+    if roi_mask is None or not roi_mask.zones:
+        return raw_mask, False
+
+    mask_height, mask_width = raw_mask.shape[:2]
+    filtered_mask = raw_mask.copy()
+    changed = False
+
+    flight_mask = rasterize_roi_zones(roi_mask, mask_width, mask_height, {"flight"})
+    if flight_mask is not None:
+        filtered_mask = cv2.bitwise_and(filtered_mask, flight_mask)
+        changed = True
+
+    ignore_mask = rasterize_roi_zones(roi_mask, mask_width, mask_height, {"ignore"})
+    if ignore_mask is not None:
+        filtered_mask[ignore_mask > 0] = 0
+        changed = True
+
+    return filtered_mask, changed
 
 
 def _point_in_polygon(point: tuple[float, float], polygon: np.ndarray) -> bool:
@@ -1340,42 +1389,57 @@ def analyze_gray_pair(
     scale_y = raw_mask.shape[0] / float(image_height)
     area_scale = max(scale_x * scale_y, 1e-9)
     accepted_mask = np.zeros_like(raw_mask)
-    contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    raw_candidates: list[tuple[MotionDetection, np.ndarray]] = []
 
-    for contour in contours:
-        area = float(cv2.contourArea(contour) / area_scale)
-        if area < config.min_area:
-            continue
-        x, y, w, h = cv2.boundingRect(contour)
-        x1 = np.clip(x / scale_x, 0, image_width)
-        y1 = np.clip(y / scale_y, 0, image_height)
-        x2 = np.clip((x + w) / scale_x, 0, image_width)
-        y2 = np.clip((y + h) / scale_y, 0, image_height)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        raw_candidates.append(
-            (
-                MotionDetection(
-                    x1=float(x1),
-                    y1=float(y1),
-                    x2=float(x2),
-                    y2=float(y2),
-                    center_x=float((x1 + x2) / 2.0),
-                    center_y=float((y1 + y2) / 2.0),
-                    area=area,
-                ),
-                contour,
+    def candidates_from_mask(mask: np.ndarray) -> list[tuple[MotionDetection, np.ndarray]]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates: list[tuple[MotionDetection, np.ndarray]] = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour) / area_scale)
+            if area < config.min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            x1 = np.clip(x / scale_x, 0, image_width)
+            y1 = np.clip(y / scale_y, 0, image_height)
+            x2 = np.clip((x + w) / scale_x, 0, image_width)
+            y2 = np.clip((y + h) / scale_y, 0, image_height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            candidates.append(
+                (
+                    MotionDetection(
+                        x1=float(x1),
+                        y1=float(y1),
+                        x2=float(x2),
+                        y2=float(y2),
+                        center_x=float((x1 + x2) / 2.0),
+                        center_y=float((y1 + y2) / 2.0),
+                        area=area,
+                    ),
+                    contour,
+                )
             )
-        )
+        return candidates
 
-    roi_rejected_count = 0
+    raw_candidates = candidates_from_mask(raw_mask)
+    roi_filtered_mask, roi_pixel_mask_active = apply_roi_pixel_mask(raw_mask, roi_mask)
+    roi_candidates = candidates_from_mask(roi_filtered_mask) if roi_pixel_mask_active else raw_candidates
+    roi_rejected_count = max(0, len(raw_candidates) - len(roi_candidates)) if roi_pixel_mask_active else 0
     roi_penalized_count = 0
+    penalty_roi_mask = None
+    if roi_mask is not None:
+        penalty_zones = tuple(zone for zone in roi_mask.zones if zone.type == "penalty")
+        if penalty_zones:
+            penalty_roi_mask = RoiMask(
+                version=roi_mask.version,
+                mode=roi_mask.mode,
+                zones=penalty_zones,
+            )
+
     kept_candidates: list[tuple[MotionDetection, np.ndarray]] = []
-    for detection, contour in raw_candidates:
+    for detection, contour in roi_candidates:
         filtered_detection = filter_detection_by_roi(
             detection,
-            roi_mask,
+            penalty_roi_mask,
             image_width,
             image_height,
         )
