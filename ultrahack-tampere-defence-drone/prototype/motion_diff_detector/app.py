@@ -51,6 +51,20 @@ with st.sidebar:
     shake_consensus = st.slider("Shake consensus", 0.10, 1.0, 0.72, 0.01)
     shake_consensus_px = st.slider("Shake consensus px", 0.5, 10.0, 2.0, 0.1)
     st.divider()
+    hysteresis = st.checkbox("Hysteresis thresholding", value=False)
+    hysteresis_high_threshold = st.slider("Hysteresis high threshold", 1, 255, 36, 1)
+    temporal_filter = st.checkbox("Temporal persistence", value=False)
+    temporal_window_frames = st.slider("Persistence window", 1, 10, 3, 1)
+    temporal_min_hits = st.slider("Persistence min hits", 1, 10, 2, 1)
+    track_confirmation = st.checkbox("Track confirmation", value=False)
+    track_confirm_hits = st.slider("Track confirm hits", 1, 10, 2, 1)
+    track_max_missed = st.slider("Track max missed", 0, 10, 2, 1)
+    track_match_distance = st.slider("Track match distance", 5.0, 300.0, 80.0, 5.0)
+    direction_consistency = st.checkbox("Direction consistency", value=False)
+    direction_min_hits = st.slider("Direction min hits", 2, 10, 3, 1)
+    direction_min_displacement = st.slider("Direction min displacement", 0.0, 30.0, 2.0, 0.5)
+    direction_cosine = st.slider("Direction cosine", -1.0, 1.0, 0.20, 0.05)
+    st.divider()
     roi_mask_enabled = st.checkbox("Use current ROI mask", value=False)
 
 tabs = st.tabs(["Upload", "Local path", "ROI mask"])
@@ -261,11 +275,37 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         str(float(shake_consensus)),
         "--shake-consensus-px",
         str(float(shake_consensus_px)),
+        "--hysteresis-high-threshold",
+        str(int(hysteresis_high_threshold)),
+        "--temporal-window-frames",
+        str(int(temporal_window_frames)),
+        "--temporal-min-hits",
+        str(int(temporal_min_hits)),
+        "--track-confirm-hits",
+        str(int(track_confirm_hits)),
+        "--track-max-missed",
+        str(int(track_max_missed)),
+        "--track-match-distance",
+        str(float(track_match_distance)),
+        "--direction-min-hits",
+        str(int(direction_min_hits)),
+        "--direction-min-displacement",
+        str(float(direction_min_displacement)),
+        "--direction-cosine",
+        str(float(direction_cosine)),
         "--out-dir",
         str(out_dir),
     ]
     if not shake_protection:
         args.append("--disable-shake-protection")
+    if hysteresis:
+        args.append("--enable-hysteresis")
+    if temporal_filter:
+        args.append("--enable-temporal-filter")
+    if track_confirmation:
+        args.append("--enable-track-confirmation")
+    if direction_consistency:
+        args.append("--enable-direction-consistency")
     if roi_mask_path is not None:
         args.extend(["--roi-mask", str(roi_mask_path)])
     return args
@@ -315,6 +355,10 @@ def render_outputs(summary: dict) -> None:
     roi_cols[1].metric("Kept detections", summary.get("kept_detection_count", summary["detection_count"]))
     roi_cols[2].metric("ROI rejected", summary.get("roi_rejected_count", 0))
     roi_cols[3].metric("ROI penalized", summary.get("roi_penalized_count", 0))
+    filter_cols = st.columns(3)
+    filter_cols[0].metric("Temporal rejected", summary.get("temporal_rejected_count", 0))
+    filter_cols[1].metric("Unconfirmed rejected", summary.get("unconfirmed_rejected_count", 0))
+    filter_cols[2].metric("Direction rejected", summary.get("direction_rejected_count", 0))
     roi_summary = summary.get("roi_mask", {})
     if roi_summary.get("enabled"):
         st.caption(

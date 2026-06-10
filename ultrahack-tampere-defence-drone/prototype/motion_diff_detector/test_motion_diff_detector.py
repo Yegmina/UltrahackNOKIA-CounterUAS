@@ -5,6 +5,8 @@ import cv2
 
 from motion_diff_detector import (
     MotionConfig,
+    MotionDetection,
+    MotionTracker,
     RoiMask,
     RoiZone,
     analyze_gray_pair,
@@ -20,6 +22,23 @@ def make_roi_mask(zone_type: str, points: list[list[float]], penalty: float = 0.
         mode="fixed",
         zones=(RoiZone(name=f"{zone_type}_zone", type=zone_type, points=tuple(map(tuple, points)), penalty=penalty),),
     )
+
+
+def make_detection(center_x: float, center_y: float, area: float = 100.0) -> MotionDetection:
+    half = 5.0
+    return MotionDetection(
+        x1=center_x - half,
+        y1=center_y - half,
+        x2=center_x + half,
+        y2=center_y + half,
+        center_x=center_x,
+        center_y=center_y,
+        area=area,
+    )
+
+
+def dummy_contour() -> np.ndarray:
+    return np.array([[[0, 0]], [[1, 0]], [[1, 1]], [[0, 1]]], dtype=np.int32)
 
 
 def test_static_frames_produce_no_motion() -> None:
@@ -55,6 +74,109 @@ def test_moving_blob_produces_box() -> None:
     assert analysis.roi_rejected_count == 0
     assert analysis.roi_penalized_count == 0
     assert np.count_nonzero(analysis.accepted_mask) > 0
+
+
+def test_hysteresis_rejects_low_motion_without_high_seed() -> None:
+    config = MotionConfig(
+        diff_threshold=5,
+        min_area=1,
+        morph_kernel=1,
+        shake_protection=False,
+        hysteresis=True,
+        hysteresis_high_threshold=20,
+    )
+    previous = np.zeros((40, 40), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (10, 10), (15, 15), 10, thickness=cv2.FILLED)
+
+    analysis = analyze_gray_pair(previous, current, config, 40, 40)
+
+    assert analysis.raw_detection_count == 0
+    assert analysis.detections == []
+    assert np.count_nonzero(analysis.accepted_mask) == 0
+
+
+def test_hysteresis_keeps_low_region_connected_to_high_seed() -> None:
+    config = MotionConfig(
+        diff_threshold=5,
+        min_area=1,
+        morph_kernel=1,
+        shake_protection=False,
+        hysteresis=True,
+        hysteresis_high_threshold=20,
+    )
+    previous = np.zeros((40, 40), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (10, 10), (15, 15), 10, thickness=cv2.FILLED)
+    current[12, 12] = 40
+
+    analysis = analyze_gray_pair(previous, current, config, 40, 40)
+
+    assert analysis.raw_detection_count == 1
+    assert len(analysis.detections) == 1
+    assert np.count_nonzero(analysis.accepted_mask) > 0
+
+
+def test_temporal_filter_rejects_first_hit_and_keeps_persistent_track() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            temporal_filter=True,
+            temporal_window_frames=3,
+            temporal_min_hits=2,
+            track_match_distance=20,
+        )
+    )
+    contour = dummy_contour()
+
+    first = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=1)
+    second = tracker.filter_candidates([(make_detection(14, 10), contour)], frame_index=2)
+
+    assert first.candidates == []
+    assert first.temporal_rejected_count == 1
+    assert len(second.candidates) == 1
+    assert second.candidates[0][0].track_id == 1
+    assert second.candidates[0][0].track_hits == 2
+
+
+def test_track_confirmation_hides_tentative_tracks_until_confirmed() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            track_confirmation=True,
+            track_confirm_hits=2,
+            track_match_distance=20,
+        )
+    )
+    contour = dummy_contour()
+
+    first = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=1)
+    second = tracker.filter_candidates([(make_detection(14, 10), contour)], frame_index=2)
+
+    assert first.candidates == []
+    assert first.unconfirmed_rejected_count == 1
+    assert len(second.candidates) == 1
+    assert second.candidates[0][0].track_confirmed
+
+
+def test_direction_consistency_rejects_jittering_track() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            direction_consistency=True,
+            direction_min_hits=3,
+            direction_min_displacement=1.0,
+            direction_cosine=0.5,
+            track_match_distance=40,
+        )
+    )
+    contour = dummy_contour()
+
+    first = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=1)
+    second = tracker.filter_candidates([(make_detection(20, 10), contour)], frame_index=2)
+    third = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=3)
+
+    assert len(first.candidates) == 1
+    assert len(second.candidates) == 1
+    assert third.candidates == []
+    assert third.direction_rejected_count == 1
 
 
 def test_roi_normalized_points_scale_to_video_size() -> None:

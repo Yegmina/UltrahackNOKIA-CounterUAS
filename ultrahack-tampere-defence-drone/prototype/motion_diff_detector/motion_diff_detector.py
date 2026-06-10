@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +32,24 @@ class MotionConfig:
     shake_min_shift: float = 1.5
     shake_consensus: float = 0.72
     shake_consensus_px: float = 2.0
+    hysteresis: bool = False
+    hysteresis_high_threshold: int = 36
+    temporal_filter: bool = False
+    temporal_window_frames: int = 3
+    temporal_min_hits: int = 2
+    track_confirmation: bool = False
+    track_confirm_hits: int = 2
+    track_max_missed: int = 2
+    track_match_distance: float = 80.0
+    direction_consistency: bool = False
+    direction_min_hits: int = 3
+    direction_min_displacement: float = 2.0
+    direction_cosine: float = 0.20
 
     def normalized(self) -> "MotionConfig":
+        diff_threshold = int(np.clip(self.diff_threshold, 1, 255))
         return MotionConfig(
-            diff_threshold=int(np.clip(self.diff_threshold, 1, 255)),
+            diff_threshold=diff_threshold,
             min_area=max(0.0, float(self.min_area)),
             blur_kernel=odd_kernel(self.blur_kernel),
             morph_kernel=odd_kernel(self.morph_kernel),
@@ -46,6 +60,21 @@ class MotionConfig:
             shake_min_shift=max(0.0, float(self.shake_min_shift)),
             shake_consensus=float(np.clip(self.shake_consensus, 0.0, 1.0)),
             shake_consensus_px=max(0.1, float(self.shake_consensus_px)),
+            hysteresis=bool(self.hysteresis),
+            hysteresis_high_threshold=int(
+                np.clip(max(diff_threshold, int(self.hysteresis_high_threshold)), 1, 255)
+            ),
+            temporal_filter=bool(self.temporal_filter),
+            temporal_window_frames=max(1, int(self.temporal_window_frames)),
+            temporal_min_hits=max(1, int(self.temporal_min_hits)),
+            track_confirmation=bool(self.track_confirmation),
+            track_confirm_hits=max(1, int(self.track_confirm_hits)),
+            track_max_missed=max(0, int(self.track_max_missed)),
+            track_match_distance=max(1.0, float(self.track_match_distance)),
+            direction_consistency=bool(self.direction_consistency),
+            direction_min_hits=max(2, int(self.direction_min_hits)),
+            direction_min_displacement=max(0.0, float(self.direction_min_displacement)),
+            direction_cosine=float(np.clip(self.direction_cosine, -1.0, 1.0)),
         )
 
 
@@ -77,6 +106,13 @@ class MotionDetection:
     zone_type: str | None = None
     zone_name: str | None = None
     roi_penalty: float = 0.0
+    track_id: int | None = None
+    track_age: int = 0
+    track_hits: int = 0
+    track_confirmed: bool = True
+    motion_dx: float = 0.0
+    motion_dy: float = 0.0
+    direction_consistent: bool = True
 
     def to_json_dict(self) -> dict[str, Any]:
         record = asdict(self)
@@ -103,6 +139,9 @@ class MotionFrameResult:
     raw_detection_count: int
     roi_rejected_count: int
     roi_penalized_count: int
+    temporal_rejected_count: int
+    unconfirmed_rejected_count: int
+    direction_rejected_count: int
     detections: list[MotionDetection]
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -122,6 +161,9 @@ class MotionFrameResult:
             "raw_detection_count": int(self.raw_detection_count),
             "roi_rejected_count": int(self.roi_rejected_count),
             "roi_penalized_count": int(self.roi_penalized_count),
+            "temporal_rejected_count": int(self.temporal_rejected_count),
+            "unconfirmed_rejected_count": int(self.unconfirmed_rejected_count),
+            "direction_rejected_count": int(self.direction_rejected_count),
             "detections": [detection.to_json_dict() for detection in self.detections],
         }
 
@@ -140,6 +182,9 @@ class MotionAnalysis:
     raw_detection_count: int = 0
     roi_rejected_count: int = 0
     roi_penalized_count: int = 0
+    temporal_rejected_count: int = 0
+    unconfirmed_rejected_count: int = 0
+    direction_rejected_count: int = 0
 
 
 def odd_kernel(value: int) -> int:
@@ -338,6 +383,206 @@ def filter_detection_by_roi(
     return detection
 
 
+@dataclass
+class MotionTrack:
+    track_id: int
+    created_frame_index: int
+    last_frame_index: int
+    center_x: float
+    center_y: float
+    area: float
+    hits: int = 1
+    missed: int = 0
+    seen_frames: list[int] = field(default_factory=list)
+    displacements: list[tuple[float, float]] = field(default_factory=list)
+    last_dx: float = 0.0
+    last_dy: float = 0.0
+
+    def age_at(self, frame_index: int) -> int:
+        return max(1, frame_index - self.created_frame_index + 1)
+
+    def recent_hits(self, frame_index: int, window_frames: int) -> int:
+        first_frame = frame_index - max(1, window_frames) + 1
+        return sum(1 for seen_frame in self.seen_frames if seen_frame >= first_frame)
+
+
+@dataclass(frozen=True)
+class MotionTrackFilterResult:
+    candidates: list[tuple[MotionDetection, np.ndarray]]
+    temporal_rejected_count: int = 0
+    unconfirmed_rejected_count: int = 0
+    direction_rejected_count: int = 0
+
+
+class MotionTracker:
+    def __init__(self, config: MotionConfig):
+        self.config = config.normalized()
+        self.tracks: dict[int, MotionTrack] = {}
+        self.next_track_id = 1
+
+    @property
+    def active(self) -> bool:
+        return (
+            self.config.temporal_filter
+            or self.config.track_confirmation
+            or self.config.direction_consistency
+        )
+
+    def reset(self) -> None:
+        self.tracks.clear()
+        self.next_track_id = 1
+
+    def filter_candidates(
+        self,
+        candidates: list[tuple[MotionDetection, np.ndarray]],
+        frame_index: int,
+    ) -> MotionTrackFilterResult:
+        if not self.active:
+            return MotionTrackFilterResult(candidates)
+
+        assignments: list[tuple[MotionDetection, np.ndarray, MotionTrack]] = []
+        matched_track_ids: set[int] = set()
+        active_tracks = [
+            track
+            for track in self.tracks.values()
+            if frame_index - track.last_frame_index <= self.config.track_max_missed + 1
+        ]
+
+        for detection, contour in sorted(candidates, key=lambda item: item[0].area, reverse=True):
+            track = self._best_track_for_detection(detection, active_tracks, matched_track_ids)
+            if track is None:
+                track = self._create_track(detection, frame_index)
+            else:
+                self._update_track(track, detection, frame_index)
+            matched_track_ids.add(track.track_id)
+            assignments.append((detection, contour, track))
+
+        self._age_unmatched_tracks(matched_track_ids)
+
+        kept: list[tuple[MotionDetection, np.ndarray]] = []
+        temporal_rejected = 0
+        unconfirmed_rejected = 0
+        direction_rejected = 0
+
+        for detection, contour, track in assignments:
+            recent_hits = track.recent_hits(frame_index, self.config.temporal_window_frames)
+            track_confirmed = track.hits >= self.config.track_confirm_hits
+            direction_consistent = self._direction_consistent(track)
+            annotated = replace(
+                detection,
+                track_id=track.track_id,
+                track_age=track.age_at(frame_index),
+                track_hits=track.hits,
+                track_confirmed=track_confirmed,
+                motion_dx=track.last_dx,
+                motion_dy=track.last_dy,
+                direction_consistent=direction_consistent,
+            )
+
+            if self.config.temporal_filter and recent_hits < self.config.temporal_min_hits:
+                temporal_rejected += 1
+                continue
+            if self.config.track_confirmation and not track_confirmed:
+                unconfirmed_rejected += 1
+                continue
+            if self.config.direction_consistency and not direction_consistent:
+                direction_rejected += 1
+                continue
+            kept.append((annotated, contour))
+
+        return MotionTrackFilterResult(
+            kept,
+            temporal_rejected,
+            unconfirmed_rejected,
+            direction_rejected,
+        )
+
+    def _best_track_for_detection(
+        self,
+        detection: MotionDetection,
+        active_tracks: list[MotionTrack],
+        matched_track_ids: set[int],
+    ) -> MotionTrack | None:
+        best_track: MotionTrack | None = None
+        best_distance = float("inf")
+        for track in active_tracks:
+            if track.track_id in matched_track_ids:
+                continue
+            distance = float(
+                np.hypot(detection.center_x - track.center_x, detection.center_y - track.center_y)
+            )
+            area_scale = max(np.sqrt(max(detection.area, track.area, 1.0)) * 1.5, 1.0)
+            distance_limit = max(self.config.track_match_distance, area_scale)
+            if distance <= distance_limit and distance < best_distance:
+                best_track = track
+                best_distance = distance
+        return best_track
+
+    def _create_track(self, detection: MotionDetection, frame_index: int) -> MotionTrack:
+        track = MotionTrack(
+            track_id=self.next_track_id,
+            created_frame_index=frame_index,
+            last_frame_index=frame_index,
+            center_x=detection.center_x,
+            center_y=detection.center_y,
+            area=detection.area,
+            seen_frames=[frame_index],
+        )
+        self.tracks[track.track_id] = track
+        self.next_track_id += 1
+        return track
+
+    def _update_track(
+        self,
+        track: MotionTrack,
+        detection: MotionDetection,
+        frame_index: int,
+    ) -> None:
+        dx = detection.center_x - track.center_x
+        dy = detection.center_y - track.center_y
+        if frame_index != track.last_frame_index:
+            track.displacements.append((float(dx), float(dy)))
+            track.displacements = track.displacements[-5:]
+        track.center_x = detection.center_x
+        track.center_y = detection.center_y
+        track.area = detection.area
+        track.last_frame_index = frame_index
+        track.hits += 1
+        track.missed = 0
+        track.seen_frames.append(frame_index)
+        track.seen_frames = track.seen_frames[-max(10, self.config.temporal_window_frames):]
+        track.last_dx = float(dx)
+        track.last_dy = float(dy)
+
+    def _age_unmatched_tracks(self, matched_track_ids: set[int]) -> None:
+        expired_track_ids: list[int] = []
+        for track_id, track in self.tracks.items():
+            if track_id not in matched_track_ids:
+                track.missed += 1
+            if track.missed > self.config.track_max_missed:
+                expired_track_ids.append(track_id)
+        for track_id in expired_track_ids:
+            del self.tracks[track_id]
+
+    def _direction_consistent(self, track: MotionTrack) -> bool:
+        if track.hits < self.config.direction_min_hits:
+            return True
+        if len(track.displacements) < 2:
+            return True
+
+        current = np.array(track.displacements[-1], dtype=np.float32)
+        previous = np.array(track.displacements[:-1], dtype=np.float32)
+        previous_mean = previous.mean(axis=0)
+        current_norm = float(np.linalg.norm(current))
+        previous_norm = float(np.linalg.norm(previous_mean))
+        if current_norm < self.config.direction_min_displacement:
+            return False
+        if previous_norm < self.config.direction_min_displacement:
+            return True
+        cosine = float(np.dot(current, previous_mean) / max(current_norm * previous_norm, 1e-9))
+        return cosine >= self.config.direction_cosine
+
+
 def prepare_gray(frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
     config = config.normalized()
     frame = frame_bgr
@@ -357,7 +602,26 @@ def prepare_gray(frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
 
 def cleanup_motion_mask(diff: np.ndarray, config: MotionConfig) -> np.ndarray:
     config = config.normalized()
-    _, mask = cv2.threshold(diff, config.diff_threshold, 255, cv2.THRESH_BINARY)
+    if config.hysteresis:
+        _, low_mask = cv2.threshold(diff, config.diff_threshold, 255, cv2.THRESH_BINARY)
+        _, high_mask = cv2.threshold(
+            diff,
+            config.hysteresis_high_threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )
+        label_count, labels = cv2.connectedComponents(low_mask)
+        if label_count <= 1:
+            mask = np.zeros_like(low_mask)
+        else:
+            seed_labels = np.unique(labels[high_mask > 0])
+            seed_labels = seed_labels[seed_labels != 0]
+            if seed_labels.size == 0:
+                mask = np.zeros_like(low_mask)
+            else:
+                mask = np.isin(labels, seed_labels).astype(np.uint8) * 255
+    else:
+        _, mask = cv2.threshold(diff, config.diff_threshold, 255, cv2.THRESH_BINARY)
     if config.morph_kernel > 1:
         kernel = np.ones((config.morph_kernel, config.morph_kernel), dtype=np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -412,6 +676,8 @@ def analyze_gray_pair(
     image_width: int,
     image_height: int,
     roi_mask: RoiMask | None = None,
+    motion_tracker: MotionTracker | None = None,
+    frame_index: int = 0,
 ) -> MotionAnalysis:
     config = config.normalized()
     compare_gray = previous_gray
@@ -514,6 +780,16 @@ def analyze_gray_pair(
             roi_penalized_count += 1
         kept_candidates.append((filtered_detection, contour))
 
+    temporal_rejected_count = 0
+    unconfirmed_rejected_count = 0
+    direction_rejected_count = 0
+    if motion_tracker is not None:
+        track_filter_result = motion_tracker.filter_candidates(kept_candidates, frame_index)
+        kept_candidates = track_filter_result.candidates
+        temporal_rejected_count = track_filter_result.temporal_rejected_count
+        unconfirmed_rejected_count = track_filter_result.unconfirmed_rejected_count
+        direction_rejected_count = track_filter_result.direction_rejected_count
+
     for _detection, contour in kept_candidates:
         cv2.drawContours(accepted_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
@@ -532,6 +808,9 @@ def analyze_gray_pair(
         len(raw_candidates),
         roi_rejected_count,
         roi_penalized_count,
+        temporal_rejected_count,
+        unconfirmed_rejected_count,
+        direction_rejected_count,
     )
 
 
@@ -567,6 +846,10 @@ def render_overlay(
     roi_active: bool = False,
     roi_rejected_count: int = 0,
     roi_penalized_count: int = 0,
+    motion_filters_active: bool = False,
+    temporal_rejected_count: int = 0,
+    unconfirmed_rejected_count: int = 0,
+    direction_rejected_count: int = 0,
 ) -> np.ndarray:
     output = frame_bgr.copy()
     for detection in detections:
@@ -581,6 +864,8 @@ def render_overlay(
         label = f"motion {detection.area:.0f}px"
         if detection.roi_action == "penalize":
             label = f"penalty {detection.area:.0f}px"
+        if detection.track_id is not None:
+            label = f"{label} t{detection.track_id} h{detection.track_hits}"
         label_y = max(18, y1 - 6)
         cv2.putText(
             output,
@@ -625,6 +910,20 @@ def render_overlay(
             2,
             cv2.LINE_AA,
         )
+    if motion_filters_active:
+        cv2.putText(
+            output,
+            (
+                f"Filter rejected temporal={temporal_rejected_count} "
+                f"unconfirmed={unconfirmed_rejected_count} direction={direction_rejected_count}"
+            ),
+            (12, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     return output
 
 
@@ -641,6 +940,19 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "shake_min_shift": config.shake_min_shift,
         "shake_consensus": config.shake_consensus,
         "shake_consensus_px": config.shake_consensus_px,
+        "hysteresis": config.hysteresis,
+        "hysteresis_high_threshold": config.hysteresis_high_threshold,
+        "temporal_filter": config.temporal_filter,
+        "temporal_window_frames": config.temporal_window_frames,
+        "temporal_min_hits": config.temporal_min_hits,
+        "track_confirmation": config.track_confirmation,
+        "track_confirm_hits": config.track_confirm_hits,
+        "track_max_missed": config.track_max_missed,
+        "track_match_distance": config.track_match_distance,
+        "direction_consistency": config.direction_consistency,
+        "direction_min_hits": config.direction_min_hits,
+        "direction_min_displacement": config.direction_min_displacement,
+        "direction_cosine": config.direction_cosine,
     }
 
 
@@ -682,8 +994,22 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         shake_min_shift=args.shake_min_shift,
         shake_consensus=args.shake_consensus,
         shake_consensus_px=args.shake_consensus_px,
+        hysteresis=args.enable_hysteresis,
+        hysteresis_high_threshold=args.hysteresis_high_threshold,
+        temporal_filter=args.enable_temporal_filter,
+        temporal_window_frames=args.temporal_window_frames,
+        temporal_min_hits=args.temporal_min_hits,
+        track_confirmation=args.enable_track_confirmation,
+        track_confirm_hits=args.track_confirm_hits,
+        track_max_missed=args.track_max_missed,
+        track_match_distance=args.track_match_distance,
+        direction_consistency=args.enable_direction_consistency,
+        direction_min_hits=args.direction_min_hits,
+        direction_min_displacement=args.direction_min_displacement,
+        direction_cosine=args.direction_cosine,
     ).normalized()
     roi_mask = load_roi_mask(args.roi_mask)
+    motion_tracker = MotionTracker(config)
     out_dir = make_output_dir(args.out_dir)
 
     capture = cv2.VideoCapture(str(source))
@@ -714,6 +1040,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     total_raw_detections = 0
     total_roi_rejected = 0
     total_roi_penalized = 0
+    total_temporal_rejected = 0
+    total_unconfirmed_rejected = 0
+    total_direction_rejected = 0
     rejected_frame_count = 0
     global_motion_detected_count = 0
     started_at = time.time()
@@ -741,6 +1070,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count = 0
                     roi_rejected_count = 0
                     roi_penalized_count = 0
+                    temporal_rejected_count = 0
+                    unconfirmed_rejected_count = 0
+                    direction_rejected_count = 0
                 else:
                     analysis = analyze_gray_pair(
                         previous_gray,
@@ -749,6 +1081,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         image_width=width,
                         image_height=height,
                         roi_mask=roi_mask,
+                        motion_tracker=motion_tracker,
+                        frame_index=frame_index,
                     )
                     accepted_mask = analysis.accepted_mask
                     detections = analysis.detections
@@ -762,9 +1096,13 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count = analysis.raw_detection_count
                     roi_rejected_count = analysis.roi_rejected_count
                     roi_penalized_count = analysis.roi_penalized_count
+                    temporal_rejected_count = analysis.temporal_rejected_count
+                    unconfirmed_rejected_count = analysis.unconfirmed_rejected_count
+                    direction_rejected_count = analysis.direction_rejected_count
 
                 if global_motion_rejected:
                     rejected_frame_count += 1
+                    motion_tracker.reset()
                     trail_masks = [np.zeros_like(accepted_mask)]
                 else:
                     trail_masks.append(accepted_mask)
@@ -784,12 +1122,19 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         roi_active=roi_mask is not None,
                         roi_rejected_count=roi_rejected_count,
                         roi_penalized_count=roi_penalized_count,
+                        motion_filters_active=motion_tracker.active,
+                        temporal_rejected_count=temporal_rejected_count,
+                        unconfirmed_rejected_count=unconfirmed_rejected_count,
+                        direction_rejected_count=direction_rejected_count,
                     )
                 )
 
                 total_raw_detections += raw_detection_count
                 total_roi_rejected += roi_rejected_count
                 total_roi_penalized += roi_penalized_count
+                total_temporal_rejected += temporal_rejected_count
+                total_unconfirmed_rejected += unconfirmed_rejected_count
+                total_direction_rejected += direction_rejected_count
                 if detections:
                     frames_with_motion += 1
                     total_detections += len(detections)
@@ -812,6 +1157,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count=raw_detection_count,
                     roi_rejected_count=roi_rejected_count,
                     roi_penalized_count=roi_penalized_count,
+                    temporal_rejected_count=temporal_rejected_count,
+                    unconfirmed_rejected_count=unconfirmed_rejected_count,
+                    direction_rejected_count=direction_rejected_count,
                     detections=detections,
                 )
                 jsonl.write(json.dumps(record.to_json_dict(), separators=(",", ":")) + "\n")
@@ -839,6 +1187,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "raw_detection_count": total_raw_detections,
         "roi_rejected_count": total_roi_rejected,
         "roi_penalized_count": total_roi_penalized,
+        "temporal_rejected_count": total_temporal_rejected,
+        "unconfirmed_rejected_count": total_unconfirmed_rejected,
+        "direction_rejected_count": total_direction_rejected,
         "kept_detection_count": total_detections,
         "global_motion_rejected_frames": rejected_frame_count,
         "global_motion_detected_frames": global_motion_detected_count,
@@ -876,6 +1227,47 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--shake-min-shift", type=float, default=1.5 if not duplicate else default)
     parser.add_argument("--shake-consensus", type=float, default=0.72 if not duplicate else default)
     parser.add_argument("--shake-consensus-px", type=float, default=2.0 if not duplicate else default)
+    parser.add_argument(
+        "--enable-hysteresis",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Require low-threshold regions to contain a high-threshold motion seed.",
+    )
+    parser.add_argument(
+        "--hysteresis-high-threshold",
+        type=int,
+        default=36 if not duplicate else default,
+    )
+    parser.add_argument(
+        "--enable-temporal-filter",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Reject detections that do not persist across a short frame window.",
+    )
+    parser.add_argument("--temporal-window-frames", type=int, default=3 if not duplicate else default)
+    parser.add_argument("--temporal-min-hits", type=int, default=2 if not duplicate else default)
+    parser.add_argument(
+        "--enable-track-confirmation",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Hide tentative tracks until they collect enough hits.",
+    )
+    parser.add_argument("--track-confirm-hits", type=int, default=2 if not duplicate else default)
+    parser.add_argument("--track-max-missed", type=int, default=2 if not duplicate else default)
+    parser.add_argument("--track-match-distance", type=float, default=80.0 if not duplicate else default)
+    parser.add_argument(
+        "--enable-direction-consistency",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Reject confirmed tracks whose velocity changes direction like jitter.",
+    )
+    parser.add_argument("--direction-min-hits", type=int, default=3 if not duplicate else default)
+    parser.add_argument(
+        "--direction-min-displacement",
+        type=float,
+        default=2.0 if not duplicate else default,
+    )
+    parser.add_argument("--direction-cosine", type=float, default=0.20 if not duplicate else default)
     parser.add_argument("--roi-mask", default=default, help="Path to normalized ROI mask JSON.")
     parser.add_argument("--out-dir", default=default)
     parser.add_argument(

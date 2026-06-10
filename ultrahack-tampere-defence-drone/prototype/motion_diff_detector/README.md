@@ -58,8 +58,41 @@ Common options:
 --shake-min-shift 1.5
 --shake-consensus 0.72
 --shake-consensus-px 2.0
+--enable-hysteresis
+--hysteresis-high-threshold 36
+--enable-temporal-filter
+--temporal-window-frames 3
+--temporal-min-hits 2
+--enable-track-confirmation
+--track-confirm-hits 2
+--track-max-missed 2
+--track-match-distance 80
+--enable-direction-consistency
+--direction-min-hits 3
+--direction-min-displacement 2
+--direction-cosine 0.20
 --roi-mask path\to\roi_mask.json
 --json
+```
+
+## Small Drone Noise Filters
+
+The Streamlit sidebar exposes optional filters for noisy low-threshold videos:
+
+- `Hysteresis thresholding`: a low-threshold motion region must contain a stronger high-threshold seed. This keeps weak drone edges attached to strong pixels while dropping low-level codec/sensor noise.
+- `Temporal persistence`: a detection must appear enough times inside a short frame window.
+- `Track confirmation`: detections are tracked internally but hidden until the track has enough hits.
+- `Direction consistency`: confirmed tracks that jitter back and forth are rejected.
+
+Suggested first test for small racing drones:
+
+```text
+diff threshold: low enough to see the drone
+minimum motion area: low enough for the drone
+hysteresis: on, high threshold around 2x diff threshold
+temporal persistence: on, window=3, min hits=2
+track confirmation: on, confirm hits=2
+direction consistency: on only after the first two filters look stable
 ```
 
 ## ROI Masks
@@ -122,6 +155,9 @@ Per-frame JSONL records:
   "raw_detection_count": 1,
   "roi_rejected_count": 0,
   "roi_penalized_count": 0,
+  "temporal_rejected_count": 0,
+  "unconfirmed_rejected_count": 0,
+  "direction_rejected_count": 0,
   "detections": [
     {
       "x1": 410.0,
@@ -134,7 +170,14 @@ Per-frame JSONL records:
       "roi_action": "keep",
       "zone_type": null,
       "zone_name": null,
-      "roi_penalty": 0.0
+      "roi_penalty": 0.0,
+      "track_id": 7,
+      "track_age": 4,
+      "track_hits": 3,
+      "track_confirmed": true,
+      "motion_dx": 6.0,
+      "motion_dy": -2.0,
+      "direction_consistent": true
     }
   ]
 }
