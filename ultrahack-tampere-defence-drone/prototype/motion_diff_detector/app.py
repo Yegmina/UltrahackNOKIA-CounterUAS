@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,8 @@ SAMPLE_PATH = Path.home() / "Downloads" / "fixedcameravideo_2026-06-10_00-10-22.
 UPLOAD_CACHE_ROOT = Path(tempfile.gettempdir()) / "motion_diff_detector_uploads"
 RUN_CACHE_ROOT = UPLOAD_CACHE_ROOT / "runs"
 PROGRESS_PREFIX = "PROGRESS "
+RUN_MANIFEST_NAME = "resume_manifest.json"
+COMBINED_SUMMARY_NAME = "combined_summary.json"
 
 
 st.set_page_config(page_title="Motion Diff Drone Detector", layout="wide")
@@ -361,6 +364,8 @@ if "last_summary_path" not in st.session_state:
     st.session_state["last_summary_path"] = ""
 if "last_run_root" not in st.session_state:
     st.session_state["last_run_root"] = ""
+if "last_resume_manifest_path" not in st.session_state:
+    st.session_state["last_resume_manifest_path"] = ""
 if "profile_panel_open" not in st.session_state:
     st.session_state["profile_panel_open"] = False
 initialize_settings_profile()
@@ -1318,7 +1323,16 @@ def run_detector(args: list[str], stop_file: Path | None = None) -> dict:
         if process.poll() is None:
             if stop_file is not None:
                 request_stop_file(str(stop_file))
-            process.terminate()
+                status_placeholder.markdown(
+                    "**Stopping**  \n"
+                    "Stop requested. Waiting for partial videos and summaries to finalize."
+                )
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+            else:
+                process.terminate()
             try:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:
@@ -1350,7 +1364,12 @@ def run_detector(args: list[str], stop_file: Path | None = None) -> dict:
     return summary
 
 
-def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[str]:
+def common_cli_args(
+    out_dir: Path,
+    roi_mask_path: Path | None = None,
+    start_frame_override: int | None = None,
+    max_frames_override: int | None = None,
+) -> list[str]:
     args = [
         "--diff-threshold",
         str(int(diff_threshold)),
@@ -1431,15 +1450,21 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         args.append("--no-overlay-video")
     if not write_jsonl:
         args.append("--no-jsonl")
-    if limit_frame_range:
+    effective_start_frame = (
+        int(start_frame_override) if start_frame_override is not None else int(start_frame)
+    )
+    effective_max_frames = (
+        int(max_frames_override) if max_frames_override is not None else int(max_frames)
+    )
+    if limit_frame_range or start_frame_override is not None or max_frames_override is not None:
         args.extend(
             [
                 "--start-frame",
-                str(int(start_frame)),
-                "--max-frames",
-                str(int(max_frames)),
+                str(max(0, effective_start_frame)),
             ]
         )
+        if limit_frame_range or max_frames_override is not None:
+            args.extend(["--max-frames", str(max(0, effective_max_frames))])
     if not shake_protection:
         args.append("--disable-shake-protection")
     if hysteresis:
@@ -1487,6 +1512,420 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         if semantic_motion_gate:
             args.append("--semantic-motion-gate")
     return args
+
+
+def manifest_path_for_run(run_root: Path) -> Path:
+    return run_root / RUN_MANIFEST_NAME
+
+
+def load_resume_manifest(path: str | Path | None) -> dict | None:
+    if not path:
+        return None
+    manifest_path = Path(path)
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / RUN_MANIFEST_NAME
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["manifest_path"] = str(manifest_path)
+    return payload
+
+
+def write_resume_manifest(manifest: dict) -> Path:
+    manifest_path = Path(manifest["manifest_path"])
+    manifest["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path
+
+
+def create_resume_manifest(run_root: Path, source_path: str | Path) -> dict:
+    manifest_path = manifest_path_for_run(run_root)
+    manifest = {
+        "version": 1,
+        "source": str(source_path),
+        "run_root": str(run_root),
+        "manifest_path": str(manifest_path),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "segments": [],
+        "combined_outputs": {},
+        "combined_summary_path": "",
+    }
+    write_resume_manifest(manifest)
+    st.session_state["last_resume_manifest_path"] = str(manifest_path)
+    return manifest
+
+
+def segment_root_for(manifest: dict, segment_index: int) -> Path:
+    run_root = Path(manifest["run_root"])
+    return run_root / "segments" / f"segment_{segment_index:03d}"
+
+
+def append_segment_to_manifest(
+    manifest: dict,
+    summary: dict,
+    segment_root: Path,
+    roi_mask_path: Path | None,
+) -> dict:
+    segments = list(manifest.get("segments", []))
+    segment_index = len(segments) + 1
+    segments.append(
+        {
+            "index": segment_index,
+            "segment_root": str(segment_root),
+            "summary_path": str(summary.get("summary_path", segment_root / "outputs" / "summary.json")),
+            "start_frame": summary.get("start_frame"),
+            "end_frame": summary.get("end_frame"),
+            "frame_count": summary.get("frame_count", 0),
+            "stopped_early": summary.get("stopped_early", False),
+            "stop_reason": summary.get("stop_reason"),
+            "overlay_path": summary.get("overlay_path"),
+            "motion_only_path": summary.get("motion_only_path"),
+            "jsonl_path": summary.get("jsonl_path"),
+            "roi_mask_path": str(roi_mask_path) if roi_mask_path else None,
+            "settings": dict(current_settings),
+        }
+    )
+    manifest["segments"] = segments
+    write_resume_manifest(manifest)
+    return manifest
+
+
+def load_segment_summaries(manifest: dict) -> list[dict]:
+    summaries: list[dict] = []
+    for segment in manifest.get("segments", []):
+        summary = load_summary_file(segment.get("summary_path", ""))
+        if summary is not None:
+            summaries.append(summary)
+    return summaries
+
+
+def resume_next_start_frame(manifest: dict) -> int:
+    summaries = load_segment_summaries(manifest)
+    if not summaries:
+        return 0
+    end_frame = summaries[-1].get("end_frame")
+    if end_frame is None:
+        return int(summaries[-1].get("start_frame") or 0)
+    return int(end_frame) + 1
+
+
+def resume_is_complete(manifest: dict) -> bool:
+    summaries = load_segment_summaries(manifest)
+    if not summaries:
+        return False
+    last = summaries[-1]
+    source_total_frames = int(last.get("source_total_frames") or 0)
+    next_frame = resume_next_start_frame(manifest)
+    if source_total_frames > 0 and next_frame >= source_total_frames:
+        return True
+    return not bool(last.get("stopped_early", False)) and last.get("stop_reason") == "completed"
+
+
+def concat_file_line(path: Path) -> str:
+    escaped = path.as_posix().replace("'", "'\\''")
+    return f"file '{escaped}'\n"
+
+
+def stitch_segment_videos(paths: list[Path], output_path: Path) -> tuple[Path | None, str | None]:
+    existing_paths = [path for path in paths if path.exists()]
+    if not existing_paths:
+        return None, None
+    if len(existing_paths) == 1:
+        return existing_paths[0], None
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return existing_paths[-1], "ffmpeg not found; showing the latest segment instead of stitched video."
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output_path.with_suffix(".concat.txt")
+    list_path.write_text("".join(concat_file_line(path) for path in existing_paths), encoding="utf-8")
+    result = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(output_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not output_path.exists():
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+        return existing_paths[-1], f"Could not stitch segments; showing latest segment. ffmpeg: {detail}"
+    return output_path, None
+
+
+def concatenate_jsonl(paths: list[Path], output_path: Path) -> Path | None:
+    existing_paths = [path for path in paths if path.exists()]
+    if not existing_paths:
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as output:
+        for path in existing_paths:
+            text = path.read_text(encoding="utf-8")
+            if not text:
+                continue
+            output.write(text)
+            if not text.endswith("\n"):
+                output.write("\n")
+    return output_path
+
+
+SUMMARY_COUNTER_KEYS = [
+    "frames_with_motion",
+    "detection_count",
+    "raw_detection_count",
+    "roi_rejected_count",
+    "roi_penalized_count",
+    "semantic_detection_count",
+    "semantic_rejected_count",
+    "semantic_penalized_count",
+    "temporal_rejected_count",
+    "unconfirmed_rejected_count",
+    "direction_rejected_count",
+    "drone_track_rejected_count",
+    "screen_decoy_rejected_count",
+    "occlusion_recovered_count",
+    "kept_detection_count",
+    "global_motion_rejected_frames",
+    "global_motion_detected_frames",
+    "shake_estimated_frames",
+    "shake_reused_frames",
+]
+
+
+def build_combined_summary(
+    manifest: dict,
+    motion_path: Path | None,
+    overlay_path: Path | None,
+    jsonl_path: Path | None,
+    stitch_warnings: list[str],
+) -> dict | None:
+    summaries = load_segment_summaries(manifest)
+    if not summaries:
+        return None
+
+    first = summaries[0]
+    last = summaries[-1]
+    processing_seconds = sum(float(summary.get("processing_seconds") or 0.0) for summary in summaries)
+    frame_count = sum(int(summary.get("frame_count") or 0) for summary in summaries)
+    semantic_inference_count = sum(
+        int(summary.get("semantic_filter", {}).get("inference_count") or 0)
+        for summary in summaries
+    )
+    semantic_skipped_count = sum(
+        int(summary.get("semantic_filter", {}).get("skipped_count") or 0)
+        for summary in summaries
+    )
+
+    combined = dict(last)
+    combined.update(
+        {
+            "mode": "video",
+            "source": first.get("source"),
+            "frame_count": frame_count,
+            "source_total_frames": last.get("source_total_frames", first.get("source_total_frames", 0)),
+            "target_frame_count": last.get("source_total_frames", last.get("target_frame_count", 0)),
+            "start_frame": first.get("start_frame"),
+            "end_frame": last.get("end_frame"),
+            "requested_max_frames": None,
+            "stopped_early": not resume_is_complete(manifest),
+            "stop_reason": "completed" if resume_is_complete(manifest) else last.get("stop_reason"),
+            "duration_s": frame_count / max(float(last.get("fps") or first.get("fps") or 25.0), 0.001),
+            "processing_seconds": round(processing_seconds, 3),
+            "processing_seconds_per_frame": round(processing_seconds / max(1, frame_count), 6),
+            "processing_ms_per_frame": round(processing_seconds * 1000.0 / max(1, frame_count), 3),
+            "motion_only_path": str(motion_path) if motion_path else None,
+            "overlay_path": str(overlay_path) if overlay_path else None,
+            "jsonl_path": str(jsonl_path) if jsonl_path else None,
+            "summary_path": str(Path(manifest["run_root"]) / COMBINED_SUMMARY_NAME),
+            "segment_count": len(summaries),
+            "segments": [
+                {
+                    "summary_path": summary.get("summary_path"),
+                    "start_frame": summary.get("start_frame"),
+                    "end_frame": summary.get("end_frame"),
+                    "frame_count": summary.get("frame_count"),
+                    "stopped_early": summary.get("stopped_early"),
+                    "stop_reason": summary.get("stop_reason"),
+                }
+                for summary in summaries
+            ],
+            "resume": {
+                "manifest_path": manifest.get("manifest_path"),
+                "can_continue": not resume_is_complete(manifest),
+                "next_start_frame": resume_next_start_frame(manifest),
+            },
+            "stitch_warnings": stitch_warnings,
+        }
+    )
+    for key in SUMMARY_COUNTER_KEYS:
+        combined[key] = sum(int(summary.get(key) or 0) for summary in summaries)
+
+    semantic_summary = dict(combined.get("semantic_filter", {}))
+    semantic_summary["inference_count"] = semantic_inference_count
+    semantic_summary["skipped_count"] = semantic_skipped_count
+    combined["semantic_filter"] = semantic_summary
+    combined["outputs"] = {
+        "motion_video": motion_path is not None,
+        "overlay_video": overlay_path is not None,
+        "jsonl": jsonl_path is not None,
+    }
+    return combined
+
+
+def refresh_combined_outputs(manifest: dict) -> dict | None:
+    summaries = load_segment_summaries(manifest)
+    if not summaries:
+        return None
+
+    run_root = Path(manifest["run_root"])
+    stitch_warnings: list[str] = []
+    motion_path, motion_warning = stitch_segment_videos(
+        [Path(path) for path in (summary.get("motion_only_path") for summary in summaries) if path],
+        run_root / "combined_motion_only.mp4",
+    )
+    overlay_path, overlay_warning = stitch_segment_videos(
+        [Path(path) for path in (summary.get("overlay_path") for summary in summaries) if path],
+        run_root / "combined_motion_overlay.mp4",
+    )
+    if motion_warning:
+        stitch_warnings.append(motion_warning)
+    if overlay_warning:
+        stitch_warnings.append(overlay_warning)
+    jsonl_path = concatenate_jsonl(
+        [Path(path) for path in (summary.get("jsonl_path") for summary in summaries) if path],
+        run_root / "combined_motion_detections.jsonl",
+    )
+    combined = build_combined_summary(
+        manifest,
+        motion_path=motion_path,
+        overlay_path=overlay_path,
+        jsonl_path=jsonl_path,
+        stitch_warnings=stitch_warnings,
+    )
+    if combined is None:
+        return None
+
+    summary_path = Path(combined["summary_path"])
+    summary_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+    manifest["combined_summary_path"] = str(summary_path)
+    manifest["combined_outputs"] = {
+        "motion_only_path": str(motion_path) if motion_path else None,
+        "overlay_path": str(overlay_path) if overlay_path else None,
+        "jsonl_path": str(jsonl_path) if jsonl_path else None,
+    }
+    write_resume_manifest(manifest)
+    return combined
+
+
+def continuation_max_frames() -> int | None:
+    return int(max_frames) if limit_frame_range else None
+
+
+def run_motion_segment(
+    source_path: str | Path,
+    manifest: dict,
+    start_frame_override: int | None = None,
+    max_frames_override: int | None = None,
+) -> dict:
+    segment_index = len(manifest.get("segments", [])) + 1
+    segment_root = segment_root_for(manifest, segment_index)
+    out_dir = segment_root / "outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stop_file = segment_root / "stop_requested"
+    if stop_file.exists():
+        stop_file.unlink()
+    remember_run_paths(Path(manifest["run_root"]), out_dir)
+    st.session_state["last_resume_manifest_path"] = str(manifest["manifest_path"])
+    st.session_state["active_stop_file"] = str(stop_file)
+
+    roi_mask_path = write_current_roi_mask(segment_root)
+    if roi_mask_enabled and roi_mask_path is None:
+        st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
+
+    try:
+        summary = run_detector(
+            [
+                "video",
+                str(source_path),
+                *common_cli_args(
+                    out_dir,
+                    roi_mask_path,
+                    start_frame_override=start_frame_override,
+                    max_frames_override=max_frames_override,
+                ),
+            ],
+            stop_file=stop_file,
+        )
+    finally:
+        st.session_state["active_stop_file"] = None
+
+    append_segment_to_manifest(manifest, summary, segment_root, roi_mask_path)
+    combined = refresh_combined_outputs(manifest) or summary
+    st.session_state["last_summary_path"] = str(combined.get("summary_path", summary.get("summary_path", "")))
+    return combined
+
+
+def render_resume_controls(manifest_path: str | Path | None) -> dict | None:
+    manifest = load_resume_manifest(manifest_path)
+    if manifest is None:
+        return None
+    latest_combined = load_summary_file(manifest.get("combined_summary_path", ""))
+    if latest_combined is None:
+        latest_combined = refresh_combined_outputs(manifest)
+
+    if latest_combined is None:
+        return None
+
+    next_frame = resume_next_start_frame(manifest)
+    segment_count = len(manifest.get("segments", []))
+    can_continue = not resume_is_complete(manifest)
+    status = "complete" if not can_continue else f"ready to continue from frame {next_frame}"
+    st.caption(f"Resumable run: {segment_count} segment(s), {status}.")
+
+    warnings = latest_combined.get("stitch_warnings", [])
+    for warning in warnings:
+        st.warning(warning)
+
+    if not can_continue:
+        return latest_combined
+
+    cols = st.columns([1, 2])
+    if cols[0].button(
+        f"Continue from frame {next_frame}",
+        type="primary",
+        key=f"continue_{Path(manifest['manifest_path']).parent.name}_{segment_count}_{next_frame}",
+        help=(
+            "Starts a new segment from the next unprocessed source frame, then rebuilds "
+            "the cumulative result video."
+        ),
+    ):
+        with st.spinner(f"Continuing from frame {next_frame}..."):
+            return run_motion_segment(
+                manifest["source"],
+                manifest,
+                start_frame_override=next_frame,
+                max_frames_override=continuation_max_frames(),
+            )
+    cols[1].caption("Stop again at any point to inspect the cumulative partial output.")
+    return latest_combined
 
 
 def read_jsonl(path: str | Path) -> list[dict]:
@@ -1655,25 +2094,14 @@ with tabs[0]:
         st.caption(f"ROI preview source: {uploaded_video_path}")
     if upload and st.button("Run motion diff on upload", type="primary"):
         run_root = make_run_root()
-        out_dir = run_root / "outputs"
-        stop_file = run_root / "stop_requested"
-        remember_run_paths(run_root, out_dir)
-        st.session_state["active_stop_file"] = str(stop_file)
-        roi_mask_path = write_current_roi_mask(run_root)
-        if roi_mask_enabled and roi_mask_path is None:
-            st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
+        manifest = create_resume_manifest(run_root, uploaded_video_path)
         with st.spinner("Processing video..."):
             try:
-                summary = run_detector(
-                    ["video", str(uploaded_video_path), *common_cli_args(out_dir, roi_mask_path)],
-                    stop_file=stop_file,
-                )
-                st.session_state["last_summary_path"] = str(summary.get("summary_path", out_dir / "summary.json"))
+                summary = run_motion_segment(uploaded_video_path, manifest)
             except Exception as exc:
                 st.error(f"Detector failed: {type(exc).__name__}: {exc}")
                 st.stop()
-            finally:
-                st.session_state["active_stop_file"] = None
+        summary = render_resume_controls(st.session_state.get("last_resume_manifest_path")) or summary
         render_outputs(summary)
         rendered_summary_path = str(summary.get("summary_path", ""))
 
@@ -1686,25 +2114,14 @@ with tabs[1]:
             st.error("Enter a local video path.")
             st.stop()
         run_root = make_run_root()
-        out_dir = run_root / "outputs"
-        stop_file = run_root / "stop_requested"
-        remember_run_paths(run_root, out_dir)
-        st.session_state["active_stop_file"] = str(stop_file)
-        roi_mask_path = write_current_roi_mask(run_root)
-        if roi_mask_enabled and roi_mask_path is None:
-            st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
+        manifest = create_resume_manifest(run_root, local_path.strip())
         with st.spinner("Processing video..."):
             try:
-                summary = run_detector(
-                    ["video", local_path.strip(), *common_cli_args(out_dir, roi_mask_path)],
-                    stop_file=stop_file,
-                )
-                st.session_state["last_summary_path"] = str(summary.get("summary_path", out_dir / "summary.json"))
+                summary = run_motion_segment(local_path.strip(), manifest)
             except Exception as exc:
                 st.error(f"Detector failed: {type(exc).__name__}: {exc}")
                 st.stop()
-            finally:
-                st.session_state["active_stop_file"] = None
+        summary = render_resume_controls(st.session_state.get("last_resume_manifest_path")) or summary
         render_outputs(summary)
         rendered_summary_path = str(summary.get("summary_path", ""))
 
@@ -1953,6 +2370,10 @@ if last_summary_path and last_summary_path != rendered_summary_path:
     if latest_summary is not None:
         st.divider()
         st.subheader("Latest run output")
+        latest_summary = (
+            render_resume_controls(st.session_state.get("last_resume_manifest_path"))
+            or latest_summary
+        )
         render_outputs(latest_summary)
     elif st.session_state.get("last_run_root"):
         st.info("Latest run output is still finalizing. Refresh after a moment if it does not appear.")

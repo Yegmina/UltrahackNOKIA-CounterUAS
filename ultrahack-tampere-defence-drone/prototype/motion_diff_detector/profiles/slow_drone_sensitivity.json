@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "profile_type": "motion_diff_detector_parameters",
+  "settings": {
+    "diff_threshold": 13,
+    "min_area": 30.0,
+    "blur_kernel": 5,
+    "morph_kernel": 3,
+    "trail_frames": 4,
+    "max_motion_ratio": 0.1,
+    "analysis_scale": 0.5,
+    "processing_backend": "auto",
+    "cuda_device": 0,
+    "write_overlay_video": true,
+    "write_motion_video": false,
+    "write_jsonl": true,
+    "limit_frame_range": false,
+    "start_frame": 0,
+    "max_frames": 300,
+    "shake_protection": true,
+    "shake_min_shift": 1.0,
+    "shake_consensus": 0.72,
+    "shake_consensus_px": 2.0,
+    "shake_frame_stride": 1,
+    "shake_analysis_scale": 1.0,
+    "shake_max_corners": 240,
+    "hysteresis": true,
+    "hysteresis_high_threshold": 28,
+    "temporal_filter": true,
+    "track_confirmation": true,
+    "direction_consistency": false,
+    "temporal_window_frames": 6,
+    "temporal_min_hits": 2,
+    "track_confirm_hits": 2,
+    "track_max_missed": 6,
+    "track_match_distance": 90.0,
+    "direction_min_hits": 5,
+    "direction_min_displacement": 1.0,
+    "direction_cosine": 0.0,
+    "drone_track_filter": true,
+    "drone_min_track_hits": 2,
+    "drone_min_normalized_speed": 0.03,
+    "drone_max_normalized_speed": 18.0,
+    "screen_decoy_rejection": true,
+    "screen_min_track_hits": 12,
+    "screen_max_area_cv": 0.08,
+    "screen_max_aspect_cv": 0.1,
+    "screen_min_path_smoothness": 0.95,
+    "screen_min_perimeter_fraction": 0.25,
+    "screen_perimeter_margin": 0.1,
+    "occlusion_recovery": true,
+    "occlusion_max_frames": 10,
+    "occlusion_gate_distance": 140.0,
+    "roi_mask_enabled": true,
+    "semantic_filter": true,
+    "semantic_action": "reject",
+    "semantic_conf": 0.1,
+    "semantic_overlap_threshold": 0.15,
+    "semantic_frame_stride": 2,
+    "semantic_warmup": true,
+    "semantic_motion_gate": false,
+    "semantic_imgsz": 1280,
+    "semantic_model_repo": "devanshty/WingID",
+    "semantic_model_file": "yolo11l.pt",
+    "semantic_weights": ""
+  },
+  "roi_mask": {
+    "version": 1,
+    "mode": "fixed",
+    "zones": [
+      {
+        "name": "zone_1",
+        "type": "ignore",
+        "points": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            0.93,
+            0.33794466403162055
+          ],
+          [
+            0.0,
+            0.2964426877470356
+          ]
+        ],
+        "penalty": 0.0
+      }
+    ]
+  }
+}

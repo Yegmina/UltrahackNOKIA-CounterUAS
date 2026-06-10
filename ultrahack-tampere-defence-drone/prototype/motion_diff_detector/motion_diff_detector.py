@@ -2039,20 +2039,7 @@ def render_overlay(
         if detection.semantic_action == "penalize":
             color = (255, 80, 255)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        label = f"motion {detection.area:.0f}px"
-        if detection.roi_action == "penalize":
-            label = f"penalty {detection.area:.0f}px"
-        if detection.semantic_action == "penalize":
-            label = f"{detection.semantic_label} penalty {detection.semantic_overlap:.2f}"
-        if detection.track_id is not None:
-            label = f"{label} t{detection.track_id} h{detection.track_hits}"
-            if detection.drone_score > 0.0 or detection.screen_decoy_score > 0.0:
-                label = (
-                    f"{label} d={detection.drone_score:.2f} "
-                    f"s={detection.screen_decoy_score:.2f}"
-                )
-            if detection.occlusion_recovered:
-                label = f"{label} recovered"
+        label = "drone"
         label_y = max(18, y1 - 6)
         cv2.putText(
             output,

@@ -25,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File prototype\motion_diff_detect
 On macOS/Linux:
 
 ```bash
-python3 -m streamlit run prototype/motion_diff_detector/app.py --server.address 127.0.0.1 --server.port 8505 --server.maxUploadSize 1536
+python3 -m streamlit run prototype/motion_diff_detector/app.py --server.address 127.0.0.1 --server.port 8505 --server.maxUploadSize 4096
 ```
 
 Open:
@@ -34,7 +34,7 @@ Open:
 http://127.0.0.1:8505
 ```
 
-The app upload limit is configured to 1536 MB in `.streamlit/config.toml`.
+The app upload limit is configured to 4096 MB in `.streamlit/config.toml`.
 
 The sidebar has a `Parameter profile` expander for settings files:
 
@@ -42,6 +42,15 @@ The sidebar has a `Parameter profile` expander for settings files:
 - `Import parameters JSON` restores those controls from the saved file and reruns the UI with the imported values.
 
 The ROI tab still has a separate `Download mask JSON` button for ROI-only reuse.
+
+Long runs can be stopped from the progress panel. The detector finalizes the partial segment,
+shows the cumulative output video, and stores a `resume_manifest.json` under the run folder.
+Use `Continue from frame ...` in the latest output panel to process the next segment and rebuild
+the combined overlay/motion videos without starting from frame 0.
+
+Preset files live in `prototype/motion_diff_detector/profiles/` and can be imported from the
+`Parameter profile` panel. `slow_drone_sensitivity.json` is tuned from the aggressive IR profile
+to keep slow, intermittent drone tracks alive longer while preserving the same top ROI mask.
 
 ## CLI
 
