@@ -64,7 +64,9 @@ Common options:
 
 ## ROI Masks
 
-The Streamlit UI has an `ROI mask` tab for click-building polygon zones on a selected video frame. Use:
+The Streamlit UI has an `ROI mask` tab for click-building polygon zones on a selected video frame.
+When a video is selected in the `Upload` tab, it is cached to a temporary local path and automatically becomes the ROI preview source.
+Use:
 
 - `ignore` for tribunes, people, static props, edge bands, floor bands, lights, and gates that should remove detections.
 - `penalty` for regions that may contain useful motion but should be lower confidence.

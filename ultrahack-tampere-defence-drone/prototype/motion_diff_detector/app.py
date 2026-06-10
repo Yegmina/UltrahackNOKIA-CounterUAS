@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - runtime dependency hint for Streamlit.
 
 SCRIPT_PATH = Path(__file__).with_name("motion_diff_detector.py")
 SAMPLE_PATH = Path.home() / "Downloads" / "fixedcameravideo_2026-06-10_00-10-22.mp4"
+UPLOAD_CACHE_ROOT = Path(tempfile.gettempdir()) / "motion_diff_detector_uploads"
 
 
 st.set_page_config(page_title="Motion Diff Drone Detector", layout="wide")
@@ -32,6 +33,10 @@ if "roi_points" not in st.session_state:
     st.session_state["roi_points"] = []
 if "roi_mode" not in st.session_state:
     st.session_state["roi_mode"] = "fixed"
+if "uploaded_video_cache_id" not in st.session_state:
+    st.session_state["uploaded_video_cache_id"] = None
+if "uploaded_video_cache_path" not in st.session_state:
+    st.session_state["uploaded_video_cache_path"] = ""
 
 with st.sidebar:
     diff_threshold = st.slider("Difference threshold", 1, 100, 18, 1)
@@ -101,6 +106,36 @@ def write_current_roi_mask(root: Path) -> Path | None:
     mask_path = root / "roi_mask.json"
     mask_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return mask_path
+
+
+def safe_cache_name(name: str) -> str:
+    return "".join(char if char.isalnum() or char in ".-_" else "_" for char in name)
+
+
+def cache_uploaded_video(uploaded_file) -> Path | None:
+    if uploaded_file is None:
+        return None
+
+    upload_id = f"{getattr(uploaded_file, 'file_id', '')}:{uploaded_file.name}:{uploaded_file.size}"
+    cached_path = st.session_state.get("uploaded_video_cache_path")
+    if (
+        upload_id == st.session_state.get("uploaded_video_cache_id")
+        and cached_path
+        and Path(cached_path).exists()
+    ):
+        return Path(cached_path)
+
+    UPLOAD_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    name = safe_cache_name(uploaded_file.name)
+    target = UPLOAD_CACHE_ROOT / f"{Path(name).stem}_{uploaded_file.size}{Path(name).suffix}"
+    with target.open("wb") as output:
+        output.write(uploaded_file.getbuffer())
+
+    st.session_state["uploaded_video_cache_id"] = upload_id
+    st.session_state["uploaded_video_cache_path"] = str(target)
+    st.session_state["roi_preview_path"] = str(target)
+    st.session_state["roi_last_click"] = None
+    return target
 
 
 @st.cache_data(show_spinner=False)
@@ -325,11 +360,12 @@ def render_outputs(summary: dict) -> None:
 
 with tabs[0]:
     upload = st.file_uploader("Video file", type=["mp4", "avi", "mov", "mkv"])
+    uploaded_video_path = cache_uploaded_video(upload) if upload else None
+    if uploaded_video_path is not None:
+        st.caption(f"ROI preview source: {uploaded_video_path}")
     if upload and st.button("Run motion diff on upload", type="primary"):
         with tempfile.TemporaryDirectory() as temp_root:
             temp_root_path = Path(temp_root)
-            source_path = temp_root_path / upload.name
-            source_path.write_bytes(upload.read())
             out_dir = temp_root_path / "outputs"
             roi_mask_path = write_current_roi_mask(temp_root_path)
             if roi_mask_enabled and roi_mask_path is None:
@@ -337,7 +373,7 @@ with tabs[0]:
             with st.spinner("Rendering motion-only and overlay videos..."):
                 try:
                     summary = run_detector(
-                        ["video", str(source_path), *common_cli_args(out_dir, roi_mask_path)]
+                        ["video", str(uploaded_video_path), *common_cli_args(out_dir, roi_mask_path)]
                     )
                 except Exception as exc:
                     st.error(f"Detector failed: {type(exc).__name__}: {exc}")
@@ -382,8 +418,11 @@ with tabs[2]:
         )
         st.session_state["roi_mode"] = mode
 
-        default_path = str(SAMPLE_PATH) if SAMPLE_PATH.exists() else ""
+        uploaded_preview_path = st.session_state.get("uploaded_video_cache_path", "")
+        default_path = uploaded_preview_path or (str(SAMPLE_PATH) if SAMPLE_PATH.exists() else "")
         preview_path = st.text_input("Preview video path", default_path, key="roi_preview_path")
+        if uploaded_preview_path and preview_path == uploaded_preview_path:
+            st.caption(f"Using uploaded video for ROI preview: {Path(uploaded_preview_path).name}")
         frame_index = st.number_input("Frame number", min_value=0, value=0, step=1)
 
         zone_cols = st.columns([2, 1, 1])
