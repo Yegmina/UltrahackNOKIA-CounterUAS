@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 
 from motion_diff_detector import (
+    build_parser,
     MotionConfig,
     MotionDetection,
     MotionTracker,
@@ -11,9 +12,12 @@ from motion_diff_detector import (
     RoiZone,
     SemanticConfig,
     SemanticDetection,
+    ShakeEstimator,
     analyze_gray_pair,
     filter_candidates_by_semantics,
     prepare_gray,
+    process_video,
+    progress_payload,
     render_motion_only,
     roi_zone_points_pixels,
 )
@@ -61,6 +65,27 @@ def make_semantic_detection(
         x2=x2,
         y2=y2,
     )
+
+
+def write_test_video(path, frame_count: int = 8, width: int = 64, height: int = 48) -> None:
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        10.0,
+        (width, height),
+    )
+    assert writer.isOpened()
+    for index in range(frame_count):
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.rectangle(
+            frame,
+            (8 + index, 18),
+            (16 + index, 26),
+            (255, 255, 255),
+            thickness=cv2.FILLED,
+        )
+        writer.write(frame)
+    writer.release()
 
 
 def test_static_frames_produce_no_motion() -> None:
@@ -422,3 +447,93 @@ def test_prepare_gray_downscales_and_blurs() -> None:
     gray = prepare_gray(frame, config)
 
     assert gray.shape == (50, 40)
+
+
+def test_progress_payload_reports_recent_speed() -> None:
+    payload = progress_payload(
+        "processing",
+        started_at=0.0,
+        processed_frames=10,
+        total_frames=100,
+        recent_frames=5,
+        recent_elapsed_s=0.5,
+    )
+
+    assert payload["recent_fps"] == 10.0
+    assert payload["recent_ms_per_frame"] == 100.0
+    assert payload["remaining_frames"] == 90
+
+
+def test_shake_estimator_reuses_between_stride_frames() -> None:
+    estimator = ShakeEstimator(MotionConfig(shake_frame_stride=2, shake_protection=True))
+    previous = make_textured_frame()
+    transform = np.array([[1, 0, 3], [0, 1, 2]], dtype=np.float32)
+    current = cv2.warpAffine(previous, transform, (previous.shape[1], previous.shape[0]))
+
+    first = estimator.estimate(previous, current)
+    second = estimator.estimate(previous, current)
+
+    assert first.estimated
+    assert not first.reused
+    assert not second.estimated
+    assert second.reused
+    assert second.dx == first.dx
+    assert second.dy == first.dy
+
+
+def test_process_video_can_skip_outputs_and_limit_frames(tmp_path) -> None:
+    video_path = tmp_path / "tiny.mp4"
+    out_dir = tmp_path / "out"
+    write_test_video(video_path, frame_count=8)
+    args = build_parser().parse_args(
+        [
+            "video",
+            str(video_path),
+            "--out-dir",
+            str(out_dir),
+            "--max-frames",
+            "3",
+            "--no-motion-video",
+            "--no-overlay-video",
+            "--no-jsonl",
+            "--disable-shake-protection",
+        ]
+    )
+
+    summary = process_video(args)
+
+    assert summary["frame_count"] == 3
+    assert summary["stopped_early"]
+    assert summary["stop_reason"] == "frame_limit"
+    assert summary["motion_only_path"] is None
+    assert summary["overlay_path"] is None
+    assert summary["jsonl_path"] is None
+    assert (out_dir / "summary.json").exists()
+
+
+def test_process_video_stop_file_writes_partial_summary(tmp_path) -> None:
+    video_path = tmp_path / "tiny.mp4"
+    out_dir = tmp_path / "out"
+    stop_file = tmp_path / "stop"
+    stop_file.write_text("stop\n", encoding="utf-8")
+    write_test_video(video_path, frame_count=8)
+    args = build_parser().parse_args(
+        [
+            "video",
+            str(video_path),
+            "--out-dir",
+            str(out_dir),
+            "--stop-file",
+            str(stop_file),
+            "--no-motion-video",
+            "--no-overlay-video",
+            "--no-jsonl",
+        ]
+    )
+
+    summary = process_video(args)
+
+    assert summary["frame_count"] == 0
+    assert summary["stopped_early"]
+    assert summary["stop_reason"] == "stop_requested"
+    assert (out_dir / "summary.json").exists()

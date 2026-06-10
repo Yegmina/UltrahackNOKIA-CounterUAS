@@ -6,6 +6,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 import cv2
@@ -22,6 +24,7 @@ except ImportError:  # pragma: no cover - runtime dependency hint for Streamlit.
 SCRIPT_PATH = Path(__file__).with_name("motion_diff_detector.py")
 SAMPLE_PATH = Path.home() / "Downloads" / "fixedcameravideo_2026-06-10_00-10-22.mp4"
 UPLOAD_CACHE_ROOT = Path(tempfile.gettempdir()) / "motion_diff_detector_uploads"
+RUN_CACHE_ROOT = UPLOAD_CACHE_ROOT / "runs"
 PROGRESS_PREFIX = "PROGRESS "
 
 
@@ -91,6 +94,45 @@ with st.sidebar:
         0.05,
         help="Downscale factor for motion analysis. Lower is faster; higher preserves tiny objects.",
     )
+    st.divider()
+    st.caption("Performance / outputs")
+    write_overlay_video = st.checkbox(
+        "Write overlay video",
+        value=True,
+        help="Writes the annotated MP4. Turn off for fastest settings searches.",
+    )
+    write_motion_video = st.checkbox(
+        "Write motion-only video",
+        value=True,
+        help="Writes the motion-mask debug MP4. Turn off unless you need the mask view.",
+    )
+    write_jsonl = st.checkbox(
+        "Write detections JSONL",
+        value=True,
+        help="Stores every per-frame detection record. Turn off to reduce I/O during tuning.",
+    )
+    limit_frame_range = st.checkbox(
+        "Limit frame range",
+        value=False,
+        help="Process only a slice of the video for fast tuning or partial previews.",
+    )
+    start_frame = st.number_input(
+        "Start frame",
+        min_value=0,
+        value=0,
+        step=1,
+        disabled=not limit_frame_range,
+        help="First source frame to process when frame range limiting is enabled.",
+    )
+    max_frames = st.number_input(
+        "Max frames",
+        min_value=1,
+        value=300,
+        step=30,
+        disabled=not limit_frame_range,
+        help="Maximum number of frames to process when frame range limiting is enabled.",
+    )
+    st.divider()
     shake_protection = st.checkbox(
         "Shake protection",
         value=True,
@@ -122,6 +164,33 @@ with st.sidebar:
         0.1,
         disabled=not shake_protection,
         help="Pixel tolerance for deciding whether tracked points agree on global movement.",
+    )
+    shake_frame_stride = st.slider(
+        "Shake frame stride",
+        1,
+        10,
+        1,
+        1,
+        disabled=not shake_protection,
+        help="Estimate global shake every N frames and reuse the last estimate between runs. Higher is faster but less reactive.",
+    )
+    shake_analysis_scale = st.slider(
+        "Shake analysis scale",
+        0.10,
+        1.0,
+        1.0,
+        0.05,
+        disabled=not shake_protection,
+        help="Extra downscale used only for shake optical flow. Lower is faster; 1.0 preserves current behavior.",
+    )
+    shake_max_corners = st.slider(
+        "Shake feature points",
+        12,
+        300,
+        240,
+        12,
+        disabled=not shake_protection,
+        help="Maximum tracked feature points for shake estimation. Lower is faster but can reduce consensus quality.",
     )
     st.divider()
     hysteresis = st.checkbox(
@@ -272,6 +341,18 @@ with st.sidebar:
         disabled=not semantic_filter,
         help="Runs person detection every N frames and holds boxes between runs. Higher is faster.",
     )
+    semantic_warmup = st.checkbox(
+        "Warm up human model",
+        value=True,
+        disabled=not semantic_filter,
+        help="Runs one untimed inference before processing so the measured frame speed starts closer to steady state.",
+    )
+    semantic_motion_gate = st.checkbox(
+        "Gate human AI by motion",
+        value=False,
+        disabled=not semantic_filter,
+        help="Skips person inference while the previous frame had no raw motion. Faster on quiet clips but can miss the first frame of new motion.",
+    )
     semantic_imgsz = st.selectbox(
         "Person AI image size",
         [640, 960, 1280],
@@ -359,6 +440,16 @@ def write_current_roi_mask(root: Path) -> Path | None:
     mask_path = root / "roi_mask.json"
     mask_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return mask_path
+
+
+def make_run_root() -> Path:
+    run_root = RUN_CACHE_ROOT / f"run_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    run_root.mkdir(parents=True, exist_ok=True)
+    return run_root
+
+
+def request_stop_file(path: str) -> None:
+    Path(path).write_text("stop\n", encoding="utf-8")
 
 
 def safe_cache_name(name: str) -> str:
@@ -492,9 +583,12 @@ def progress_stage_label(stage: str) -> str:
         "opening_video": "Opening video",
         "loading_semantic_model": "Loading AI model",
         "semantic_model_ready": "AI model ready",
+        "warming_semantic_model": "Warming AI model",
+        "semantic_model_warm": "AI model warm",
         "processing": "Processing frames",
         "finalizing": "Finalizing outputs",
         "complete": "Complete",
+        "stopped": "Stopped",
     }.get(stage, stage.replace("_", " ").title())
 
 
@@ -519,12 +613,19 @@ def render_progress_event(event: dict, progress_bar, status_placeholder) -> None
 
     eta = format_duration(event.get("eta_s"))
     elapsed = format_duration(event.get("elapsed_s"))
-    fps = float(event.get("processing_fps") or 0.0)
-    ms_per_frame = event.get("processing_ms_per_frame")
-    if ms_per_frame is None:
-        speed_text = f"{fps:.1f} fps"
+    average_fps = float(event.get("average_fps") or event.get("processing_fps") or 0.0)
+    average_ms = event.get("average_ms_per_frame") or event.get("processing_ms_per_frame")
+    recent_fps = event.get("recent_fps")
+    recent_ms = event.get("recent_ms_per_frame")
+    if recent_fps is not None and recent_ms is not None:
+        speed_text = (
+            f"recent {float(recent_fps):.1f} fps / {float(recent_ms):.1f} ms "
+            f"· avg {average_fps:.1f} fps"
+        )
+    elif average_ms is None:
+        speed_text = f"avg {average_fps:.1f} fps"
     else:
-        speed_text = f"{fps:.1f} fps / {float(ms_per_frame):.1f} ms per frame"
+        speed_text = f"avg {average_fps:.1f} fps / {float(average_ms):.1f} ms"
     remaining = event.get("remaining_frames")
     remaining_text = f"{remaining} frames left" if remaining is not None else "frames left unknown"
     counts = (
@@ -533,16 +634,24 @@ def render_progress_event(event: dict, progress_bar, status_placeholder) -> None
         f"semantic rejected={event.get('semantic_rejected_count', 0)} "
         f"ROI rejected={event.get('roi_rejected_count', 0)}"
     )
+    engine_counts = (
+        f"shake estimated={event.get('shake_estimated_count', 0)} "
+        f"reused={event.get('shake_reused_count', 0)} "
+        f"AI runs={event.get('semantic_inference_count', 0)} "
+        f"AI skipped={event.get('semantic_skipped_count', 0)}"
+    )
     status_placeholder.markdown(
         f"**{stage_label}**  \n"
         f"Elapsed `{elapsed}` · ETA `{eta}` · {remaining_text} · {speed_text}  \n"
-        f"`{counts}`"
+        f"`{counts}`  \n"
+        f"`{engine_counts}`"
     )
 
 
-def run_detector(args: list[str]) -> dict:
+def run_detector(args: list[str], stop_file: Path | None = None) -> dict:
     progress_bar = st.progress(0.0, text="Starting detector...")
     status_placeholder = st.empty()
+    stop_placeholder = st.empty()
     command = [
         sys.executable,
         str(SCRIPT_PATH),
@@ -552,6 +661,8 @@ def run_detector(args: list[str]) -> dict:
         "0.5",
         *args,
     ]
+    if stop_file is not None:
+        command.extend(["--stop-file", str(stop_file)])
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -565,25 +676,46 @@ def run_detector(args: list[str]) -> dict:
     if process.stdout is None:
         raise RuntimeError("Detector did not expose progress output.")
 
-    for raw_line in process.stdout:
-        line = raw_line.strip()
-        if not line:
-            continue
-        lines.append(line)
-        if line.startswith(PROGRESS_PREFIX):
-            try:
-                event = json.loads(line[len(PROGRESS_PREFIX) :])
-            except json.JSONDecodeError:
+    if stop_file is not None:
+        stop_placeholder.button(
+            "Stop processing and finalize partial output",
+            key=f"stop_{stop_file.name}",
+            on_click=request_stop_file,
+            args=(str(stop_file),),
+            help="Requests a graceful stop. The detector closes video writers and returns a partial summary.",
+        )
+
+    try:
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
                 continue
-            render_progress_event(event, progress_bar, status_placeholder)
-            continue
-        if line.startswith("{"):
+            lines.append(line)
+            if line.startswith(PROGRESS_PREFIX):
+                try:
+                    event = json.loads(line[len(PROGRESS_PREFIX) :])
+                except json.JSONDecodeError:
+                    continue
+                render_progress_event(event, progress_bar, status_placeholder)
+                continue
+            if line.startswith("{"):
+                try:
+                    summary = json.loads(line)
+                except json.JSONDecodeError:
+                    pass
+    finally:
+        if process.poll() is None:
+            if stop_file is not None:
+                request_stop_file(str(stop_file))
+            process.terminate()
             try:
-                summary = json.loads(line)
-            except json.JSONDecodeError:
-                pass
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
     return_code = process.wait()
+    stop_placeholder.empty()
     if return_code != 0:
         detail_lines = [line for line in lines if not line.startswith(PROGRESS_PREFIX)]
         detail = "\n".join(detail_lines[-12:])
@@ -597,9 +729,9 @@ def run_detector(args: list[str]) -> dict:
     if summary is None:
         raise RuntimeError("Detector did not return JSON.")
 
-    progress_bar.progress(1.0, text="Complete")
+    progress_bar.progress(1.0, text="Stopped" if summary.get("stopped_early") else "Complete")
     status_placeholder.markdown(
-        f"**Complete**  \n"
+        f"**{'Stopped' if summary.get('stopped_early') else 'Complete'}**  \n"
         f"Processed `{summary['frame_count']}` frames in "
         f"`{format_duration(summary.get('processing_seconds'))}` · "
         f"`{summary.get('processing_ms_per_frame', 0.0)}` ms per frame"
@@ -629,6 +761,12 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         str(float(shake_consensus)),
         "--shake-consensus-px",
         str(float(shake_consensus_px)),
+        "--shake-frame-stride",
+        str(int(shake_frame_stride)),
+        "--shake-analysis-scale",
+        str(float(shake_analysis_scale)),
+        "--shake-max-corners",
+        str(int(shake_max_corners)),
         "--hysteresis-high-threshold",
         str(int(hysteresis_high_threshold)),
         "--temporal-window-frames",
@@ -650,6 +788,21 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         "--out-dir",
         str(out_dir),
     ]
+    if not write_motion_video:
+        args.append("--no-motion-video")
+    if not write_overlay_video:
+        args.append("--no-overlay-video")
+    if not write_jsonl:
+        args.append("--no-jsonl")
+    if limit_frame_range:
+        args.extend(
+            [
+                "--start-frame",
+                str(int(start_frame)),
+                "--max-frames",
+                str(int(max_frames)),
+            ]
+        )
     if not shake_protection:
         args.append("--disable-shake-protection")
     if hysteresis:
@@ -688,12 +841,23 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
             args.extend(["--semantic-device", semantic_device])
         if semantic_weights.strip():
             args.extend(["--semantic-weights", semantic_weights.strip()])
+        if semantic_warmup:
+            args.append("--semantic-warmup")
+        if semantic_motion_gate:
+            args.append("--semantic-motion-gate")
     return args
 
 
 def read_jsonl(path: str | Path) -> list[dict]:
     payload = Path(path).read_text(encoding="utf-8")
     return [json.loads(line) for line in payload.splitlines() if line.strip()]
+
+
+def existing_path(path: str | Path | None) -> Path | None:
+    if not path:
+        return None
+    candidate = Path(path)
+    return candidate if candidate.exists() else None
 
 
 def render_detections(records: list[dict]) -> None:
@@ -717,11 +881,15 @@ def render_detections(records: list[dict]) -> None:
 
 
 def render_outputs(summary: dict) -> None:
-    motion_bytes = Path(summary["motion_only_path"]).read_bytes()
-    overlay_bytes = Path(summary["overlay_path"]).read_bytes()
-    jsonl_bytes = Path(summary["jsonl_path"]).read_bytes()
-    summary_bytes = Path(summary["summary_path"]).read_bytes()
-    records = read_jsonl(summary["jsonl_path"])
+    motion_path = existing_path(summary.get("motion_only_path"))
+    overlay_path = existing_path(summary.get("overlay_path"))
+    jsonl_path = existing_path(summary.get("jsonl_path"))
+    summary_path = existing_path(summary.get("summary_path"))
+    motion_bytes = motion_path.read_bytes() if motion_path else None
+    overlay_bytes = overlay_path.read_bytes() if overlay_path else None
+    jsonl_bytes = jsonl_path.read_bytes() if jsonl_path else None
+    summary_bytes = summary_path.read_bytes() if summary_path else json.dumps(summary, indent=2).encode()
+    records = read_jsonl(jsonl_path) if jsonl_path else []
 
     metric_cols = st.columns(6)
     metric_cols[0].metric("Frames", summary["frame_count"])
@@ -730,6 +898,11 @@ def render_outputs(summary: dict) -> None:
     metric_cols[3].metric("Shake frames", summary.get("global_motion_detected_frames", 0))
     metric_cols[4].metric("Rejected frames", summary["global_motion_rejected_frames"])
     metric_cols[5].metric("ms / frame", summary.get("processing_ms_per_frame", 0.0))
+    if summary.get("stopped_early"):
+        st.warning(
+            f"Processing stopped early after {summary.get('frame_count', 0)} frames "
+            f"({summary.get('stop_reason')})."
+        )
 
     roi_cols = st.columns(4)
     roi_cols[0].metric("Raw detections", summary.get("raw_detection_count", summary["detection_count"]))
@@ -745,6 +918,11 @@ def render_outputs(summary: dict) -> None:
     semantic_cols[1].metric("Semantic rejected", summary.get("semantic_rejected_count", 0))
     semantic_cols[2].metric("Semantic penalized", summary.get("semantic_penalized_count", 0))
     semantic_cols[3].metric("Processing seconds", summary.get("processing_seconds", 0.0))
+    perf_cols = st.columns(4)
+    perf_cols[0].metric("Shake estimated", summary.get("shake_estimated_frames", 0))
+    perf_cols[1].metric("Shake reused", summary.get("shake_reused_frames", 0))
+    perf_cols[2].metric("AI runs", summary.get("semantic_filter", {}).get("inference_count", 0))
+    perf_cols[3].metric("AI skipped", summary.get("semantic_filter", {}).get("skipped_count", 0))
     roi_summary = summary.get("roi_mask", {})
     if roi_summary.get("enabled"):
         st.caption(
@@ -758,35 +936,56 @@ def render_outputs(summary: dict) -> None:
             f"action={semantic_summary.get('action')} conf={semantic_summary.get('confidence')} "
             f"stride={semantic_summary.get('frame_stride')} model={semantic_summary.get('model_repo')}"
         )
+    output_summary = summary.get("outputs", {})
+    st.caption(
+        "Outputs: "
+        f"overlay={output_summary.get('overlay_video', bool(overlay_path))} "
+        f"motion-only={output_summary.get('motion_video', bool(motion_path))} "
+        f"jsonl={output_summary.get('jsonl', bool(jsonl_path))}"
+    )
 
     preview_cols = st.columns(2)
     with preview_cols[0]:
         st.subheader("Motion only")
-        st.video(motion_bytes)
-        st.download_button(
-            "Download motion-only video",
-            motion_bytes,
-            file_name=Path(summary["motion_only_path"]).name,
-            mime="video/mp4",
-        )
+        if motion_bytes is not None and motion_path is not None:
+            st.video(motion_bytes)
+            st.download_button(
+                "Download motion-only video",
+                motion_bytes,
+                file_name=motion_path.name,
+                mime="video/mp4",
+            )
+        else:
+            st.info("Motion-only video was disabled for this run.")
     with preview_cols[1]:
         st.subheader("Overlay")
-        st.video(overlay_bytes)
-        st.download_button(
-            "Download overlay video",
-            overlay_bytes,
-            file_name=Path(summary["overlay_path"]).name,
-            mime="video/mp4",
-        )
+        if overlay_bytes is not None and overlay_path is not None:
+            st.video(overlay_bytes)
+            st.download_button(
+                "Download overlay video",
+                overlay_bytes,
+                file_name=overlay_path.name,
+                mime="video/mp4",
+            )
+        else:
+            st.info("Overlay video was disabled for this run.")
 
-    render_detections(records)
+    if records:
+        render_detections(records)
+    elif jsonl_path is None:
+        st.info("Per-frame JSONL was disabled for this run.")
+    else:
+        render_detections(records)
     download_cols = st.columns(2)
-    download_cols[0].download_button(
-        "Download detections JSONL",
-        jsonl_bytes,
-        file_name="motion_detections.jsonl",
-        mime="application/x-ndjson",
-    )
+    if jsonl_bytes is not None:
+        download_cols[0].download_button(
+            "Download detections JSONL",
+            jsonl_bytes,
+            file_name="motion_detections.jsonl",
+            mime="application/x-ndjson",
+        )
+    else:
+        download_cols[0].info("JSONL disabled")
     download_cols[1].download_button(
         "Download summary JSON",
         summary_bytes,
@@ -801,21 +1000,25 @@ with tabs[0]:
     if uploaded_video_path is not None:
         st.caption(f"ROI preview source: {uploaded_video_path}")
     if upload and st.button("Run motion diff on upload", type="primary"):
-        with tempfile.TemporaryDirectory() as temp_root:
-            temp_root_path = Path(temp_root)
-            out_dir = temp_root_path / "outputs"
-            roi_mask_path = write_current_roi_mask(temp_root_path)
-            if roi_mask_enabled and roi_mask_path is None:
-                st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
-            with st.spinner("Rendering motion-only and overlay videos..."):
-                try:
-                    summary = run_detector(
-                        ["video", str(uploaded_video_path), *common_cli_args(out_dir, roi_mask_path)]
-                    )
-                except Exception as exc:
-                    st.error(f"Detector failed: {type(exc).__name__}: {exc}")
-                    st.stop()
-            render_outputs(summary)
+        run_root = make_run_root()
+        out_dir = run_root / "outputs"
+        stop_file = run_root / "stop_requested"
+        st.session_state["active_stop_file"] = str(stop_file)
+        roi_mask_path = write_current_roi_mask(run_root)
+        if roi_mask_enabled and roi_mask_path is None:
+            st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
+        with st.spinner("Processing video..."):
+            try:
+                summary = run_detector(
+                    ["video", str(uploaded_video_path), *common_cli_args(out_dir, roi_mask_path)],
+                    stop_file=stop_file,
+                )
+            except Exception as exc:
+                st.error(f"Detector failed: {type(exc).__name__}: {exc}")
+                st.stop()
+            finally:
+                st.session_state["active_stop_file"] = None
+        render_outputs(summary)
 
 
 with tabs[1]:
@@ -825,21 +1028,25 @@ with tabs[1]:
         if not local_path.strip():
             st.error("Enter a local video path.")
             st.stop()
-        with tempfile.TemporaryDirectory() as temp_root:
-            temp_root_path = Path(temp_root)
-            out_dir = temp_root_path / "outputs"
-            roi_mask_path = write_current_roi_mask(temp_root_path)
-            if roi_mask_enabled and roi_mask_path is None:
-                st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
-            with st.spinner("Rendering motion-only and overlay videos..."):
-                try:
-                    summary = run_detector(
-                        ["video", local_path.strip(), *common_cli_args(out_dir, roi_mask_path)]
-                    )
-                except Exception as exc:
-                    st.error(f"Detector failed: {type(exc).__name__}: {exc}")
-                    st.stop()
-            render_outputs(summary)
+        run_root = make_run_root()
+        out_dir = run_root / "outputs"
+        stop_file = run_root / "stop_requested"
+        st.session_state["active_stop_file"] = str(stop_file)
+        roi_mask_path = write_current_roi_mask(run_root)
+        if roi_mask_enabled and roi_mask_path is None:
+            st.warning("ROI mask is enabled, but no zones are defined. Running without ROI filtering.")
+        with st.spinner("Processing video..."):
+            try:
+                summary = run_detector(
+                    ["video", local_path.strip(), *common_cli_args(out_dir, roi_mask_path)],
+                    stop_file=stop_file,
+                )
+            except Exception as exc:
+                st.error(f"Detector failed: {type(exc).__name__}: {exc}")
+                st.stop()
+            finally:
+                st.session_state["active_stop_file"] = None
+        render_outputs(summary)
 
 
 with tabs[2]:

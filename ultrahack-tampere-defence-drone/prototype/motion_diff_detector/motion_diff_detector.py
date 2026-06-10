@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -21,6 +22,7 @@ DEFAULT_SEMANTIC_MODEL_REPO = "devanshty/WingID"
 DEFAULT_SEMANTIC_MODEL_FILE = "yolo11l.pt"
 PROGRESS_PREFIX = "PROGRESS "
 SEMANTIC_ACTIONS = {"reject", "penalize"}
+STOP_REQUESTED = False
 SEMANTIC_LABEL_ALIASES = {
     "human": "person",
     "person": "person",
@@ -44,6 +46,9 @@ class MotionConfig:
     shake_min_shift: float = 1.5
     shake_consensus: float = 0.72
     shake_consensus_px: float = 2.0
+    shake_frame_stride: int = 1
+    shake_analysis_scale: float = 1.0
+    shake_max_corners: int = 240
     hysteresis: bool = False
     hysteresis_high_threshold: int = 36
     temporal_filter: bool = False
@@ -72,6 +77,9 @@ class MotionConfig:
             shake_min_shift=max(0.0, float(self.shake_min_shift)),
             shake_consensus=float(np.clip(self.shake_consensus, 0.0, 1.0)),
             shake_consensus_px=max(0.1, float(self.shake_consensus_px)),
+            shake_frame_stride=max(1, int(self.shake_frame_stride)),
+            shake_analysis_scale=float(np.clip(self.shake_analysis_scale, 0.10, 1.0)),
+            shake_max_corners=max(12, int(self.shake_max_corners)),
             hysteresis=bool(self.hysteresis),
             hysteresis_high_threshold=int(
                 np.clip(max(diff_threshold, int(self.hysteresis_high_threshold)), 1, 255)
@@ -119,6 +127,8 @@ class SemanticConfig:
     device: str | None = None
     frame_stride: int = 2
     overlap_threshold: float = 0.15
+    warmup: bool = False
+    motion_gate: bool = False
 
     def normalized(self) -> "SemanticConfig":
         labels = tuple(
@@ -143,6 +153,8 @@ class SemanticConfig:
             device=device or None,
             frame_stride=max(1, int(self.frame_stride)),
             overlap_threshold=float(np.clip(self.overlap_threshold, 0.0, 1.0)),
+            warmup=bool(self.warmup),
+            motion_gate=bool(self.motion_gate),
         )
 
 
@@ -264,6 +276,8 @@ class MotionAnalysis:
     global_dy: float = 0.0
     global_consensus: float = 0.0
     tracked_vectors: int = 0
+    shake_estimated: bool = False
+    shake_reused: bool = False
     raw_detection_count: int = 0
     roi_rejected_count: int = 0
     roi_penalized_count: int = 0
@@ -589,6 +603,9 @@ class SemanticDetector:
     def __init__(self, config: SemanticConfig):
         self.config = config.normalized()
         self.last_detections: list[SemanticDetection] = []
+        self.inference_count = 0
+        self.skipped_count = 0
+        self.last_inference_ran = False
         try:
             from huggingface_hub import hf_hub_download
             from ultralytics import YOLO
@@ -608,8 +625,24 @@ class SemanticDetector:
         self.weights_path = weights_path
         self.model = YOLO(str(weights_path))
 
+    def warmup(self, width: int, height: int) -> None:
+        warmup_frame = np.zeros((max(1, height), max(1, width), 3), dtype=np.uint8)
+        predict_kwargs: dict[str, Any] = {
+            "conf": self.config.confidence,
+            "iou": self.config.iou,
+            "imgsz": self.config.image_size,
+            "verbose": False,
+        }
+        if self.config.device is not None:
+            predict_kwargs["device"] = self.config.device
+        self.model.predict(warmup_frame, **predict_kwargs)
+        self.last_detections = []
+        self.last_inference_ran = False
+
     def detect(self, frame_bgr: np.ndarray, frame_index: int) -> list[SemanticDetection]:
         if frame_index % self.config.frame_stride != 0:
+            self.skipped_count += 1
+            self.last_inference_ran = False
             return self.last_detections
 
         predict_kwargs: dict[str, Any] = {
@@ -622,6 +655,8 @@ class SemanticDetector:
             predict_kwargs["device"] = self.config.device
 
         results = self.model.predict(frame_bgr, **predict_kwargs)
+        self.inference_count += 1
+        self.last_inference_ran = True
         result = results[0]
         names = getattr(result, "names", {})
         boxes = getattr(result, "boxes", None)
@@ -877,7 +912,11 @@ def prepare_gray(frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
     return gray
 
 
-def cleanup_motion_mask(diff: np.ndarray, config: MotionConfig) -> np.ndarray:
+def cleanup_motion_mask(
+    diff: np.ndarray,
+    config: MotionConfig,
+    morph_kernel_matrix: np.ndarray | None = None,
+) -> np.ndarray:
     config = config.normalized()
     if config.hysteresis:
         _, low_mask = cv2.threshold(diff, config.diff_threshold, 255, cv2.THRESH_BINARY)
@@ -900,7 +939,11 @@ def cleanup_motion_mask(diff: np.ndarray, config: MotionConfig) -> np.ndarray:
     else:
         _, mask = cv2.threshold(diff, config.diff_threshold, 255, cv2.THRESH_BINARY)
     if config.morph_kernel > 1:
-        kernel = np.ones((config.morph_kernel, config.morph_kernel), dtype=np.uint8)
+        kernel = (
+            morph_kernel_matrix
+            if morph_kernel_matrix is not None
+            else np.ones((config.morph_kernel, config.morph_kernel), dtype=np.uint8)
+        )
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -912,10 +955,11 @@ def estimate_global_shift(
     current_gray: np.ndarray,
     min_vectors: int = 12,
     consensus_px: float = 2.0,
+    max_corners: int = 240,
 ) -> tuple[float, float, float, int]:
     points = cv2.goodFeaturesToTrack(
         previous_gray,
-        maxCorners=240,
+        maxCorners=max(12, int(max_corners)),
         qualityLevel=0.01,
         minDistance=12,
         blockSize=7,
@@ -946,6 +990,66 @@ def estimate_global_shift(
     return float(median[0]), float(median[1]), consensus, int(vectors.shape[0])
 
 
+@dataclass(frozen=True)
+class ShakeEstimate:
+    dx: float = 0.0
+    dy: float = 0.0
+    consensus: float = 0.0
+    tracked_vectors: int = 0
+    estimated: bool = False
+    reused: bool = False
+
+
+def resize_gray_for_shake(gray: np.ndarray, scale: float) -> np.ndarray:
+    if scale >= 0.999:
+        return gray
+    return cv2.resize(gray, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+
+def estimate_configured_global_shift(
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    config: MotionConfig,
+) -> ShakeEstimate:
+    config = config.normalized()
+    scale = config.shake_analysis_scale
+    previous_for_shift = resize_gray_for_shake(previous_gray, scale)
+    current_for_shift = resize_gray_for_shake(current_gray, scale)
+    dx, dy, consensus, tracked_vectors = estimate_global_shift(
+        previous_for_shift,
+        current_for_shift,
+        consensus_px=max(0.1, config.shake_consensus_px * scale),
+        max_corners=config.shake_max_corners,
+    )
+    if scale < 0.999:
+        dx /= scale
+        dy /= scale
+    return ShakeEstimate(
+        dx=dx,
+        dy=dy,
+        consensus=consensus,
+        tracked_vectors=tracked_vectors,
+        estimated=True,
+    )
+
+
+class ShakeEstimator:
+    def __init__(self, config: MotionConfig):
+        self.config = config.normalized()
+        self.last_estimate: ShakeEstimate | None = None
+        self.frames_until_estimate = 0
+
+    def estimate(self, previous_gray: np.ndarray, current_gray: np.ndarray) -> ShakeEstimate:
+        if self.last_estimate is not None and self.frames_until_estimate > 0:
+            self.frames_until_estimate -= 1
+            return replace(self.last_estimate, estimated=False, reused=True)
+
+        estimate = estimate_configured_global_shift(previous_gray, current_gray, self.config)
+        self.last_estimate = estimate
+        self.frames_until_estimate = max(0, self.config.shake_frame_stride - 1)
+        return estimate
+
+
 def analyze_gray_pair(
     previous_gray: np.ndarray,
     current_gray: np.ndarray,
@@ -956,7 +1060,10 @@ def analyze_gray_pair(
     semantic_detections: list[SemanticDetection] | None = None,
     semantic_config: SemanticConfig | None = None,
     motion_tracker: MotionTracker | None = None,
+    shake_estimator: ShakeEstimator | None = None,
     frame_index: int = 0,
+    build_mask: bool = True,
+    morph_kernel_matrix: np.ndarray | None = None,
 ) -> MotionAnalysis:
     config = config.normalized()
     semantic_detections = semantic_detections or []
@@ -966,12 +1073,20 @@ def analyze_gray_pair(
     global_consensus = 0.0
     tracked_vectors = 0
     global_motion_detected = False
+    shake_estimated = False
+    shake_reused = False
     if config.shake_protection:
-        global_dx, global_dy, global_consensus, tracked_vectors = estimate_global_shift(
-            previous_gray,
-            current_gray,
-            consensus_px=config.shake_consensus_px,
+        shake = (
+            shake_estimator.estimate(previous_gray, current_gray)
+            if shake_estimator is not None
+            else estimate_configured_global_shift(previous_gray, current_gray, config)
         )
+        global_dx = shake.dx
+        global_dy = shake.dy
+        global_consensus = shake.consensus
+        tracked_vectors = shake.tracked_vectors
+        shake_estimated = shake.estimated
+        shake_reused = shake.reused
         global_shift = float(np.hypot(global_dx, global_dy))
         global_motion_detected = (
             global_shift >= config.shake_min_shift
@@ -991,7 +1106,7 @@ def analyze_gray_pair(
             )
 
     diff = cv2.absdiff(current_gray, compare_gray)
-    raw_mask = cleanup_motion_mask(diff, config)
+    raw_mask = cleanup_motion_mask(diff, config, morph_kernel_matrix=morph_kernel_matrix)
     motion_ratio = float(np.count_nonzero(raw_mask) / max(1, raw_mask.size))
 
     global_motion_rejected = (
@@ -1008,6 +1123,8 @@ def analyze_gray_pair(
             global_dy,
             global_consensus,
             tracked_vectors,
+            shake_estimated=shake_estimated,
+            shake_reused=shake_reused,
             semantic_detections=semantic_detections,
             semantic_detection_count=len(semantic_detections),
         )
@@ -1083,8 +1200,9 @@ def analyze_gray_pair(
         unconfirmed_rejected_count = track_filter_result.unconfirmed_rejected_count
         direction_rejected_count = track_filter_result.direction_rejected_count
 
-    for _detection, contour in kept_candidates:
-        cv2.drawContours(accepted_mask, [contour], -1, 255, thickness=cv2.FILLED)
+    if build_mask:
+        for _detection, contour in kept_candidates:
+            cv2.drawContours(accepted_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
     detections = [detection for detection, _contour in kept_candidates]
     detections.sort(key=lambda detection: detection.area, reverse=True)
@@ -1098,6 +1216,8 @@ def analyze_gray_pair(
         global_dy,
         global_consensus,
         tracked_vectors,
+        shake_estimated,
+        shake_reused,
         len(raw_candidates),
         roi_rejected_count,
         roi_penalized_count,
@@ -1281,6 +1401,9 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "shake_min_shift": config.shake_min_shift,
         "shake_consensus": config.shake_consensus,
         "shake_consensus_px": config.shake_consensus_px,
+        "shake_frame_stride": config.shake_frame_stride,
+        "shake_analysis_scale": config.shake_analysis_scale,
+        "shake_max_corners": config.shake_max_corners,
         "hysteresis": config.hysteresis,
         "hysteresis_high_threshold": config.hysteresis_high_threshold,
         "temporal_filter": config.temporal_filter,
@@ -1312,7 +1435,21 @@ def serialize_semantic_config(config: SemanticConfig) -> dict[str, Any]:
         "device": config.device,
         "frame_stride": config.frame_stride,
         "overlap_threshold": config.overlap_threshold,
+        "warmup": config.warmup,
+        "motion_gate": config.motion_gate,
     }
+
+
+def request_stop(_signum: int, _frame: Any) -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+
+
+def stop_requested(args: argparse.Namespace) -> bool:
+    if STOP_REQUESTED:
+        return True
+    stop_file = getattr(args, "stop_file", None)
+    return bool(stop_file and Path(stop_file).exists())
 
 
 def emit_progress(args: argparse.Namespace, stage: str, **payload: Any) -> None:
@@ -1331,21 +1468,25 @@ def progress_payload(
     started_at: float,
     processed_frames: int,
     total_frames: int,
+    recent_frames: int | None = None,
+    recent_elapsed_s: float | None = None,
     **payload: Any,
 ) -> dict[str, Any]:
     elapsed_s = max(0.0, time.time() - started_at)
     processing_fps = processed_frames / elapsed_s if elapsed_s > 0.0 else 0.0
+    recent_fps = (
+        recent_frames / recent_elapsed_s
+        if recent_frames is not None and recent_elapsed_s is not None and recent_elapsed_s > 0.0
+        else None
+    )
     if total_frames > 0:
         remaining_frames = max(0, total_frames - processed_frames)
         progress = float(np.clip(processed_frames / float(total_frames), 0.0, 1.0))
     else:
         remaining_frames = None
         progress = None
-    eta_s = (
-        remaining_frames / processing_fps
-        if remaining_frames is not None and processing_fps > 0.0
-        else None
-    )
+    eta_fps = recent_fps if recent_fps is not None and recent_fps > 0.0 else processing_fps
+    eta_s = remaining_frames / eta_fps if remaining_frames is not None and eta_fps > 0.0 else None
     return {
         "processed_frames": int(processed_frames),
         "total_frames": int(total_frames),
@@ -1354,9 +1495,23 @@ def progress_payload(
         "elapsed_s": round(elapsed_s, 3),
         "eta_s": round(eta_s, 3) if eta_s is not None else None,
         "processing_fps": round(processing_fps, 3),
+        "average_fps": round(processing_fps, 3),
+        "recent_fps": round(recent_fps, 3) if recent_fps is not None else None,
         "processing_ms_per_frame": (
             round((elapsed_s / max(1, processed_frames)) * 1000.0, 3)
             if processed_frames > 0
+            else None
+        ),
+        "average_ms_per_frame": (
+            round((elapsed_s / max(1, processed_frames)) * 1000.0, 3)
+            if processed_frames > 0
+            else None
+        ),
+        "recent_ms_per_frame": (
+            round((recent_elapsed_s / max(1, recent_frames)) * 1000.0, 3)
+            if recent_frames is not None
+            and recent_elapsed_s is not None
+            and recent_frames > 0
             else None
         ),
         **payload,
@@ -1385,6 +1540,14 @@ def open_video_writer(path: Path, fps: float, width: int, height: int) -> cv2.Vi
 
 
 def process_video(args: argparse.Namespace) -> dict[str, Any]:
+    global STOP_REQUESTED
+    STOP_REQUESTED = False
+    try:
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+    except ValueError:
+        pass
+
     run_started_at = time.time()
     source = Path(args.path)
     if not source.exists():
@@ -1402,6 +1565,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         shake_min_shift=args.shake_min_shift,
         shake_consensus=args.shake_consensus,
         shake_consensus_px=args.shake_consensus_px,
+        shake_frame_stride=args.shake_frame_stride,
+        shake_analysis_scale=args.shake_analysis_scale,
+        shake_max_corners=args.shake_max_corners,
         hysteresis=args.enable_hysteresis,
         hysteresis_high_threshold=args.hysteresis_high_threshold,
         temporal_filter=args.enable_temporal_filter,
@@ -1431,8 +1597,15 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         device=args.semantic_device,
         frame_stride=args.semantic_frame_stride,
         overlap_threshold=args.semantic_overlap_threshold,
+        warmup=args.semantic_warmup,
+        motion_gate=args.semantic_motion_gate,
     ).normalized()
     out_dir = make_output_dir(args.out_dir)
+    write_motion_video = not args.no_motion_video
+    write_overlay_video = not args.no_overlay_video
+    write_jsonl = not args.no_jsonl
+    start_frame = max(0, int(args.start_frame))
+    max_frames = max(0, int(args.max_frames))
 
     emit_progress(
         args,
@@ -1452,6 +1625,13 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         capture.release()
         raise RuntimeError(f"Could not read video dimensions: {source}")
 
+    if start_frame > 0:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    target_frame_count = max(0, total_video_frames - start_frame) if total_video_frames > 0 else 0
+    if max_frames > 0:
+        target_frame_count = min(target_frame_count, max_frames) if target_frame_count > 0 else max_frames
+
     semantic_detector: SemanticDetector | None = None
     if semantic_config.enabled:
         emit_progress(
@@ -1461,7 +1641,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 "loading_semantic_model",
                 run_started_at,
                 0,
-                total_video_frames,
+                target_frame_count,
                 message="Loading semantic model weights.",
                 model_repo=semantic_config.model_repo,
                 model_file=semantic_config.model_file,
@@ -1479,19 +1659,50 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 "semantic_model_ready",
                 run_started_at,
                 0,
-                total_video_frames,
+                target_frame_count,
                 message="Semantic model loaded.",
                 weights_path=str(semantic_detector.weights_path),
             ),
         )
+        if semantic_config.warmup:
+            emit_progress(
+                args,
+                "warming_semantic_model",
+                **progress_payload(
+                    "warming_semantic_model",
+                    run_started_at,
+                    0,
+                    target_frame_count,
+                    message="Warming semantic model before timed frame processing.",
+                ),
+            )
+            semantic_detector.warmup(width, height)
+            emit_progress(
+                args,
+                "semantic_model_warm",
+                **progress_payload(
+                    "semantic_model_warm",
+                    run_started_at,
+                    0,
+                    target_frame_count,
+                    message="Semantic model warmup complete.",
+                ),
+            )
 
     motion_only_path = out_dir / f"{source.stem}_motion_only.mp4"
     overlay_path = out_dir / f"{source.stem}_motion_overlay.mp4"
     jsonl_path = out_dir / "motion_detections.jsonl"
     summary_path = out_dir / "summary.json"
 
-    motion_writer = open_video_writer(motion_only_path, fps, width, height)
-    overlay_writer = open_video_writer(overlay_path, fps, width, height)
+    motion_writer = open_video_writer(motion_only_path, fps, width, height) if write_motion_video else None
+    overlay_writer = open_video_writer(overlay_path, fps, width, height) if write_overlay_video else None
+    jsonl = jsonl_path.open("w", encoding="utf-8") if write_jsonl else None
+    shake_estimator = ShakeEstimator(config) if config.shake_protection else None
+    morph_kernel_matrix = (
+        np.ones((config.morph_kernel, config.morph_kernel), dtype=np.uint8)
+        if config.morph_kernel > 1
+        else None
+    )
 
     previous_gray: np.ndarray | None = None
     trail_masks: list[np.ndarray] = []
@@ -1510,99 +1721,154 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     total_direction_rejected = 0
     rejected_frame_count = 0
     global_motion_detected_count = 0
-    last_progress_at = 0.0
+    shake_estimated_count = 0
+    shake_reused_count = 0
+    previous_raw_detection_count = 0
+    stopped_early = False
     progress_interval_s = max(0.1, float(args.progress_interval))
     processing_started_at = time.time()
+    last_progress_at = processing_started_at
+    last_progress_frame = 0
+
+    def make_progress(
+        stage: str,
+        message: str,
+        recent_frames: int | None = None,
+        recent_elapsed_s: float | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        semantic_inference_count = semantic_detector.inference_count if semantic_detector else 0
+        semantic_skipped_count = semantic_detector.skipped_count if semantic_detector else 0
+        return progress_payload(
+            stage,
+            processing_started_at,
+            frame_index,
+            target_frame_count,
+            recent_frames=recent_frames,
+            recent_elapsed_s=recent_elapsed_s,
+            message=message,
+            frames_with_motion=frames_with_motion,
+            raw_detection_count=total_raw_detections,
+            kept_detection_count=total_detections,
+            roi_rejected_count=total_roi_rejected,
+            semantic_rejected_count=total_semantic_rejected,
+            temporal_rejected_count=total_temporal_rejected,
+            shake_estimated_count=shake_estimated_count,
+            shake_reused_count=shake_reused_count,
+            semantic_inference_count=semantic_inference_count,
+            semantic_skipped_count=semantic_skipped_count,
+            stopped_early=stopped_early,
+            **extra,
+        )
 
     emit_progress(
         args,
         "processing",
-        **progress_payload(
-            "processing",
-            processing_started_at,
-            0,
-            total_video_frames,
-            message="Processing video frames.",
-        ),
+        **make_progress("processing", "Processing video frames."),
     )
 
     try:
-        with jsonl_path.open("w", encoding="utf-8") as jsonl:
-            while True:
-                ok, frame = capture.read()
-                if not ok:
-                    break
+        while True:
+            if max_frames > 0 and frame_index >= max_frames:
+                stopped_early = total_video_frames == 0 or start_frame + frame_index < total_video_frames
+                break
+            if stop_requested(args):
+                stopped_early = True
+                break
 
-                timestamp_s = frame_index / max(fps, 0.001)
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            source_frame_index = start_frame + frame_index
+            timestamp_s = source_frame_index / max(fps, 0.001)
+            current_gray = prepare_gray(frame, config)
+
+            should_run_semantic = semantic_detector is not None
+            if semantic_detector is not None and semantic_config.motion_gate:
+                should_run_semantic = previous_gray is not None and previous_raw_detection_count > 0
+            if should_run_semantic and semantic_detector is not None:
                 semantic_detections = (
-                    semantic_detector.detect(frame, frame_index)
-                    if semantic_detector is not None
-                    else []
+                    semantic_detector.detect(frame, source_frame_index)
                 )
-                current_gray = prepare_gray(frame, config)
+            else:
+                semantic_detections = []
+                if semantic_detector is not None:
+                    semantic_detector.skipped_count += 1
 
-                if previous_gray is None:
-                    accepted_mask = np.zeros_like(current_gray)
-                    detections: list[MotionDetection] = []
-                    motion_ratio = 0.0
-                    global_motion_rejected = False
-                    global_motion_detected = False
-                    global_dx = 0.0
-                    global_dy = 0.0
-                    global_consensus = 0.0
-                    tracked_vectors = 0
-                    raw_detection_count = 0
-                    roi_rejected_count = 0
-                    roi_penalized_count = 0
-                    semantic_detection_count = len(semantic_detections)
-                    semantic_rejected_count = 0
-                    semantic_penalized_count = 0
-                    temporal_rejected_count = 0
-                    unconfirmed_rejected_count = 0
-                    direction_rejected_count = 0
-                else:
-                    analysis = analyze_gray_pair(
-                        previous_gray,
-                        current_gray,
-                        config,
-                        image_width=width,
-                        image_height=height,
-                        roi_mask=roi_mask,
-                        semantic_detections=semantic_detections,
-                        semantic_config=semantic_config,
-                        motion_tracker=motion_tracker,
-                        frame_index=frame_index,
-                    )
-                    accepted_mask = analysis.accepted_mask
-                    detections = analysis.detections
-                    motion_ratio = analysis.motion_ratio
-                    global_motion_rejected = analysis.global_motion_rejected
-                    global_motion_detected = analysis.global_motion_detected
-                    global_dx = analysis.global_dx
-                    global_dy = analysis.global_dy
-                    global_consensus = analysis.global_consensus
-                    tracked_vectors = analysis.tracked_vectors
-                    raw_detection_count = analysis.raw_detection_count
-                    roi_rejected_count = analysis.roi_rejected_count
-                    roi_penalized_count = analysis.roi_penalized_count
-                    semantic_detections = analysis.semantic_detections
-                    semantic_detection_count = analysis.semantic_detection_count
-                    semantic_rejected_count = analysis.semantic_rejected_count
-                    semantic_penalized_count = analysis.semantic_penalized_count
-                    temporal_rejected_count = analysis.temporal_rejected_count
-                    unconfirmed_rejected_count = analysis.unconfirmed_rejected_count
-                    direction_rejected_count = analysis.direction_rejected_count
+            if previous_gray is None:
+                accepted_mask = np.zeros_like(current_gray)
+                detections: list[MotionDetection] = []
+                motion_ratio = 0.0
+                global_motion_rejected = False
+                global_motion_detected = False
+                global_dx = 0.0
+                global_dy = 0.0
+                global_consensus = 0.0
+                tracked_vectors = 0
+                shake_estimated = False
+                shake_reused = False
+                raw_detection_count = 0
+                roi_rejected_count = 0
+                roi_penalized_count = 0
+                semantic_detection_count = len(semantic_detections)
+                semantic_rejected_count = 0
+                semantic_penalized_count = 0
+                temporal_rejected_count = 0
+                unconfirmed_rejected_count = 0
+                direction_rejected_count = 0
+            else:
+                analysis = analyze_gray_pair(
+                    previous_gray,
+                    current_gray,
+                    config,
+                    image_width=width,
+                    image_height=height,
+                    roi_mask=roi_mask,
+                    semantic_detections=semantic_detections,
+                    semantic_config=semantic_config,
+                    motion_tracker=motion_tracker,
+                    shake_estimator=shake_estimator,
+                    frame_index=source_frame_index,
+                    build_mask=write_motion_video,
+                    morph_kernel_matrix=morph_kernel_matrix,
+                )
+                accepted_mask = analysis.accepted_mask
+                detections = analysis.detections
+                motion_ratio = analysis.motion_ratio
+                global_motion_rejected = analysis.global_motion_rejected
+                global_motion_detected = analysis.global_motion_detected
+                global_dx = analysis.global_dx
+                global_dy = analysis.global_dy
+                global_consensus = analysis.global_consensus
+                tracked_vectors = analysis.tracked_vectors
+                shake_estimated = analysis.shake_estimated
+                shake_reused = analysis.shake_reused
+                raw_detection_count = analysis.raw_detection_count
+                roi_rejected_count = analysis.roi_rejected_count
+                roi_penalized_count = analysis.roi_penalized_count
+                semantic_detections = analysis.semantic_detections
+                semantic_detection_count = analysis.semantic_detection_count
+                semantic_rejected_count = analysis.semantic_rejected_count
+                semantic_penalized_count = analysis.semantic_penalized_count
+                temporal_rejected_count = analysis.temporal_rejected_count
+                unconfirmed_rejected_count = analysis.unconfirmed_rejected_count
+                direction_rejected_count = analysis.direction_rejected_count
 
+            if global_motion_rejected:
+                rejected_frame_count += 1
+                motion_tracker.reset()
+            if write_motion_video:
                 if global_motion_rejected:
-                    rejected_frame_count += 1
-                    motion_tracker.reset()
                     trail_masks = [np.zeros_like(accepted_mask)]
                 else:
                     trail_masks.append(accepted_mask)
                     trail_masks = trail_masks[-max_trail_masks:]
-
                 trail_mask = combine_trail_masks(trail_masks)
+                assert motion_writer is not None
                 motion_writer.write(render_motion_only(frame, trail_mask))
+            if write_overlay_video:
+                assert overlay_writer is not None
                 overlay_writer.write(
                     render_overlay(
                         frame_bgr=frame,
@@ -1626,24 +1892,29 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 )
 
-                total_raw_detections += raw_detection_count
-                total_roi_rejected += roi_rejected_count
-                total_roi_penalized += roi_penalized_count
-                total_semantic_detections += semantic_detection_count
-                total_semantic_rejected += semantic_rejected_count
-                total_semantic_penalized += semantic_penalized_count
-                total_temporal_rejected += temporal_rejected_count
-                total_unconfirmed_rejected += unconfirmed_rejected_count
-                total_direction_rejected += direction_rejected_count
-                if detections:
-                    frames_with_motion += 1
-                    total_detections += len(detections)
-                if global_motion_detected:
-                    global_motion_detected_count += 1
+            total_raw_detections += raw_detection_count
+            total_roi_rejected += roi_rejected_count
+            total_roi_penalized += roi_penalized_count
+            total_semantic_detections += semantic_detection_count
+            total_semantic_rejected += semantic_rejected_count
+            total_semantic_penalized += semantic_penalized_count
+            total_temporal_rejected += temporal_rejected_count
+            total_unconfirmed_rejected += unconfirmed_rejected_count
+            total_direction_rejected += direction_rejected_count
+            if shake_estimated:
+                shake_estimated_count += 1
+            if shake_reused:
+                shake_reused_count += 1
+            if detections:
+                frames_with_motion += 1
+                total_detections += len(detections)
+            if global_motion_detected:
+                global_motion_detected_count += 1
 
+            if jsonl is not None:
                 record = MotionFrameResult(
                     source=str(source),
-                    frame_index=frame_index,
+                    frame_index=source_frame_index,
                     timestamp_s=timestamp_s,
                     image_width=width,
                     image_height=height,
@@ -1668,61 +1939,55 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 jsonl.write(json.dumps(record.to_json_dict(), separators=(",", ":")) + "\n")
 
-                previous_gray = current_gray
-                frame_index += 1
-                now = time.time()
-                should_emit_progress = (
-                    args.progress_json
-                    and (
-                        now - last_progress_at >= progress_interval_s
-                        or (
-                            total_video_frames > 0
-                            and frame_index >= total_video_frames
-                        )
+            previous_raw_detection_count = raw_detection_count
+            previous_gray = current_gray
+            frame_index += 1
+            now = time.time()
+            should_emit_progress = (
+                args.progress_json
+                and (
+                    now - last_progress_at >= progress_interval_s
+                    or (
+                        target_frame_count > 0
+                        and frame_index >= target_frame_count
                     )
                 )
-                if should_emit_progress:
-                    emit_progress(
-                        args,
-                        "processing",
-                        **progress_payload(
-                            "processing",
-                            processing_started_at,
-                            frame_index,
-                            total_video_frames,
-                            message="Processing video frames.",
-                            frames_with_motion=frames_with_motion,
-                            raw_detection_count=total_raw_detections,
-                            kept_detection_count=total_detections,
-                            roi_rejected_count=total_roi_rejected,
-                            semantic_rejected_count=total_semantic_rejected,
-                            temporal_rejected_count=total_temporal_rejected,
-                        ),
-                    )
-                    last_progress_at = now
-            emit_progress(
-                args,
-                "finalizing",
-                **progress_payload(
-                    "finalizing",
-                    processing_started_at,
-                    frame_index,
-                    total_video_frames,
-                    message="Finalizing output videos and summaries.",
-                    frames_with_motion=frames_with_motion,
-                    raw_detection_count=total_raw_detections,
-                    kept_detection_count=total_detections,
-                    roi_rejected_count=total_roi_rejected,
-                    semantic_rejected_count=total_semantic_rejected,
-                    temporal_rejected_count=total_temporal_rejected,
-                ),
             )
-    finally:
-        capture.release()
-        motion_writer.release()
-        overlay_writer.release()
+            if should_emit_progress:
+                emit_progress(
+                    args,
+                    "processing",
+                    **make_progress(
+                        "processing",
+                        "Processing video frames.",
+                        recent_frames=frame_index - last_progress_frame,
+                        recent_elapsed_s=now - last_progress_at,
+                    ),
+                )
+                last_progress_at = now
+                last_progress_frame = frame_index
 
-    if frame_index == 0:
+        now = time.time()
+        emit_progress(
+            args,
+            "finalizing",
+            **make_progress(
+                "finalizing",
+                "Finalizing output videos and summaries.",
+                recent_frames=frame_index - last_progress_frame,
+                recent_elapsed_s=now - last_progress_at,
+            ),
+        )
+    finally:
+        if jsonl is not None:
+            jsonl.close()
+        capture.release()
+        if motion_writer is not None:
+            motion_writer.release()
+        if overlay_writer is not None:
+            overlay_writer.release()
+
+    if frame_index == 0 and not stopped_early:
         raise RuntimeError(f"No frames were read from video: {source}")
 
     processing_seconds = time.time() - processing_started_at
@@ -1734,6 +1999,13 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "image_height": height,
         "fps": fps,
         "frame_count": frame_index,
+        "source_total_frames": total_video_frames,
+        "target_frame_count": target_frame_count,
+        "start_frame": start_frame,
+        "end_frame": start_frame + frame_index - 1 if frame_index > 0 else None,
+        "requested_max_frames": max_frames or None,
+        "stopped_early": stopped_early,
+        "stop_reason": "stop_requested" if stopped_early and stop_requested(args) else ("frame_limit" if stopped_early else "completed"),
         "duration_s": frame_index / max(fps, 0.001),
         "frames_with_motion": frames_with_motion,
         "detection_count": total_detections,
@@ -1749,6 +2021,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "kept_detection_count": total_detections,
         "global_motion_rejected_frames": rejected_frame_count,
         "global_motion_detected_frames": global_motion_detected_count,
+        "shake_estimated_frames": shake_estimated_count,
+        "shake_reused_frames": shake_reused_count,
         "processing_seconds": round(processing_seconds, 3),
         "processing_seconds_per_frame": round(processing_seconds_per_frame, 6),
         "processing_ms_per_frame": round(processing_seconds_per_frame * 1000.0, 3),
@@ -1762,29 +2036,28 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "semantic_filter": {
             **serialize_semantic_config(semantic_config),
             "weights_path": str(semantic_detector.weights_path) if semantic_detector else None,
+            "inference_count": semantic_detector.inference_count if semantic_detector else 0,
+            "skipped_count": semantic_detector.skipped_count if semantic_detector else 0,
         },
-        "motion_only_path": str(motion_only_path),
-        "overlay_path": str(overlay_path),
-        "jsonl_path": str(jsonl_path),
+        "outputs": {
+            "motion_video": write_motion_video,
+            "overlay_video": write_overlay_video,
+            "jsonl": write_jsonl,
+        },
+        "motion_only_path": str(motion_only_path) if write_motion_video else None,
+        "overlay_path": str(overlay_path) if write_overlay_video else None,
+        "jsonl_path": str(jsonl_path) if write_jsonl else None,
         "summary_path": str(summary_path),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    final_stage = "stopped" if stopped_early else "complete"
     emit_progress(
         args,
-        "complete",
-        **progress_payload(
-            "complete",
-            processing_started_at,
-            frame_index,
-            total_video_frames,
-            message="Processing complete.",
-            frames_with_motion=frames_with_motion,
-            raw_detection_count=total_raw_detections,
-            kept_detection_count=total_detections,
-            roi_rejected_count=total_roi_rejected,
-            semantic_rejected_count=total_semantic_rejected,
-            temporal_rejected_count=total_temporal_rejected,
-            overlay_path=str(overlay_path),
+        final_stage,
+        **make_progress(
+            final_stage,
+            "Processing stopped early." if stopped_early else "Processing complete.",
+            overlay_path=str(overlay_path) if write_overlay_video else None,
             summary_path=str(summary_path),
         ),
     )
@@ -1808,6 +2081,9 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--shake-min-shift", type=float, default=1.5 if not duplicate else default)
     parser.add_argument("--shake-consensus", type=float, default=0.72 if not duplicate else default)
     parser.add_argument("--shake-consensus-px", type=float, default=2.0 if not duplicate else default)
+    parser.add_argument("--shake-frame-stride", type=int, default=1 if not duplicate else default)
+    parser.add_argument("--shake-analysis-scale", type=float, default=1.0 if not duplicate else default)
+    parser.add_argument("--shake-max-corners", type=int, default=240 if not duplicate else default)
     parser.add_argument(
         "--enable-hysteresis",
         action="store_true",
@@ -1882,12 +2158,54 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--semantic-device", default=default, help="Ultralytics device, e.g. mps or cpu.")
     parser.add_argument("--semantic-frame-stride", type=int, default=2 if not duplicate else default)
     parser.add_argument(
+        "--semantic-warmup",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Run one untimed warmup inference before processing video frames.",
+    )
+    parser.add_argument(
+        "--semantic-motion-gate",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Skip semantic inference while the previous frame had no raw motion candidates.",
+    )
+    parser.add_argument(
         "--semantic-overlap-threshold",
         type=float,
         default=0.15 if not duplicate else default,
         help="Reject when semantic-box intersection covers this fraction of the motion box.",
     )
     parser.add_argument("--out-dir", default=default)
+    parser.add_argument(
+        "--no-motion-video",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Skip writing the motion-only debug MP4.",
+    )
+    parser.add_argument(
+        "--no-overlay-video",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Skip writing the annotated overlay MP4.",
+    )
+    parser.add_argument(
+        "--no-jsonl",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Skip writing per-frame detections JSONL.",
+    )
+    parser.add_argument("--start-frame", type=int, default=0 if not duplicate else default)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0 if not duplicate else default,
+        help="Maximum frames to process. 0 means process to the end.",
+    )
+    parser.add_argument(
+        "--stop-file",
+        default=default,
+        help="If this file appears during processing, stop gracefully and finalize partial outputs.",
+    )
     parser.add_argument(
         "--json",
         action="store_true",
