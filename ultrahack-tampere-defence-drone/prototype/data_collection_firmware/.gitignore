@@ -1,0 +1,10 @@
+outputs/
+.venv*/
+__pycache__/
+.pytest_cache/
+*.log
+*.mp4
+*.wav
+*.jsonl
+streamlit.log
+run_*/
