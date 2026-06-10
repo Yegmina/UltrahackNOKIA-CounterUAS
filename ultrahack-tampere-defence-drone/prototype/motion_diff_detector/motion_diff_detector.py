@@ -19,6 +19,7 @@ ROI_ZONE_TYPES = {"ignore", "penalty", "flight"}
 ROI_MASK_MODES = {"fixed", "handheld"}
 DEFAULT_SEMANTIC_MODEL_REPO = "devanshty/WingID"
 DEFAULT_SEMANTIC_MODEL_FILE = "yolo11l.pt"
+PROGRESS_PREFIX = "PROGRESS "
 SEMANTIC_ACTIONS = {"reject", "penalize"}
 SEMANTIC_LABEL_ALIASES = {
     "human": "person",
@@ -1314,6 +1315,54 @@ def serialize_semantic_config(config: SemanticConfig) -> dict[str, Any]:
     }
 
 
+def emit_progress(args: argparse.Namespace, stage: str, **payload: Any) -> None:
+    if not getattr(args, "progress_json", False):
+        return
+    record = {"type": "progress", "stage": stage, **payload}
+    print(
+        f"{PROGRESS_PREFIX}{json.dumps(record, separators=(',', ':'))}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def progress_payload(
+    stage: str,
+    started_at: float,
+    processed_frames: int,
+    total_frames: int,
+    **payload: Any,
+) -> dict[str, Any]:
+    elapsed_s = max(0.0, time.time() - started_at)
+    processing_fps = processed_frames / elapsed_s if elapsed_s > 0.0 else 0.0
+    if total_frames > 0:
+        remaining_frames = max(0, total_frames - processed_frames)
+        progress = float(np.clip(processed_frames / float(total_frames), 0.0, 1.0))
+    else:
+        remaining_frames = None
+        progress = None
+    eta_s = (
+        remaining_frames / processing_fps
+        if remaining_frames is not None and processing_fps > 0.0
+        else None
+    )
+    return {
+        "processed_frames": int(processed_frames),
+        "total_frames": int(total_frames),
+        "remaining_frames": remaining_frames,
+        "progress": round(progress, 6) if progress is not None else None,
+        "elapsed_s": round(elapsed_s, 3),
+        "eta_s": round(eta_s, 3) if eta_s is not None else None,
+        "processing_fps": round(processing_fps, 3),
+        "processing_ms_per_frame": (
+            round((elapsed_s / max(1, processed_frames)) * 1000.0, 3)
+            if processed_frames > 0
+            else None
+        ),
+        **payload,
+    }
+
+
 def make_output_dir(out_dir: str | None) -> Path:
     if out_dir:
         path = Path(out_dir)
@@ -1336,6 +1385,7 @@ def open_video_writer(path: Path, fps: float, width: int, height: int) -> cv2.Vi
 
 
 def process_video(args: argparse.Namespace) -> dict[str, Any]:
+    run_started_at = time.time()
     source = Path(args.path)
     if not source.exists():
         raise FileNotFoundError(f"Video not found: {source}")
@@ -1382,9 +1432,14 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         frame_stride=args.semantic_frame_stride,
         overlap_threshold=args.semantic_overlap_threshold,
     ).normalized()
-    semantic_detector = SemanticDetector(semantic_config) if semantic_config.enabled else None
     out_dir = make_output_dir(args.out_dir)
 
+    emit_progress(
+        args,
+        "opening_video",
+        message="Opening video and reading metadata.",
+        source=str(source),
+    )
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {source}")
@@ -1392,9 +1447,43 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 25.0)
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    total_video_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if width <= 0 or height <= 0:
         capture.release()
         raise RuntimeError(f"Could not read video dimensions: {source}")
+
+    semantic_detector: SemanticDetector | None = None
+    if semantic_config.enabled:
+        emit_progress(
+            args,
+            "loading_semantic_model",
+            **progress_payload(
+                "loading_semantic_model",
+                run_started_at,
+                0,
+                total_video_frames,
+                message="Loading semantic model weights.",
+                model_repo=semantic_config.model_repo,
+                model_file=semantic_config.model_file,
+            ),
+        )
+        try:
+            semantic_detector = SemanticDetector(semantic_config)
+        except Exception:
+            capture.release()
+            raise
+        emit_progress(
+            args,
+            "semantic_model_ready",
+            **progress_payload(
+                "semantic_model_ready",
+                run_started_at,
+                0,
+                total_video_frames,
+                message="Semantic model loaded.",
+                weights_path=str(semantic_detector.weights_path),
+            ),
+        )
 
     motion_only_path = out_dir / f"{source.stem}_motion_only.mp4"
     overlay_path = out_dir / f"{source.stem}_motion_overlay.mp4"
@@ -1421,7 +1510,21 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     total_direction_rejected = 0
     rejected_frame_count = 0
     global_motion_detected_count = 0
-    started_at = time.time()
+    last_progress_at = 0.0
+    progress_interval_s = max(0.1, float(args.progress_interval))
+    processing_started_at = time.time()
+
+    emit_progress(
+        args,
+        "processing",
+        **progress_payload(
+            "processing",
+            processing_started_at,
+            0,
+            total_video_frames,
+            message="Processing video frames.",
+        ),
+    )
 
     try:
         with jsonl_path.open("w", encoding="utf-8") as jsonl:
@@ -1567,6 +1670,53 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
 
                 previous_gray = current_gray
                 frame_index += 1
+                now = time.time()
+                should_emit_progress = (
+                    args.progress_json
+                    and (
+                        now - last_progress_at >= progress_interval_s
+                        or (
+                            total_video_frames > 0
+                            and frame_index >= total_video_frames
+                        )
+                    )
+                )
+                if should_emit_progress:
+                    emit_progress(
+                        args,
+                        "processing",
+                        **progress_payload(
+                            "processing",
+                            processing_started_at,
+                            frame_index,
+                            total_video_frames,
+                            message="Processing video frames.",
+                            frames_with_motion=frames_with_motion,
+                            raw_detection_count=total_raw_detections,
+                            kept_detection_count=total_detections,
+                            roi_rejected_count=total_roi_rejected,
+                            semantic_rejected_count=total_semantic_rejected,
+                            temporal_rejected_count=total_temporal_rejected,
+                        ),
+                    )
+                    last_progress_at = now
+            emit_progress(
+                args,
+                "finalizing",
+                **progress_payload(
+                    "finalizing",
+                    processing_started_at,
+                    frame_index,
+                    total_video_frames,
+                    message="Finalizing output videos and summaries.",
+                    frames_with_motion=frames_with_motion,
+                    raw_detection_count=total_raw_detections,
+                    kept_detection_count=total_detections,
+                    roi_rejected_count=total_roi_rejected,
+                    semantic_rejected_count=total_semantic_rejected,
+                    temporal_rejected_count=total_temporal_rejected,
+                ),
+            )
     finally:
         capture.release()
         motion_writer.release()
@@ -1575,7 +1725,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     if frame_index == 0:
         raise RuntimeError(f"No frames were read from video: {source}")
 
-    processing_seconds = time.time() - started_at
+    processing_seconds = time.time() - processing_started_at
     processing_seconds_per_frame = processing_seconds / max(1, frame_index)
     summary = {
         "mode": "video",
@@ -1619,6 +1769,25 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "summary_path": str(summary_path),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    emit_progress(
+        args,
+        "complete",
+        **progress_payload(
+            "complete",
+            processing_started_at,
+            frame_index,
+            total_video_frames,
+            message="Processing complete.",
+            frames_with_motion=frames_with_motion,
+            raw_detection_count=total_raw_detections,
+            kept_detection_count=total_detections,
+            roi_rejected_count=total_roi_rejected,
+            semantic_rejected_count=total_semantic_rejected,
+            temporal_rejected_count=total_temporal_rejected,
+            overlay_path=str(overlay_path),
+            summary_path=str(summary_path),
+        ),
+    )
     return summary
 
 
@@ -1724,6 +1893,18 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         action="store_true",
         default=False if not duplicate else default,
         help="Print machine-readable run summary.",
+    )
+    parser.add_argument(
+        "--progress-json",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Emit machine-readable progress events to stderr.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=1.0 if not duplicate else default,
+        help="Minimum seconds between progress events.",
     )
 
 

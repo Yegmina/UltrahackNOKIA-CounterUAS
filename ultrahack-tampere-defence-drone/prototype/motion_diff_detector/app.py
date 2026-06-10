@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - runtime dependency hint for Streamlit.
 SCRIPT_PATH = Path(__file__).with_name("motion_diff_detector.py")
 SAMPLE_PATH = Path.home() / "Downloads" / "fixedcameravideo_2026-06-10_00-10-22.mp4"
 UPLOAD_CACHE_ROOT = Path(tempfile.gettempdir()) / "motion_diff_detector_uploads"
+PROGRESS_PREFIX = "PROGRESS "
 
 
 st.set_page_config(page_title="Motion Diff Drone Detector", layout="wide")
@@ -473,22 +474,137 @@ def draw_roi_preview(
     return output
 
 
+def format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "estimating"
+    seconds = max(0, int(round(float(seconds))))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
+
+def progress_stage_label(stage: str) -> str:
+    return {
+        "opening_video": "Opening video",
+        "loading_semantic_model": "Loading AI model",
+        "semantic_model_ready": "AI model ready",
+        "processing": "Processing frames",
+        "finalizing": "Finalizing outputs",
+        "complete": "Complete",
+    }.get(stage, stage.replace("_", " ").title())
+
+
+def render_progress_event(event: dict, progress_bar, status_placeholder) -> None:
+    stage = str(event.get("stage", "processing"))
+    stage_label = progress_stage_label(stage)
+    processed = int(event.get("processed_frames") or 0)
+    total = int(event.get("total_frames") or 0)
+    progress = event.get("progress")
+    if progress is None:
+        progress_value = 0.0
+    else:
+        progress_value = float(np.clip(float(progress), 0.0, 1.0))
+    if stage == "complete":
+        progress_value = 1.0
+
+    if total > 0:
+        bar_text = f"{stage_label}: {processed}/{total} frames"
+    else:
+        bar_text = stage_label
+    progress_bar.progress(progress_value, text=bar_text)
+
+    eta = format_duration(event.get("eta_s"))
+    elapsed = format_duration(event.get("elapsed_s"))
+    fps = float(event.get("processing_fps") or 0.0)
+    ms_per_frame = event.get("processing_ms_per_frame")
+    if ms_per_frame is None:
+        speed_text = f"{fps:.1f} fps"
+    else:
+        speed_text = f"{fps:.1f} fps / {float(ms_per_frame):.1f} ms per frame"
+    remaining = event.get("remaining_frames")
+    remaining_text = f"{remaining} frames left" if remaining is not None else "frames left unknown"
+    counts = (
+        f"raw={event.get('raw_detection_count', 0)} "
+        f"kept={event.get('kept_detection_count', 0)} "
+        f"semantic rejected={event.get('semantic_rejected_count', 0)} "
+        f"ROI rejected={event.get('roi_rejected_count', 0)}"
+    )
+    status_placeholder.markdown(
+        f"**{stage_label}**  \n"
+        f"Elapsed `{elapsed}` · ETA `{eta}` · {remaining_text} · {speed_text}  \n"
+        f"`{counts}`"
+    )
+
+
 def run_detector(args: list[str]) -> dict:
-    completed = subprocess.run(
-        [sys.executable, str(SCRIPT_PATH), "--json", *args],
-        capture_output=True,
-        check=False,
+    progress_bar = st.progress(0.0, text="Starting detector...")
+    status_placeholder = st.empty()
+    command = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--json",
+        "--progress-json",
+        "--progress-interval",
+        "0.5",
+        *args,
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
         cwd=str(Path(__file__).parent),
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(detail or f"Detector exited with code {completed.returncode}.")
-    for line in reversed(completed.stdout.splitlines()):
-        line = line.strip()
+    lines: list[str] = []
+    summary: dict | None = None
+    if process.stdout is None:
+        raise RuntimeError("Detector did not expose progress output.")
+
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        lines.append(line)
+        if line.startswith(PROGRESS_PREFIX):
+            try:
+                event = json.loads(line[len(PROGRESS_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            render_progress_event(event, progress_bar, status_placeholder)
+            continue
         if line.startswith("{"):
-            return json.loads(line)
-    raise RuntimeError(completed.stdout.strip() or "Detector did not return JSON.")
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+
+    return_code = process.wait()
+    if return_code != 0:
+        detail_lines = [line for line in lines if not line.startswith(PROGRESS_PREFIX)]
+        detail = "\n".join(detail_lines[-12:])
+        raise RuntimeError(detail or f"Detector exited with code {return_code}.")
+
+    if summary is None:
+        for line in reversed(lines):
+            if line.startswith("{"):
+                summary = json.loads(line)
+                break
+    if summary is None:
+        raise RuntimeError("Detector did not return JSON.")
+
+    progress_bar.progress(1.0, text="Complete")
+    status_placeholder.markdown(
+        f"**Complete**  \n"
+        f"Processed `{summary['frame_count']}` frames in "
+        f"`{format_duration(summary.get('processing_seconds'))}` · "
+        f"`{summary.get('processing_ms_per_frame', 0.0)}` ms per frame"
+    )
+    return summary
 
 
 def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[str]:
