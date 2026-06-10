@@ -39,6 +39,38 @@ AIRPLANE_TYPES = (
     "glider",
     "unknown_airplane",
 )
+PERSON_TYPES = (
+    "standing_person",
+    "walking_person",
+    "running_person",
+    "crouching_person",
+    "group_of_people",
+    "unknown_person",
+)
+STATIC_OBSTACLE_TYPES = (
+    "building",
+    "tower",
+    "pole",
+    "wire",
+    "tree",
+    "fence",
+    "parked_vehicle",
+    "ground_structure",
+    "unknown_static_obstacle",
+)
+ALLOWED_CATEGORIES = ("drone", "airplane", "person", "static_obstacle")
+TYPE_BY_CATEGORY = {
+    "drone": DRONE_TYPES,
+    "airplane": AIRPLANE_TYPES,
+    "person": PERSON_TYPES,
+    "static_obstacle": STATIC_OBSTACLE_TYPES,
+}
+DEFAULT_TYPE_BY_CATEGORY = {
+    "drone": "unknown_drone",
+    "airplane": "unknown_airplane",
+    "person": "unknown_person",
+    "static_obstacle": "unknown_static_obstacle",
+}
 
 
 @dataclass(frozen=True)
@@ -248,12 +280,16 @@ def detection_from_raw(raw: Any, image_width: int, image_height: int) -> Detecti
         category = "drone"
     elif category in {"aircraft", "plane", "airplane_like", "aeroplane"}:
         category = "airplane"
-    if category not in {"drone", "airplane"}:
+    elif category in {"human", "people", "pedestrian", "person_like"}:
+        category = "person"
+    elif category in {"obstacle", "static_obstacle", "hazard", "structure", "fixed_obstacle"}:
+        category = "static_obstacle"
+    if category not in ALLOWED_CATEGORIES:
         return None
 
-    default_type = "unknown_drone" if category == "drone" else "unknown_airplane"
+    default_type = DEFAULT_TYPE_BY_CATEGORY[category]
     object_type = normalize_token(raw.get("type", raw.get("class_name", raw.get("class"))), default_type)
-    allowed_types = DRONE_TYPES if category == "drone" else AIRPLANE_TYPES
+    allowed_types = TYPE_BY_CATEGORY[category]
     if object_type not in allowed_types:
         object_type = default_type
 
@@ -328,8 +364,15 @@ def draw_boxes(image: Image.Image, detections: list[Detection]) -> Image.Image:
     font = ImageFont.load_default()
     line_width = max(2, int(round(min(annotated.size) / 240)))
 
+    colors = {
+        "drone": (0, 190, 255),
+        "airplane": (255, 176, 0),
+        "person": (80, 230, 120),
+        "static_obstacle": (255, 90, 150),
+    }
+
     for detection in detections:
-        color = (0, 190, 255) if detection.category == "drone" else (255, 176, 0)
+        color = colors.get(detection.category, (220, 220, 220))
         box = [
             int(round(detection.x1)),
             int(round(detection.y1)),
@@ -379,16 +422,18 @@ def build_prompt(
         "thermal_counter_uas": (
             "Perform a counter-UAS scan for small airborne objects in thermal-like imagery. "
             "Look for compact bright or dark silhouettes, rotor-arm shapes, fixed-wing UAV "
-            "outlines, and aircraft shapes against the sky or background."
+            "outlines, aircraft shapes against the sky or background, people in the operating "
+            "area, and fixed obstacles that could affect navigation or safety."
         ),
         "visible_daylight": (
-            "Perform a visible daylight scan for airborne drones and airplanes. Use shape, "
-            "scale, wing/rotor structure, blur trails, and sky/background separation."
+            "Perform a visible daylight scan for airborne drones and airplanes plus people "
+            "and distinct static obstacles. Use shape, scale, wing/rotor structure, human "
+            "body pose, obstacle geometry, blur trails, and sky/background separation."
         ),
         "low_light_or_noisy": (
             "Perform a tolerant scan for blurry, noisy, dim, compressed, low-resolution, or "
-            "partially occluded airborne drones and airplanes. Lower visual certainty should "
-            "be reflected as lower confidence."
+            "partially occluded drones, airplanes, people, and static obstacles. Lower visual "
+            "certainty should be reflected as lower confidence."
         ),
         "custom": (
             "Follow the fixed task and JSON schema below, then apply the custom operator "
@@ -406,16 +451,22 @@ def build_prompt(
 
     drone_types = ", ".join(DRONE_TYPES)
     airplane_types = ", ".join(AIRPLANE_TYPES)
+    person_types = ", ".join(PERSON_TYPES)
+    static_obstacle_types = ", ".join(STATIC_OBSTACLE_TYPES)
+    categories = ", ".join(ALLOWED_CATEGORIES)
 
     return f"""
 You are a custom edge computing VLA model used for visual target reasoning.
-Detect drones and airplanes only. Ignore birds, insects, clouds, trees, vehicles, people, buildings, and sensor artifacts unless the evidence strongly supports drone or airplane.
+Detect only these target categories: drones, airplanes, people, and static obstacles. Ignore birds, insects, clouds, shadows, reflections, and sensor artifacts unless the evidence strongly supports one of the allowed categories.
+Static obstacles means clearly visible fixed or effectively stationary hazards in the scene, such as structures, poles, wires, fences, trees, towers, or parked vehicles. Do not label the entire background as an obstacle; return only distinct obstacles that are useful for navigation, safety, or scene understanding.
 
 {polarity_text}
 {preset_text}
 
 Allowed drone types: {drone_types}.
 Allowed airplane types: {airplane_types}.
+Allowed person types: {person_types}.
+Allowed static_obstacle types: {static_obstacle_types}.
 
 Return JSON only, with no prose before or after it. Use this exact top-level shape:
 {{
@@ -433,11 +484,11 @@ Return JSON only, with no prose before or after it. Use this exact top-level sha
 
 Rules:
 - box_2d must be normalized 0..1000 integer or float coordinates in [ymin, xmin, ymax, xmax] order.
-- category must be exactly "drone" or "airplane".
-- type must be one allowed type for the category. Use unknown_drone or unknown_airplane when type is unclear.
+- category must be exactly one of: {categories}.
+- type must be one allowed type for the category. Use unknown_drone, unknown_airplane, unknown_person, or unknown_static_obstacle when type is unclear.
 - confidence must be a calibrated 0.0..1.0 probability.
-- Include only detections for drones and airplanes.
-- If no drones or airplanes are visible, return {{"detections": []}}.
+- Include only detections for drones, airplanes, people, and distinct static obstacles.
+- If none of those target categories are visible, return {{"detections": []}}.
 
 {custom_text}
 """.strip()

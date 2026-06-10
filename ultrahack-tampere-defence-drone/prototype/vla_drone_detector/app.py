@@ -24,8 +24,8 @@ SCRIPT_PATH = Path(__file__).with_name("vla_drone_detector.py")
 
 
 load_local_env()
-st.set_page_config(page_title="VLA Drone And Aircraft Classifier", layout="wide")
-st.title("VLA Drone And Aircraft Classifier")
+st.set_page_config(page_title="VLA Scene Target Classifier", layout="wide")
+st.title("VLA Scene Target Classifier")
 st.caption(f"Testing with a {MODEL_DISPLAY_NAME}.")
 
 with st.sidebar:

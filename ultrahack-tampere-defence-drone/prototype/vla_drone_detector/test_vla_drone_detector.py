@@ -66,16 +66,64 @@ def test_detection_from_raw_serializes_stable_fields() -> None:
     }
 
 
+def test_detection_from_raw_accepts_people_and_static_obstacles() -> None:
+    person = detection_from_raw(
+        {
+            "box_2d": [100, 100, 400, 250],
+            "confidence": 0.76,
+            "category": "people",
+            "type": "walking_person",
+        },
+        1000,
+        1000,
+    )
+    obstacle = detection_from_raw(
+        {
+            "box_2d": [500, 500, 900, 700],
+            "confidence": 0.82,
+            "category": "obstacle",
+            "type": "wire",
+        },
+        1000,
+        1000,
+    )
+
+    assert person is not None
+    assert person.category == "person"
+    assert person.type == "walking_person"
+    assert obstacle is not None
+    assert obstacle.category == "static_obstacle"
+    assert obstacle.type == "wire"
+
+
+def test_detection_from_raw_falls_back_for_unknown_category_types() -> None:
+    detection = detection_from_raw(
+        {
+            "box_2d": [100, 100, 400, 250],
+            "confidence": 0.76,
+            "category": "person",
+            "type": "pilot",
+        },
+        1000,
+        1000,
+    )
+
+    assert detection is not None
+    assert detection.type == "unknown_person"
+
+
 def test_confidence_threshold_filters_detections() -> None:
     detections = [
         Detection(0, 0, 10, 10, 5, 5, 0.2, "drone", "unknown_drone", "unknown", ""),
         Detection(0, 0, 10, 10, 5, 5, 0.8, "airplane", "jet_aircraft", "visible_rgb", ""),
+        Detection(0, 0, 10, 10, 5, 5, 0.7, "person", "standing_person", "visible_rgb", ""),
     ]
 
     filtered = filter_detections(detections, 0.5)
 
-    assert len(filtered) == 1
+    assert len(filtered) == 2
     assert filtered[0].type == "jet_aircraft"
+    assert filtered[1].type == "standing_person"
 
 
 def test_detections_from_response_filters_below_threshold() -> None:
@@ -126,9 +174,11 @@ def test_build_prompts_include_required_terms_for_each_polarity_and_preset() -> 
         ):
             prompt = build_prompt(prompt_type, polarity, "camera is fixed")
             assert "custom edge computing VLA model" in prompt
-            assert "drones and airplanes only" in prompt
+            assert "drones, airplanes, people, and static obstacles" in prompt
             assert "quadrotor" in prompt
             assert "commercial_airliner" in prompt
+            assert "walking_person" in prompt
+            assert "static_obstacle" in prompt
             assert '"category": "drone"' in prompt
             assert "[ymin, xmin, ymax, xmax]" in prompt
             assert polarity.split("_")[0] in prompt or polarity == "visible_rgb"
