@@ -159,6 +159,55 @@ def clamp01(value: float) -> float:
     return float(min(1.0, max(0.0, value)))
 
 
+def snap_normalized_point(
+    x: float,
+    y: float,
+    enabled: bool,
+    threshold: float,
+) -> tuple[float, float, str | None]:
+    x = clamp01(x)
+    y = clamp01(y)
+    if not enabled:
+        return x, y, None
+
+    threshold = clamp01(threshold)
+    horizontal: str | None = None
+    vertical: str | None = None
+
+    if x <= threshold:
+        x = 0.0
+        horizontal = "left"
+    elif x >= 1.0 - threshold:
+        x = 1.0
+        horizontal = "right"
+
+    if y <= threshold:
+        y = 0.0
+        vertical = "top"
+    elif y >= 1.0 - threshold:
+        y = 1.0
+        vertical = "bottom"
+
+    if horizontal and vertical:
+        return x, y, f"{vertical}-{horizontal} corner"
+    if horizontal:
+        return x, y, f"{horizontal} edge"
+    if vertical:
+        return x, y, f"{vertical} edge"
+    return x, y, None
+
+
+def edge_band_points(edge: str, size: float) -> list[list[float]]:
+    size = clamp01(size)
+    if edge == "bottom":
+        return [[0.0, 1.0 - size], [1.0, 1.0 - size], [1.0, 1.0], [0.0, 1.0]]
+    if edge == "left":
+        return [[0.0, 0.0], [size, 0.0], [size, 1.0], [0.0, 1.0]]
+    if edge == "right":
+        return [[1.0 - size, 0.0], [1.0, 0.0], [1.0, 1.0], [1.0 - size, 1.0]]
+    return [[0.0, 0.0], [1.0, 0.0], [1.0, size], [0.0, size]]
+
+
 def normalize_zone(zone: dict) -> dict:
     zone_type = str(zone.get("type", "ignore")).lower()
     if zone_type not in {"ignore", "penalty", "flight"}:
@@ -194,6 +243,7 @@ def load_roi_mask_payload(payload: dict) -> None:
     st.session_state["roi_zones"] = zones
     st.session_state["roi_points"] = []
     st.session_state["roi_last_click"] = None
+    st.session_state["roi_last_snap"] = ""
 
 
 def coerce_setting(name: str, value: Any) -> Any:
@@ -293,6 +343,14 @@ if "roi_points" not in st.session_state:
     st.session_state["roi_points"] = []
 if "roi_mode" not in st.session_state:
     st.session_state["roi_mode"] = "fixed"
+if "roi_snap_enabled" not in st.session_state:
+    st.session_state["roi_snap_enabled"] = True
+if "roi_snap_threshold" not in st.session_state:
+    st.session_state["roi_snap_threshold"] = 0.035
+if "roi_edge_band_size" not in st.session_state:
+    st.session_state["roi_edge_band_size"] = 0.20
+if "roi_last_snap" not in st.session_state:
+    st.session_state["roi_last_snap"] = ""
 if "uploaded_video_cache_id" not in st.session_state:
     st.session_state["uploaded_video_cache_id"] = None
 if "uploaded_video_cache_path" not in st.session_state:
@@ -1028,6 +1086,7 @@ def cache_uploaded_video(uploaded_file) -> Path | None:
     st.session_state["uploaded_video_cache_path"] = str(target)
     st.session_state["roi_preview_path"] = str(target)
     st.session_state["roi_last_click"] = None
+    st.session_state["roi_last_snap"] = ""
     return target
 
 
@@ -1682,10 +1741,11 @@ with tabs[2]:
             help="Frame displayed for clicking ROI polygon vertices.",
         )
 
+        default_zone_name = f"zone_{len(st.session_state['roi_zones']) + 1}"
         zone_cols = st.columns([2, 1, 1])
         zone_name = zone_cols[0].text_input(
             "Zone name",
-            value=f"zone_{len(st.session_state['roi_zones']) + 1}",
+            value=default_zone_name,
             help="Label stored in the mask JSON for debugging and summaries.",
         )
         zone_type = zone_cols[1].selectbox(
@@ -1703,11 +1763,84 @@ with tabs[2]:
             help="Penalty value saved for penalty zones; disabled for ignore and flight zones.",
         )
 
+        snap_cols = st.columns([1, 1])
+        snap_enabled = snap_cols[0].checkbox(
+            "Snap to edges/corners",
+            key="roi_snap_enabled",
+            help=(
+                "When clicking near the preview border, x/y are snapped to exact 0.0 or 1.0 "
+                "so masks can cover the full edge cleanly."
+            ),
+        )
+        snap_threshold = snap_cols[1].slider(
+            "Snap distance",
+            min_value=0.0,
+            max_value=0.10,
+            step=0.005,
+            format="%.3f",
+            key="roi_snap_threshold",
+            disabled=not snap_enabled,
+            help="Normalized distance from an edge that should snap a clicked point to that edge.",
+        )
+
+        st.caption("Exact corner points")
+        corner_cols = st.columns(4)
+        corner_shortcuts = [
+            ("Top-left", [0.0, 0.0]),
+            ("Top-right", [1.0, 0.0]),
+            ("Bottom-right", [1.0, 1.0]),
+            ("Bottom-left", [0.0, 1.0]),
+        ]
+        for corner_col, (corner_label, corner_point) in zip(corner_cols, corner_shortcuts):
+            if corner_col.button(
+                corner_label,
+                help=f"Adds an exact {corner_label.lower()} point to the pending polygon.",
+            ):
+                st.session_state["roi_points"].append(corner_point)
+                st.session_state["roi_last_click"] = None
+                st.session_state["roi_last_snap"] = f"added {corner_label.lower()} corner"
+                st.rerun()
+
+        band_cols = st.columns([1, 1, 1])
+        edge_name = band_cols[0].selectbox(
+            "Quick edge band",
+            ["top", "bottom", "left", "right"],
+            help="Creates a perfect rectangular zone locked to one edge of the preview.",
+        )
+        edge_band_size = band_cols[1].slider(
+            "Band size",
+            min_value=0.01,
+            max_value=0.50,
+            step=0.01,
+            format="%.2f",
+            key="roi_edge_band_size",
+            help="Normalized thickness of the edge band. 0.20 means 20% of the image.",
+        )
+        if band_cols[2].button("Add edge band", help="Adds the selected edge band as a complete zone."):
+            band_name = zone_name.strip() or default_zone_name
+            if band_name == default_zone_name:
+                band_name = f"{edge_name}_{zone_type}_band"
+            st.session_state["roi_zones"].append(
+                normalize_zone(
+                    {
+                        "name": band_name,
+                        "type": zone_type,
+                        "points": edge_band_points(edge_name, edge_band_size),
+                        "penalty": penalty if zone_type == "penalty" else 0.0,
+                    }
+                )
+            )
+            st.session_state["roi_points"] = []
+            st.session_state["roi_last_click"] = None
+            st.session_state["roi_last_snap"] = f"added {edge_name} edge band"
+            st.rerun()
+
         action_cols = st.columns(4)
         if action_cols[0].button("Undo point", help="Removes the last clicked polygon vertex."):
             if st.session_state["roi_points"]:
                 st.session_state["roi_points"].pop()
             st.session_state["roi_last_click"] = None
+            st.session_state["roi_last_snap"] = ""
             st.rerun()
         if action_cols[1].button(
             "Close zone",
@@ -1726,11 +1859,13 @@ with tabs[2]:
             )
             st.session_state["roi_points"] = []
             st.session_state["roi_last_click"] = None
+            st.session_state["roi_last_snap"] = ""
             st.rerun()
         if action_cols[2].button("Clear zones", help="Deletes all zones from the current in-memory mask."):
             st.session_state["roi_zones"] = []
             st.session_state["roi_points"] = []
             st.session_state["roi_last_click"] = None
+            st.session_state["roi_last_snap"] = ""
             st.rerun()
         action_cols[3].download_button(
             "Download mask JSON",
@@ -1762,16 +1897,27 @@ with tabs[2]:
                     key=f"roi_coordinates_{preview_path}_{int(frame_index)}",
                 )
                 if coordinate:
-                    x = clamp01(float(coordinate["x"]) / float(max(1, annotated.shape[1])))
-                    y = clamp01(float(coordinate["y"]) / float(max(1, annotated.shape[0])))
+                    raw_x = float(coordinate["x"]) / float(max(1, annotated.shape[1]))
+                    raw_y = float(coordinate["y"]) / float(max(1, annotated.shape[0]))
+                    x, y, snap_label = snap_normalized_point(
+                        raw_x,
+                        raw_y,
+                        bool(snap_enabled),
+                        float(snap_threshold),
+                    )
                     click_key = f"{preview_path}:{int(frame_index)}:{x:.6f}:{y:.6f}"
                     if click_key != st.session_state.get("roi_last_click"):
                         st.session_state["roi_points"].append([x, y])
                         st.session_state["roi_last_click"] = click_key
+                        st.session_state["roi_last_snap"] = (
+                            f"snapped to {snap_label}" if snap_label else ""
+                        )
                         st.rerun()
+                snap_note = st.session_state.get("roi_last_snap", "")
                 st.caption(
                     f"Preview {source_width}x{source_height}, frames={frame_count or 'unknown'}, "
                     f"pending points={len(st.session_state['roi_points'])}"
+                    + (f", {snap_note}" if snap_note else "")
                 )
         else:
             st.info("Enter a local preview video path to click polygon vertices.")

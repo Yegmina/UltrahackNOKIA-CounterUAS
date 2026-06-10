@@ -170,6 +170,8 @@ Use:
 - `ignore` for tribunes, people, static props, edge bands, floor bands, lights, and gates that should remove detections.
 - `penalty` for regions that may contain useful motion but should be lower confidence.
 - `flight` for valid flight space. If any flight zones exist, detections outside them are rejected.
+- `Snap to edges/corners` in the ROI tab to make clicks near preview borders land exactly on `0.0` or `1.0`.
+- `Quick edge band` to create exact top, bottom, left, or right rectangular masks without hand-clicking all four corners.
 
 `ignore` and `flight` zones are applied directly to the motion mask before contours are extracted.
 This clips moving pixels at ROI boundaries instead of dropping a whole bounding box just because it touched an ignored area.
