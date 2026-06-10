@@ -5,10 +5,21 @@ import cv2
 
 from motion_diff_detector import (
     MotionConfig,
+    RoiMask,
+    RoiZone,
     analyze_gray_pair,
     prepare_gray,
     render_motion_only,
+    roi_zone_points_pixels,
 )
+
+
+def make_roi_mask(zone_type: str, points: list[list[float]], penalty: float = 0.5) -> RoiMask:
+    return RoiMask(
+        version=1,
+        mode="fixed",
+        zones=(RoiZone(name=f"{zone_type}_zone", type=zone_type, points=tuple(map(tuple, points)), penalty=penalty),),
+    )
 
 
 def test_static_frames_produce_no_motion() -> None:
@@ -39,6 +50,92 @@ def test_moving_blob_produces_box() -> None:
     assert detection.y1 <= 30
     assert detection.x2 >= 35
     assert detection.y2 >= 45
+    assert detection.roi_action == "keep"
+    assert analysis.raw_detection_count == 1
+    assert analysis.roi_rejected_count == 0
+    assert analysis.roi_penalized_count == 0
+    assert np.count_nonzero(analysis.accepted_mask) > 0
+
+
+def test_roi_normalized_points_scale_to_video_size() -> None:
+    zone = RoiZone(
+        name="top",
+        type="ignore",
+        points=((0.0, 0.0), (1.0, 0.0), (0.5, 0.5)),
+    )
+
+    points = roi_zone_points_pixels(zone, image_width=200, image_height=100)
+
+    assert points.tolist() == [[0.0, 0.0], [200.0, 0.0], [100.0, 50.0]]
+
+
+def test_roi_ignore_zone_rejects_detection() -> None:
+    config = MotionConfig(
+        diff_threshold=18,
+        min_area=20,
+        morph_kernel=1,
+        shake_protection=False,
+    )
+    previous = np.zeros((100, 100), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (20, 30), (34, 44), 255, thickness=cv2.FILLED)
+    roi_mask = make_roi_mask("ignore", [[0.1, 0.2], [0.5, 0.2], [0.5, 0.6], [0.1, 0.6]])
+
+    analysis = analyze_gray_pair(previous, current, config, 100, 100, roi_mask=roi_mask)
+
+    assert analysis.raw_detection_count == 1
+    assert analysis.roi_rejected_count == 1
+    assert analysis.detections == []
+    assert np.count_nonzero(analysis.accepted_mask) == 0
+
+
+def test_roi_flight_zone_rejects_detection_outside_flight_space() -> None:
+    config = MotionConfig(
+        diff_threshold=18,
+        min_area=20,
+        morph_kernel=1,
+        shake_protection=False,
+    )
+    previous = np.zeros((100, 100), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (70, 30), (84, 44), 255, thickness=cv2.FILLED)
+    roi_mask = make_roi_mask("flight", [[0.0, 0.0], [0.4, 0.0], [0.4, 1.0], [0.0, 1.0]])
+
+    analysis = analyze_gray_pair(previous, current, config, 100, 100, roi_mask=roi_mask)
+
+    assert analysis.raw_detection_count == 1
+    assert analysis.roi_rejected_count == 1
+    assert analysis.detections == []
+    assert np.count_nonzero(analysis.accepted_mask) == 0
+
+
+def test_roi_penalty_zone_keeps_and_tags_detection() -> None:
+    config = MotionConfig(
+        diff_threshold=18,
+        min_area=20,
+        morph_kernel=1,
+        shake_protection=False,
+    )
+    previous = np.zeros((100, 100), dtype=np.uint8)
+    current = previous.copy()
+    cv2.rectangle(current, (20, 30), (34, 44), 255, thickness=cv2.FILLED)
+    roi_mask = make_roi_mask(
+        "penalty",
+        [[0.1, 0.2], [0.5, 0.2], [0.5, 0.6], [0.1, 0.6]],
+        penalty=0.35,
+    )
+
+    analysis = analyze_gray_pair(previous, current, config, 100, 100, roi_mask=roi_mask)
+
+    assert analysis.raw_detection_count == 1
+    assert analysis.roi_rejected_count == 0
+    assert analysis.roi_penalized_count == 1
+    assert len(analysis.detections) == 1
+    detection = analysis.detections[0]
+    assert detection.roi_action == "penalize"
+    assert detection.zone_type == "penalty"
+    assert detection.zone_name == "penalty_zone"
+    assert detection.roi_penalty == 0.35
     assert np.count_nonzero(analysis.accepted_mask) > 0
 
 

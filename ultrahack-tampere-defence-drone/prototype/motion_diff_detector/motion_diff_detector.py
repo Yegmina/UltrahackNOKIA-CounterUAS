@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,8 @@ import numpy as np
 
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).with_name("outputs")
+ROI_ZONE_TYPES = {"ignore", "penalty", "flight"}
+ROI_MASK_MODES = {"fixed", "handheld"}
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,21 @@ class MotionConfig:
 
 
 @dataclass(frozen=True)
+class RoiZone:
+    name: str
+    type: str
+    points: tuple[tuple[float, float], ...]
+    penalty: float = 0.0
+
+
+@dataclass(frozen=True)
+class RoiMask:
+    version: int
+    mode: str
+    zones: tuple[RoiZone, ...]
+
+
+@dataclass(frozen=True)
 class MotionDetection:
     x1: float
     y1: float
@@ -56,11 +73,16 @@ class MotionDetection:
     center_x: float
     center_y: float
     area: float
+    roi_action: str = "keep"
+    zone_type: str | None = None
+    zone_name: str | None = None
+    roi_penalty: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         record = asdict(self)
-        for key in record:
-            record[key] = round(float(record[key]), 6)
+        for key, value in record.items():
+            if isinstance(value, float):
+                record[key] = round(value, 6)
         return record
 
 
@@ -78,6 +100,9 @@ class MotionFrameResult:
     global_dy: float
     global_consensus: float
     tracked_vectors: int
+    raw_detection_count: int
+    roi_rejected_count: int
+    roi_penalized_count: int
     detections: list[MotionDetection]
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -94,6 +119,9 @@ class MotionFrameResult:
             "global_dy": round(float(self.global_dy), 6),
             "global_consensus": round(float(self.global_consensus), 6),
             "tracked_vectors": int(self.tracked_vectors),
+            "raw_detection_count": int(self.raw_detection_count),
+            "roi_rejected_count": int(self.roi_rejected_count),
+            "roi_penalized_count": int(self.roi_penalized_count),
             "detections": [detection.to_json_dict() for detection in self.detections],
         }
 
@@ -109,6 +137,9 @@ class MotionAnalysis:
     global_dy: float = 0.0
     global_consensus: float = 0.0
     tracked_vectors: int = 0
+    raw_detection_count: int = 0
+    roi_rejected_count: int = 0
+    roi_penalized_count: int = 0
 
 
 def odd_kernel(value: int) -> int:
@@ -116,6 +147,195 @@ def odd_kernel(value: int) -> int:
     if kernel % 2 == 0:
         kernel += 1
     return kernel
+
+
+def normalize_roi_points(points: Any) -> tuple[tuple[float, float], ...]:
+    if not isinstance(points, (list, tuple)):
+        raise ValueError("ROI zone points must be a list of [x, y] pairs.")
+    normalized: list[tuple[float, float]] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError("ROI zone points must be [x, y] pairs.")
+        x = float(point[0])
+        y = float(point[1])
+        if not np.isfinite(x) or not np.isfinite(y):
+            raise ValueError("ROI zone points must be finite numbers.")
+        normalized.append((float(np.clip(x, 0.0, 1.0)), float(np.clip(y, 0.0, 1.0))))
+    if len(normalized) < 3:
+        raise ValueError("ROI zones require at least three points.")
+    return tuple(normalized)
+
+
+def parse_roi_mask(payload: dict[str, Any]) -> RoiMask:
+    if not isinstance(payload, dict):
+        raise ValueError("ROI mask must be a JSON object.")
+
+    version = int(payload.get("version", 1))
+    if version != 1:
+        raise ValueError(f"Unsupported ROI mask version: {version}")
+
+    mode = str(payload.get("mode", "fixed")).strip().lower()
+    if mode not in ROI_MASK_MODES:
+        raise ValueError(f"ROI mask mode must be one of: {', '.join(sorted(ROI_MASK_MODES))}")
+
+    zones_payload = payload.get("zones", [])
+    if not isinstance(zones_payload, list):
+        raise ValueError("ROI mask zones must be a list.")
+
+    zones: list[RoiZone] = []
+    for index, zone_payload in enumerate(zones_payload, start=1):
+        if not isinstance(zone_payload, dict):
+            raise ValueError("Each ROI zone must be a JSON object.")
+        zone_type = str(zone_payload.get("type", "ignore")).strip().lower()
+        if zone_type not in ROI_ZONE_TYPES:
+            raise ValueError(f"ROI zone type must be one of: {', '.join(sorted(ROI_ZONE_TYPES))}")
+        points = normalize_roi_points(zone_payload.get("points", []))
+        default_penalty = 0.5 if zone_type == "penalty" else 0.0
+        penalty = float(np.clip(float(zone_payload.get("penalty", default_penalty)), 0.0, 1.0))
+        zones.append(
+            RoiZone(
+                name=str(zone_payload.get("name") or f"{zone_type}_{index}"),
+                type=zone_type,
+                points=points,
+                penalty=penalty,
+            )
+        )
+
+    return RoiMask(version=version, mode=mode, zones=tuple(zones))
+
+
+def load_roi_mask(path: str | Path | None) -> RoiMask | None:
+    if not path:
+        return None
+    mask_path = Path(path)
+    payload = json.loads(mask_path.read_text(encoding="utf-8"))
+    return parse_roi_mask(payload)
+
+
+def roi_zone_points_pixels(zone: RoiZone, image_width: int, image_height: int) -> np.ndarray:
+    return np.array(
+        [
+            [
+                float(np.clip(x * image_width, 0.0, float(image_width))),
+                float(np.clip(y * image_height, 0.0, float(image_height))),
+            ]
+            for x, y in zone.points
+        ],
+        dtype=np.float32,
+    )
+
+
+def _point_in_polygon(point: tuple[float, float], polygon: np.ndarray) -> bool:
+    return cv2.pointPolygonTest(polygon, point, False) >= 0
+
+
+def _point_in_detection_box(point: np.ndarray, detection: MotionDetection) -> bool:
+    x, y = float(point[0]), float(point[1])
+    return detection.x1 <= x <= detection.x2 and detection.y1 <= y <= detection.y2
+
+
+def _orientation(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _on_segment(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    eps: float = 1e-9,
+) -> bool:
+    return (
+        min(a[0], b[0]) - eps <= c[0] <= max(a[0], b[0]) + eps
+        and min(a[1], b[1]) - eps <= c[1] <= max(a[1], b[1]) + eps
+    )
+
+
+def _segments_intersect(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    d: tuple[float, float],
+    eps: float = 1e-9,
+) -> bool:
+    o1 = _orientation(a, b, c)
+    o2 = _orientation(a, b, d)
+    o3 = _orientation(c, d, a)
+    o4 = _orientation(c, d, b)
+
+    if abs(o1) <= eps and _on_segment(a, b, c):
+        return True
+    if abs(o2) <= eps and _on_segment(a, b, d):
+        return True
+    if abs(o3) <= eps and _on_segment(c, d, a):
+        return True
+    if abs(o4) <= eps and _on_segment(c, d, b):
+        return True
+    return (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0)
+
+
+def detection_overlaps_zone(
+    detection: MotionDetection,
+    zone: RoiZone,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    polygon = roi_zone_points_pixels(zone, image_width, image_height)
+    x1, y1, x2, y2 = detection.x1, detection.y1, detection.x2, detection.y2
+    box_points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    test_points = [(detection.center_x, detection.center_y), *box_points]
+    if any(_point_in_polygon(point, polygon) for point in test_points):
+        return True
+    if any(_point_in_detection_box(point, detection) for point in polygon):
+        return True
+
+    polygon_points = [(float(point[0]), float(point[1])) for point in polygon]
+    box_edges = list(zip(box_points, box_points[1:] + box_points[:1]))
+    polygon_edges = list(zip(polygon_points, polygon_points[1:] + polygon_points[:1]))
+    return any(
+        _segments_intersect(box_a, box_b, poly_a, poly_b)
+        for box_a, box_b in box_edges
+        for poly_a, poly_b in polygon_edges
+    )
+
+
+def filter_detection_by_roi(
+    detection: MotionDetection,
+    roi_mask: RoiMask | None,
+    image_width: int,
+    image_height: int,
+) -> MotionDetection | None:
+    if roi_mask is None or not roi_mask.zones:
+        return detection
+
+    ignore_zones = [zone for zone in roi_mask.zones if zone.type == "ignore"]
+    for zone in ignore_zones:
+        if detection_overlaps_zone(detection, zone, image_width, image_height):
+            return None
+
+    flight_zones = [zone for zone in roi_mask.zones if zone.type == "flight"]
+    if flight_zones and not any(
+        detection_overlaps_zone(detection, zone, image_width, image_height)
+        for zone in flight_zones
+    ):
+        return None
+
+    penalty_zones = [zone for zone in roi_mask.zones if zone.type == "penalty"]
+    for zone in penalty_zones:
+        if detection_overlaps_zone(detection, zone, image_width, image_height):
+            return replace(
+                detection,
+                roi_action="penalize",
+                zone_type=zone.type,
+                zone_name=zone.name,
+                roi_penalty=zone.penalty,
+            )
+
+    return detection
 
 
 def prepare_gray(frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
@@ -191,6 +411,7 @@ def analyze_gray_pair(
     config: MotionConfig,
     image_width: int,
     image_height: int,
+    roi_mask: RoiMask | None = None,
 ) -> MotionAnalysis:
     config = config.normalized()
     compare_gray = previous_gray
@@ -248,7 +469,7 @@ def analyze_gray_pair(
     area_scale = max(scale_x * scale_y, 1e-9)
     accepted_mask = np.zeros_like(raw_mask)
     contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    detections: list[MotionDetection] = []
+    raw_candidates: list[tuple[MotionDetection, np.ndarray]] = []
 
     for contour in contours:
         area = float(cv2.contourArea(contour) / area_scale)
@@ -261,19 +482,42 @@ def analyze_gray_pair(
         y2 = np.clip((y + h) / scale_y, 0, image_height)
         if x2 <= x1 or y2 <= y1:
             continue
-        detections.append(
-            MotionDetection(
-                x1=float(x1),
-                y1=float(y1),
-                x2=float(x2),
-                y2=float(y2),
-                center_x=float((x1 + x2) / 2.0),
-                center_y=float((y1 + y2) / 2.0),
-                area=area,
+        raw_candidates.append(
+            (
+                MotionDetection(
+                    x1=float(x1),
+                    y1=float(y1),
+                    x2=float(x2),
+                    y2=float(y2),
+                    center_x=float((x1 + x2) / 2.0),
+                    center_y=float((y1 + y2) / 2.0),
+                    area=area,
+                ),
+                contour,
             )
         )
+
+    roi_rejected_count = 0
+    roi_penalized_count = 0
+    kept_candidates: list[tuple[MotionDetection, np.ndarray]] = []
+    for detection, contour in raw_candidates:
+        filtered_detection = filter_detection_by_roi(
+            detection,
+            roi_mask,
+            image_width,
+            image_height,
+        )
+        if filtered_detection is None:
+            roi_rejected_count += 1
+            continue
+        if filtered_detection.roi_action == "penalize":
+            roi_penalized_count += 1
+        kept_candidates.append((filtered_detection, contour))
+
+    for _detection, contour in kept_candidates:
         cv2.drawContours(accepted_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
+    detections = [detection for detection, _contour in kept_candidates]
     detections.sort(key=lambda detection: detection.area, reverse=True)
     return MotionAnalysis(
         accepted_mask,
@@ -285,6 +529,9 @@ def analyze_gray_pair(
         global_dy,
         global_consensus,
         tracked_vectors,
+        len(raw_candidates),
+        roi_rejected_count,
+        roi_penalized_count,
     )
 
 
@@ -317,6 +564,9 @@ def render_overlay(
     global_dx: float = 0.0,
     global_dy: float = 0.0,
     global_consensus: float = 0.0,
+    roi_active: bool = False,
+    roi_rejected_count: int = 0,
+    roi_penalized_count: int = 0,
 ) -> np.ndarray:
     output = frame_bgr.copy()
     for detection in detections:
@@ -326,8 +576,11 @@ def render_overlay(
             int(round(detection.x2)),
             int(round(detection.y2)),
         )
-        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        color = (0, 165, 255) if detection.roi_action == "penalize" else (0, 255, 255)
+        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         label = f"motion {detection.area:.0f}px"
+        if detection.roi_action == "penalize":
+            label = f"penalty {detection.area:.0f}px"
         label_y = max(18, y1 - 6)
         cv2.putText(
             output,
@@ -335,7 +588,7 @@ def render_overlay(
             (x1, label_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (0, 255, 255),
+            color,
             1,
             cv2.LINE_AA,
         )
@@ -358,6 +611,17 @@ def render_overlay(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (0, 220, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    if roi_active:
+        cv2.putText(
+            output,
+            f"ROI rejected={roi_rejected_count} penalized={roi_penalized_count}",
+            (12, 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
@@ -419,6 +683,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         shake_consensus=args.shake_consensus,
         shake_consensus_px=args.shake_consensus_px,
     ).normalized()
+    roi_mask = load_roi_mask(args.roi_mask)
     out_dir = make_output_dir(args.out_dir)
 
     capture = cv2.VideoCapture(str(source))
@@ -446,6 +711,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     frame_index = 0
     frames_with_motion = 0
     total_detections = 0
+    total_raw_detections = 0
+    total_roi_rejected = 0
+    total_roi_penalized = 0
     rejected_frame_count = 0
     global_motion_detected_count = 0
     started_at = time.time()
@@ -470,6 +738,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     global_dy = 0.0
                     global_consensus = 0.0
                     tracked_vectors = 0
+                    raw_detection_count = 0
+                    roi_rejected_count = 0
+                    roi_penalized_count = 0
                 else:
                     analysis = analyze_gray_pair(
                         previous_gray,
@@ -477,6 +748,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         config,
                         image_width=width,
                         image_height=height,
+                        roi_mask=roi_mask,
                     )
                     accepted_mask = analysis.accepted_mask
                     detections = analysis.detections
@@ -487,6 +759,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     global_dy = analysis.global_dy
                     global_consensus = analysis.global_consensus
                     tracked_vectors = analysis.tracked_vectors
+                    raw_detection_count = analysis.raw_detection_count
+                    roi_rejected_count = analysis.roi_rejected_count
+                    roi_penalized_count = analysis.roi_penalized_count
 
                 if global_motion_rejected:
                     rejected_frame_count += 1
@@ -506,9 +781,15 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         global_dx,
                         global_dy,
                         global_consensus,
+                        roi_active=roi_mask is not None,
+                        roi_rejected_count=roi_rejected_count,
+                        roi_penalized_count=roi_penalized_count,
                     )
                 )
 
+                total_raw_detections += raw_detection_count
+                total_roi_rejected += roi_rejected_count
+                total_roi_penalized += roi_penalized_count
                 if detections:
                     frames_with_motion += 1
                     total_detections += len(detections)
@@ -528,6 +809,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     global_dy=global_dy,
                     global_consensus=global_consensus,
                     tracked_vectors=tracked_vectors,
+                    raw_detection_count=raw_detection_count,
+                    roi_rejected_count=roi_rejected_count,
+                    roi_penalized_count=roi_penalized_count,
                     detections=detections,
                 )
                 jsonl.write(json.dumps(record.to_json_dict(), separators=(",", ":")) + "\n")
@@ -552,10 +836,20 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "duration_s": frame_index / max(fps, 0.001),
         "frames_with_motion": frames_with_motion,
         "detection_count": total_detections,
+        "raw_detection_count": total_raw_detections,
+        "roi_rejected_count": total_roi_rejected,
+        "roi_penalized_count": total_roi_penalized,
+        "kept_detection_count": total_detections,
         "global_motion_rejected_frames": rejected_frame_count,
         "global_motion_detected_frames": global_motion_detected_count,
         "processing_seconds": round(time.time() - started_at, 3),
         "config": serialize_config(config),
+        "roi_mask": {
+            "enabled": roi_mask is not None,
+            "path": str(args.roi_mask) if args.roi_mask else None,
+            "mode": roi_mask.mode if roi_mask else None,
+            "zone_count": len(roi_mask.zones) if roi_mask else 0,
+        },
         "motion_only_path": str(motion_only_path),
         "overlay_path": str(overlay_path),
         "jsonl_path": str(jsonl_path),
@@ -582,6 +876,7 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--shake-min-shift", type=float, default=1.5 if not duplicate else default)
     parser.add_argument("--shake-consensus", type=float, default=0.72 if not duplicate else default)
     parser.add_argument("--shake-consensus-px", type=float, default=2.0 if not duplicate else default)
+    parser.add_argument("--roi-mask", default=default, help="Path to normalized ROI mask JSON.")
     parser.add_argument("--out-dir", default=default)
     parser.add_argument(
         "--json",
