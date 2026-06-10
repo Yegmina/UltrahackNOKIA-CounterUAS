@@ -844,6 +844,14 @@ def test_overlay_debug_text_can_be_enabled() -> None:
     assert not np.array_equal(output, frame)
 
 
+def test_overlay_audio_cli_is_disabled_by_default() -> None:
+    default_args = build_parser().parse_args(["video", "input.mp4"])
+    enabled_args = build_parser().parse_args(["video", "input.mp4", "--overlay-audio"])
+
+    assert not default_args.overlay_audio
+    assert enabled_args.overlay_audio
+
+
 def test_semantic_overlay_boxes_respect_roi_ignore_zone() -> None:
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
     roi_mask = make_roi_mask("ignore", [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]])
@@ -910,6 +918,7 @@ def test_process_video_can_skip_outputs_and_limit_frames(tmp_path) -> None:
             str(out_dir),
             "--max-frames",
             "3",
+            "--overlay-audio",
             "--no-motion-video",
             "--no-overlay-video",
             "--no-jsonl",
@@ -925,6 +934,8 @@ def test_process_video_can_skip_outputs_and_limit_frames(tmp_path) -> None:
     assert summary["motion_only_path"] is None
     assert summary["overlay_path"] is None
     assert summary["jsonl_path"] is None
+    assert not summary["outputs"]["overlay_audio_requested"]
+    assert not summary["outputs"]["overlay_audio"]
     assert (out_dir / "summary.json").exists()
 
 

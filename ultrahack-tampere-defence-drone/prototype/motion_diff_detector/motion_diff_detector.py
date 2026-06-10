@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -2640,6 +2642,94 @@ def open_video_writer(path: Path, fps: float, width: int, height: int) -> cv2.Vi
     return writer
 
 
+def source_has_audio_stream(source: Path) -> bool:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        return True
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(source),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def add_source_audio_to_overlay(
+    source: Path,
+    overlay_path: Path,
+    start_frame: int,
+    frame_count: int,
+    fps: float,
+) -> str | None:
+    if frame_count <= 0:
+        return "Overlay audio skipped because no overlay frames were written."
+    if not overlay_path.exists():
+        return "Overlay audio skipped because the overlay video was not written."
+    if not source_has_audio_stream(source):
+        return "Source video has no audio stream; overlay remains silent."
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return "ffmpeg not found; overlay remains silent."
+
+    start_s = start_frame / max(fps, 0.001)
+    duration_s = frame_count / max(fps, 0.001)
+    temp_path = overlay_path.with_name(f"{overlay_path.stem}_with_audio_tmp{overlay_path.suffix}")
+    result = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(overlay_path),
+            "-ss",
+            f"{start_s:.6f}",
+            "-t",
+            f"{duration_s:.6f}",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(temp_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not temp_path.exists():
+        if temp_path.exists():
+            temp_path.unlink()
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+        return f"Could not add source audio to overlay; overlay remains silent. ffmpeg: {detail}"
+
+    temp_path.replace(overlay_path)
+    return None
+
+
 def process_video(args: argparse.Namespace) -> dict[str, Any]:
     global STOP_REQUESTED
     STOP_REQUESTED = False
@@ -2738,6 +2828,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = make_output_dir(args.out_dir)
     write_motion_video = not args.no_motion_video
     write_overlay_video = not args.no_overlay_video
+    overlay_audio_requested = bool(getattr(args, "overlay_audio", False) and write_overlay_video)
     write_jsonl = not args.no_jsonl
     start_frame = max(0, int(args.start_frame))
     max_frames = max(0, int(args.max_frames))
@@ -3173,6 +3264,25 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         if overlay_writer is not None:
             overlay_writer.release()
 
+    overlay_audio_warning: str | None = None
+    if overlay_audio_requested:
+        emit_progress(
+            args,
+            "muxing_overlay_audio",
+            **make_progress(
+                "muxing_overlay_audio",
+                "Adding source audio to overlay video.",
+            ),
+        )
+        overlay_audio_warning = add_source_audio_to_overlay(
+            source,
+            overlay_path,
+            start_frame,
+            frame_index,
+            fps,
+        )
+    overlay_audio_added = overlay_audio_requested and overlay_audio_warning is None
+
     if frame_index == 0 and not stopped_early:
         raise RuntimeError(f"No frames were read from video: {source}")
 
@@ -3232,6 +3342,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "outputs": {
             "motion_video": write_motion_video,
             "overlay_video": write_overlay_video,
+            "overlay_audio_requested": overlay_audio_requested,
+            "overlay_audio": overlay_audio_added,
+            "overlay_audio_warning": overlay_audio_warning,
             "jsonl": write_jsonl,
         },
         "motion_only_path": str(motion_only_path) if write_motion_video else None,
@@ -3286,6 +3399,12 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         action="store_true",
         default=False if not duplicate else default,
         help="Draw top-left diagnostic text on the annotated overlay MP4.",
+    )
+    parser.add_argument(
+        "--overlay-audio",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Mux the source audio track into the annotated overlay MP4.",
     )
     parser.add_argument(
         "--backend",

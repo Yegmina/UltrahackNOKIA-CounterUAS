@@ -59,6 +59,7 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "overlay_hold_frames": 12,
     "overlay_hold_expand_px": 10.0,
     "overlay_debug_text": False,
+    "overlay_audio": False,
     "processing_backend": "auto",
     "cuda_device": 0,
     "write_overlay_video": True,
@@ -539,6 +540,13 @@ with st.sidebar:
         disabled=not write_overlay_video,
         help="Draws the top-left ROI/filter/semantic/shake diagnostics on the overlay video.",
     )
+    overlay_audio = st.checkbox(
+        "Add source audio to overlay video",
+        value=setting_value("overlay_audio"),
+        key=setting_key("overlay_audio"),
+        disabled=not write_overlay_video,
+        help="Muxes the source video's audio track into the annotated overlay MP4 after processing.",
+    )
     write_motion_video = st.checkbox(
         "Write motion-only video",
         value=setting_value("write_motion_video"),
@@ -1002,6 +1010,7 @@ with st.sidebar:
         "overlay_hold_frames": int(overlay_hold_frames),
         "overlay_hold_expand_px": float(overlay_hold_expand_px),
         "overlay_debug_text": bool(overlay_debug_text),
+        "overlay_audio": bool(overlay_audio),
         "processing_backend": processing_backend,
         "cuda_device": int(cuda_device),
         "write_overlay_video": bool(write_overlay_video),
@@ -1502,6 +1511,8 @@ def common_cli_args(
         args.append("--no-overlay-video")
     if overlay_debug_text:
         args.append("--overlay-debug-text")
+    if overlay_audio:
+        args.append("--overlay-audio")
     if not write_jsonl:
         args.append("--no-jsonl")
     effective_start_frame = (
@@ -1787,6 +1798,19 @@ def build_combined_summary(
         int(summary.get("semantic_filter", {}).get("skipped_count") or 0)
         for summary in summaries
     )
+    overlay_audio_requested = any(
+        bool(summary.get("outputs", {}).get("overlay_audio_requested"))
+        for summary in summaries
+    )
+    overlay_audio_added = overlay_path is not None and any(
+        bool(summary.get("outputs", {}).get("overlay_audio"))
+        for summary in summaries
+    )
+    overlay_audio_warnings = [
+        str(summary.get("outputs", {}).get("overlay_audio_warning"))
+        for summary in summaries
+        if summary.get("outputs", {}).get("overlay_audio_warning")
+    ]
 
     combined = dict(last)
     combined.update(
@@ -1839,6 +1863,9 @@ def build_combined_summary(
     combined["outputs"] = {
         "motion_video": motion_path is not None,
         "overlay_video": overlay_path is not None,
+        "overlay_audio_requested": overlay_audio_requested,
+        "overlay_audio": overlay_audio_added,
+        "overlay_audio_warnings": overlay_audio_warnings,
         "jsonl": jsonl_path is not None,
     }
     return combined
@@ -2087,9 +2114,16 @@ def render_outputs(summary: dict) -> None:
     st.caption(
         "Outputs: "
         f"overlay={output_summary.get('overlay_video', bool(overlay_path))} "
+        f"overlay-audio={output_summary.get('overlay_audio', False)} "
         f"motion-only={output_summary.get('motion_video', bool(motion_path))} "
         f"jsonl={output_summary.get('jsonl', bool(jsonl_path))}"
     )
+    overlay_audio_warning = output_summary.get("overlay_audio_warning")
+    overlay_audio_warnings = output_summary.get("overlay_audio_warnings") or []
+    if overlay_audio_warning:
+        st.warning(str(overlay_audio_warning))
+    for warning in overlay_audio_warnings:
+        st.warning(str(warning))
 
     preview_cols = st.columns(2)
     with preview_cols[0]:
