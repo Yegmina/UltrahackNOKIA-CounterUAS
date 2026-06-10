@@ -1810,10 +1810,34 @@ def write_markdown_report(
             f"- Sync JSON: `{summary['paths']['sync_report']}`",
             f"- Auto perspective JSON: `{summary['paths']['auto_perspective']}`",
             f"- Evidence index: `{summary['paths']['evidence_index']}`",
+            f"- Markdown preview report: `{summary['paths'].get('result_report_preview', '')}`",
             "",
         ]
     )
     report_path.write_text("\n".join(lines), encoding="utf-8")
+    write_markdown_preview_copy(report_path, report_path.with_name(f"{report_path.stem}_preview{report_path.suffix}"))
+
+
+def write_markdown_preview_copy(report_path: Path, preview_path: Path) -> None:
+    text = report_path.read_text(encoding="utf-8")
+
+    def replace_image_tag(match: re.Match[str]) -> str:
+        src = match.group("src")
+        alt = match.group("alt").replace("]", ")")
+        return f"![{alt}]({src})"
+
+    text = re.sub(
+        r'<img\s+src="(?P<src>[^"]+)"\s+alt="(?P<alt>[^"]*)"\s+width="\d+">',
+        replace_image_tag,
+        text,
+    )
+    text = text.replace(
+        "# Fusion Evidence Lab Result Report\n",
+        "# Fusion Evidence Lab Result Report\n\n"
+        "_Preview version with standard Markdown image links. Keep this file next to `report_assets/`._\n",
+        1,
+    )
+    preview_path.write_text(text, encoding="utf-8")
 
 
 def analyze(args: argparse.Namespace) -> dict[str, Any]:
@@ -1996,6 +2020,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "motion_records": str(out_dir / "motion_records.jsonl"),
         "audio_records": str(out_dir / "audio_records.jsonl"),
         "result_report": str(out_dir / "result_report.md"),
+        "result_report_preview": str(out_dir / "result_report_preview.md"),
         "summary": str(out_dir / "run_summary.json"),
     }
     write_json(out_dir / "fusion_timeline.json", timeline)
