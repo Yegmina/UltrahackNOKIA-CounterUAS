@@ -950,14 +950,16 @@ with st.sidebar:
     }
     st.session_state["settings_profile_values"] = dict(current_settings)
     if profile_download_slot is not None:
-        profile_payload = settings_profile_payload(current_settings)
-        st.download_button(
-            "Export current parameters JSON",
-            json.dumps(profile_payload, indent=2),
-            file_name="motion_diff_parameters.json",
-            mime="application/json",
-            help="Saves the current UI parameters and ROI mask for later import.",
-        )
+        with profile_download_slot.container():
+            profile_payload = settings_profile_payload(current_settings)
+            st.download_button(
+                "Export current parameters JSON",
+                json.dumps(profile_payload, indent=2),
+                file_name="motion_diff_parameters.json",
+                mime="application/json",
+                help="Saves the current UI parameters and ROI mask for later import.",
+                use_container_width=True,
+            )
 
 tabs = st.tabs(["Upload", "Local path", "ROI mask"])
 rendered_summary_path: str | None = None
