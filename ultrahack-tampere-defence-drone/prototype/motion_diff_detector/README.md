@@ -54,6 +54,8 @@ Common options:
 --trail-frames 3
 --max-motion-ratio 0.10
 --analysis-scale 0.5
+--backend auto
+--cuda-device 0
 --disable-shake-protection
 --shake-min-shift 1.5
 --shake-consensus 0.72
@@ -82,6 +84,14 @@ Common options:
 --semantic-overlap-threshold 0.15
 --json
 ```
+
+Backend modes:
+
+- `auto`: use OpenCV CUDA when a CUDA device is available; otherwise fall back to CPU.
+- `cpu`: force CPU processing.
+- `cuda`: require OpenCV CUDA and fail clearly if no CUDA device/build is available.
+
+CUDA acceleration covers frame resize, grayscale conversion, blur, frame differencing, thresholding, morphology, and shake-compensation warping. Contour extraction, ROI filtering, tracking, semantic filtering, JSON output, and MP4 writing still run on CPU.
 
 ## Flying Object AI Overlay
 

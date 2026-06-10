@@ -31,6 +31,15 @@ PROGRESS_PREFIX = "PROGRESS "
 st.set_page_config(page_title="Motion Diff Drone Detector", layout="wide")
 st.title("Motion Diff Drone Detector")
 
+
+def cuda_device_count() -> int:
+    try:
+        if not hasattr(cv2, "cuda"):
+            return 0
+        return int(cv2.cuda.getCudaEnabledDeviceCount())
+    except Exception:
+        return 0
+
 if "roi_zones" not in st.session_state:
     st.session_state["roi_zones"] = []
 if "roi_points" not in st.session_state:
@@ -102,6 +111,22 @@ with st.sidebar:
     )
     st.divider()
     st.caption("Performance / outputs")
+    cuda_devices = cuda_device_count()
+    processing_backend = st.selectbox(
+        "Processing backend",
+        ["auto", "cpu", "cuda"],
+        index=0,
+        help="auto uses CUDA for frame differencing when OpenCV reports a CUDA device, otherwise CPU.",
+    )
+    cuda_device = st.number_input(
+        "CUDA device",
+        min_value=0,
+        max_value=max(0, cuda_devices - 1),
+        value=0,
+        step=1,
+        disabled=processing_backend == "cpu" or cuda_devices == 0,
+        help=f"Detected CUDA devices: {cuda_devices}.",
+    )
     write_overlay_video = st.checkbox(
         "Write overlay video",
         value=True,
@@ -777,6 +802,10 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         str(float(max_motion_ratio)),
         "--analysis-scale",
         str(float(analysis_scale)),
+        "--backend",
+        processing_backend,
+        "--cuda-device",
+        str(int(cuda_device)),
         "--shake-min-shift",
         str(float(shake_min_shift)),
         "--shake-consensus",
@@ -945,6 +974,14 @@ def render_outputs(summary: dict) -> None:
     perf_cols[1].metric("Shake reused", summary.get("shake_reused_frames", 0))
     perf_cols[2].metric("AI runs", summary.get("semantic_filter", {}).get("inference_count", 0))
     perf_cols[3].metric("AI skipped", summary.get("semantic_filter", {}).get("skipped_count", 0))
+    backend_summary = summary.get("backend", {})
+    if backend_summary:
+        st.caption(
+            f"Backend requested={backend_summary.get('requested')} "
+            f"used={backend_summary.get('used')} "
+            f"cuda_devices={backend_summary.get('cuda_device_count')} "
+            f"{backend_summary.get('message', '')}"
+        )
     roi_summary = summary.get("roi_mask", {})
     if roi_summary.get("enabled"):
         st.caption(

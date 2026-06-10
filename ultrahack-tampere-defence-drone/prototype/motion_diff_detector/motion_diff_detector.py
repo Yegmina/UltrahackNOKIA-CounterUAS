@@ -22,6 +22,7 @@ DEFAULT_SEMANTIC_MODEL_REPO = "devanshty/WingID"
 DEFAULT_SEMANTIC_MODEL_FILE = "yolo11l.pt"
 PROGRESS_PREFIX = "PROGRESS "
 SEMANTIC_ACTIONS = {"reject", "penalize"}
+PROCESSING_BACKENDS = {"auto", "cpu", "cuda"}
 STOP_REQUESTED = False
 SEMANTIC_LABEL_ALIASES = {
     "human": "person",
@@ -96,6 +97,26 @@ class MotionConfig:
             direction_min_displacement=max(0.0, float(self.direction_min_displacement)),
             direction_cosine=float(np.clip(self.direction_cosine, -1.0, 1.0)),
         )
+
+
+@dataclass(frozen=True)
+class BackendInfo:
+    requested: str
+    used: str
+    cuda_available: bool
+    cuda_device_count: int
+    cuda_device: int | None = None
+    message: str = ""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "requested": self.requested,
+            "used": self.used,
+            "cuda_available": self.cuda_available,
+            "cuda_device_count": self.cuda_device_count,
+            "cuda_device": self.cuda_device,
+            "message": self.message,
+        }
 
 
 @dataclass(frozen=True)
@@ -300,6 +321,171 @@ def odd_kernel(value: int) -> int:
     if kernel % 2 == 0:
         kernel += 1
     return kernel
+
+
+def get_cuda_device_count() -> int:
+    try:
+        if not hasattr(cv2, "cuda"):
+            return 0
+        return int(cv2.cuda.getCudaEnabledDeviceCount())
+    except Exception:
+        return 0
+
+
+def cuda_is_available() -> bool:
+    return get_cuda_device_count() > 0
+
+
+def resolve_backend(requested: str, cuda_device: int = 0) -> BackendInfo:
+    requested = str(requested or "auto").strip().lower()
+    if requested not in PROCESSING_BACKENDS:
+        raise ValueError(f"Unsupported processing backend: {requested}")
+
+    device_count = get_cuda_device_count()
+    available = device_count > 0
+    if requested == "cpu":
+        return BackendInfo(
+            requested=requested,
+            used="cpu",
+            cuda_available=available,
+            cuda_device_count=device_count,
+            message="CPU backend selected.",
+        )
+
+    if available:
+        if cuda_device < 0 or cuda_device >= device_count:
+            raise RuntimeError(
+                f"CUDA device {cuda_device} is not available. Detected {device_count} CUDA device(s)."
+            )
+        return BackendInfo(
+            requested=requested,
+            used="cuda",
+            cuda_available=True,
+            cuda_device_count=device_count,
+            cuda_device=int(cuda_device),
+            message=f"CUDA backend selected on device {cuda_device}.",
+        )
+
+    if requested == "cuda":
+        raise RuntimeError(
+            "CUDA backend was requested, but OpenCV reports no CUDA-enabled devices. "
+            "Install an OpenCV build with CUDA support and a working NVIDIA driver, or use --backend auto/cpu."
+        )
+
+    return BackendInfo(
+        requested=requested,
+        used="cpu",
+        cuda_available=False,
+        cuda_device_count=device_count,
+        message="CUDA unavailable; auto backend fell back to CPU.",
+    )
+
+
+class CudaMotionProcessor:
+    def __init__(self, device_id: int = 0) -> None:
+        self.device_id = int(device_id)
+        self._blur_filter: Any | None = None
+        self._blur_kernel: int | None = None
+        self._morph_filters: dict[tuple[int, int], Any] = {}
+        cv2.cuda.setDevice(self.device_id)
+
+    def prepare_gray(self, frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
+        config = config.normalized()
+        gpu_frame = cv2.cuda_GpuMat()
+        gpu_frame.upload(frame_bgr)
+        if config.analysis_scale < 0.999:
+            target_size = (
+                max(1, int(round(frame_bgr.shape[1] * config.analysis_scale))),
+                max(1, int(round(frame_bgr.shape[0] * config.analysis_scale))),
+            )
+            gpu_frame = cv2.cuda.resize(gpu_frame, target_size, interpolation=cv2.INTER_AREA)
+
+        gpu_gray = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2GRAY)
+        if config.blur_kernel > 1:
+            if self._blur_filter is None or self._blur_kernel != config.blur_kernel:
+                self._blur_filter = cv2.cuda.createGaussianFilter(
+                    gpu_gray.type(),
+                    gpu_gray.type(),
+                    (config.blur_kernel, config.blur_kernel),
+                    0,
+                )
+                self._blur_kernel = config.blur_kernel
+            gpu_gray = self._blur_filter.apply(gpu_gray)
+        return gpu_gray.download()
+
+    def _morph_filter(self, operation: int, kernel_size: int, mat_type: int) -> Any:
+        key = (operation, kernel_size)
+        if key not in self._morph_filters:
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            self._morph_filters[key] = cv2.cuda.createMorphologyFilter(
+                operation,
+                mat_type,
+                kernel,
+            )
+        return self._morph_filters[key]
+
+    def cleanup_motion_mask(self, diff: np.ndarray, config: MotionConfig) -> np.ndarray:
+        config = config.normalized()
+        if config.hysteresis:
+            return cleanup_motion_mask(diff, config)
+
+        gpu_diff = cv2.cuda_GpuMat()
+        gpu_diff.upload(diff)
+        _threshold, gpu_mask = cv2.cuda.threshold(
+            gpu_diff,
+            config.diff_threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )
+        if config.morph_kernel > 1:
+            mat_type = gpu_mask.type()
+            gpu_mask = self._morph_filter(cv2.MORPH_OPEN, config.morph_kernel, mat_type).apply(gpu_mask)
+            gpu_mask = self._morph_filter(cv2.MORPH_CLOSE, config.morph_kernel, mat_type).apply(gpu_mask)
+            gpu_mask = self._morph_filter(cv2.MORPH_DILATE, config.morph_kernel, mat_type).apply(gpu_mask)
+        return gpu_mask.download()
+
+    def warp_affine(
+        self,
+        image: np.ndarray,
+        transform: np.ndarray,
+        size: tuple[int, int],
+    ) -> np.ndarray:
+        gpu_image = cv2.cuda_GpuMat()
+        gpu_image.upload(image)
+        gpu_warped = cv2.cuda.warpAffine(
+            gpu_image,
+            transform,
+            size,
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        return gpu_warped.download()
+
+    def diff_and_mask(
+        self,
+        current_gray: np.ndarray,
+        compare_gray: np.ndarray,
+        config: MotionConfig,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        gpu_current = cv2.cuda_GpuMat()
+        gpu_compare = cv2.cuda_GpuMat()
+        gpu_current.upload(current_gray)
+        gpu_compare.upload(compare_gray)
+        gpu_diff = cv2.cuda.absdiff(gpu_current, gpu_compare)
+        diff = gpu_diff.download()
+        return diff, self.cleanup_motion_mask(diff, config)
+
+
+def create_cuda_processor(backend_info: BackendInfo) -> CudaMotionProcessor | None:
+    if backend_info.used != "cuda":
+        return None
+    assert backend_info.cuda_device is not None
+    try:
+        return CudaMotionProcessor(backend_info.cuda_device)
+    except Exception as exc:
+        if backend_info.requested == "cuda":
+            raise RuntimeError(f"Could not initialize CUDA backend: {exc}") from exc
+        return None
 
 
 def normalize_roi_points(points: Any) -> tuple[tuple[float, float], ...]:
@@ -895,8 +1081,18 @@ class MotionTracker:
         return cosine >= self.config.direction_cosine
 
 
-def prepare_gray(frame_bgr: np.ndarray, config: MotionConfig) -> np.ndarray:
+def prepare_gray(
+    frame_bgr: np.ndarray,
+    config: MotionConfig,
+    cuda_processor: CudaMotionProcessor | None = None,
+) -> np.ndarray:
     config = config.normalized()
+    if cuda_processor is not None:
+        try:
+            return cuda_processor.prepare_gray(frame_bgr, config)
+        except Exception as exc:
+            raise RuntimeError(f"CUDA grayscale preparation failed: {exc}") from exc
+
     frame = frame_bgr
     if config.analysis_scale < 0.999:
         frame = cv2.resize(
@@ -1064,6 +1260,7 @@ def analyze_gray_pair(
     frame_index: int = 0,
     build_mask: bool = True,
     morph_kernel_matrix: np.ndarray | None = None,
+    cuda_processor: CudaMotionProcessor | None = None,
 ) -> MotionAnalysis:
     config = config.normalized()
     semantic_detections = semantic_detections or []
@@ -1097,16 +1294,26 @@ def analyze_gray_pair(
                 [[1.0, 0.0, global_dx], [0.0, 1.0, global_dy]],
                 dtype=np.float32,
             )
-            compare_gray = cv2.warpAffine(
-                previous_gray,
-                transform,
-                (current_gray.shape[1], current_gray.shape[0]),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
+            if cuda_processor is not None:
+                compare_gray = cuda_processor.warp_affine(
+                    previous_gray,
+                    transform,
+                    (current_gray.shape[1], current_gray.shape[0]),
+                )
+            else:
+                compare_gray = cv2.warpAffine(
+                    previous_gray,
+                    transform,
+                    (current_gray.shape[1], current_gray.shape[0]),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
 
-    diff = cv2.absdiff(current_gray, compare_gray)
-    raw_mask = cleanup_motion_mask(diff, config, morph_kernel_matrix=morph_kernel_matrix)
+    if cuda_processor is not None:
+        _diff, raw_mask = cuda_processor.diff_and_mask(current_gray, compare_gray, config)
+    else:
+        diff = cv2.absdiff(current_gray, compare_gray)
+        raw_mask = cleanup_motion_mask(diff, config, morph_kernel_matrix=morph_kernel_matrix)
     motion_ratio = float(np.count_nonzero(raw_mask) / max(1, raw_mask.size))
 
     global_motion_rejected = (
@@ -1582,6 +1789,17 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         direction_min_displacement=args.direction_min_displacement,
         direction_cosine=args.direction_cosine,
     ).normalized()
+    backend_info = resolve_backend(args.backend, int(args.cuda_device))
+    cuda_processor = create_cuda_processor(backend_info)
+    if backend_info.used == "cuda" and cuda_processor is None:
+        backend_info = BackendInfo(
+            requested=backend_info.requested,
+            used="cpu",
+            cuda_available=backend_info.cuda_available,
+            cuda_device_count=backend_info.cuda_device_count,
+            cuda_device=backend_info.cuda_device,
+            message="CUDA initialization failed; auto backend fell back to CPU.",
+        )
     roi_mask = load_roi_mask(args.roi_mask)
     motion_tracker = MotionTracker(config)
     semantic_config = SemanticConfig(
@@ -1612,6 +1830,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "opening_video",
         message="Opening video and reading metadata.",
         source=str(source),
+        backend=backend_info.to_json_dict(),
     )
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
@@ -1757,6 +1976,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
             shake_reused_count=shake_reused_count,
             semantic_inference_count=semantic_inference_count,
             semantic_skipped_count=semantic_skipped_count,
+            backend=backend_info.to_json_dict(),
             stopped_early=stopped_early,
             **extra,
         )
@@ -1782,7 +2002,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
 
             source_frame_index = start_frame + frame_index
             timestamp_s = source_frame_index / max(fps, 0.001)
-            current_gray = prepare_gray(frame, config)
+            current_gray = prepare_gray(frame, config, cuda_processor)
 
             should_run_semantic = semantic_detector is not None
             if semantic_detector is not None and semantic_config.motion_gate:
@@ -1832,6 +2052,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     frame_index=source_frame_index,
                     build_mask=write_motion_video,
                     morph_kernel_matrix=morph_kernel_matrix,
+                    cuda_processor=cuda_processor,
                 )
                 accepted_mask = analysis.accepted_mask
                 detections = analysis.detections
@@ -2027,6 +2248,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "processing_seconds_per_frame": round(processing_seconds_per_frame, 6),
         "processing_ms_per_frame": round(processing_seconds_per_frame * 1000.0, 3),
         "config": serialize_config(config),
+        "backend": backend_info.to_json_dict(),
         "roi_mask": {
             "enabled": roi_mask is not None,
             "path": str(args.roi_mask) if args.roi_mask else None,
@@ -2073,6 +2295,13 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--trail-frames", type=int, default=3 if not duplicate else default)
     parser.add_argument("--max-motion-ratio", type=float, default=0.10 if not duplicate else default)
     parser.add_argument("--analysis-scale", type=float, default=0.5 if not duplicate else default)
+    parser.add_argument(
+        "--backend",
+        choices=sorted(PROCESSING_BACKENDS),
+        default="auto" if not duplicate else default,
+        help="Processing backend for frame differencing. auto uses CUDA when available.",
+    )
+    parser.add_argument("--cuda-device", type=int, default=0 if not duplicate else default)
     parser.add_argument(
         "--disable-shake-protection",
         action="store_true",

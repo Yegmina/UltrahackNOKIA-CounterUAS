@@ -14,11 +14,13 @@ from motion_diff_detector import (
     SemanticDetection,
     ShakeEstimator,
     analyze_gray_pair,
+    cuda_is_available,
     filter_candidates_by_semantics,
     prepare_gray,
     process_video,
     progress_payload,
     render_motion_only,
+    resolve_backend,
     roi_zone_points_pixels,
 )
 
@@ -447,6 +449,33 @@ def test_prepare_gray_downscales_and_blurs() -> None:
     gray = prepare_gray(frame, config)
 
     assert gray.shape == (50, 40)
+
+
+def test_backend_auto_resolves_to_cpu_or_cuda() -> None:
+    backend = resolve_backend("auto")
+
+    assert backend.requested == "auto"
+    assert backend.used in {"cpu", "cuda"}
+    assert backend.cuda_available == cuda_is_available()
+
+
+def test_backend_cpu_forces_cpu() -> None:
+    backend = resolve_backend("cpu")
+
+    assert backend.requested == "cpu"
+    assert backend.used == "cpu"
+
+
+def test_backend_cuda_requires_available_device() -> None:
+    if cuda_is_available():
+        assert resolve_backend("cuda").used == "cuda"
+    else:
+        try:
+            resolve_backend("cuda")
+        except RuntimeError as exc:
+            assert "CUDA backend was requested" in str(exc)
+        else:
+            raise AssertionError("Expected CUDA backend to fail without a CUDA device.")
 
 
 def test_progress_payload_reports_recent_speed() -> None:
