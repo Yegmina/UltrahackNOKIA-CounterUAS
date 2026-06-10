@@ -1656,6 +1656,33 @@ def md_path(path_text: str, out_dir: Path) -> str:
         return path.resolve().as_posix()
 
 
+def make_report_image_asset(
+    source_path_text: str,
+    report_path: Path,
+    label: str,
+    index: int,
+    max_width: int = 1400,
+) -> str | None:
+    source_path = Path(source_path_text)
+    if not source_path.exists():
+        return None
+    asset_dir = report_path.parent / "report_assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = slugify(label)
+    target_path = asset_dir / f"{index:03d}_{safe_label}.jpg"
+    image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+    if image is None:
+        fallback_path = asset_dir / f"{index:03d}_{safe_label}{source_path.suffix.lower() or '.png'}"
+        shutil.copy2(source_path, fallback_path)
+        return md_path(str(fallback_path), report_path.parent)
+    height, width = image.shape[:2]
+    if width > max_width:
+        scale = max_width / float(width)
+        image = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(str(target_path), image, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    return md_path(str(target_path), report_path.parent)
+
+
 def write_markdown_report(
     report_path: Path,
     summary: dict[str, Any],
@@ -1665,6 +1692,21 @@ def write_markdown_report(
     evidence_index: list[dict[str, Any]],
 ) -> None:
     out_dir = report_path.parent
+    image_index = 0
+
+    def image_block(path_text: str, label: str, max_width: int = 1400, display_width: int = 980) -> list[str]:
+        nonlocal image_index
+        image_index += 1
+        asset = make_report_image_asset(path_text, report_path, label, image_index, max_width=max_width)
+        if not asset:
+            return [f"_Missing image: `{path_text}`_", ""]
+        return [
+            f'<img src="{asset}" alt="{label}" width="{display_width}">',
+            "",
+            f"_Source image: `{path_text}`_",
+            "",
+        ]
+
     lines: list[str] = [
         "# Fusion Evidence Lab Result Report",
         "",
@@ -1713,13 +1755,9 @@ def write_markdown_report(
                 lines.append(f"### Perspective Proof: `{source_id}`")
                 lines.append("")
                 if preview.get("matches_path"):
-                    rel = md_path(preview["matches_path"], out_dir)
-                    lines.append(f"![Feature matches]({rel})")
-                    lines.append("")
+                    lines.extend(image_block(preview["matches_path"], f"{source_id} feature matches", 1600, 1100))
                 if preview.get("warp_preview_path"):
-                    rel = md_path(preview["warp_preview_path"], out_dir)
-                    lines.append(f"![Warp preview]({rel})")
-                    lines.append("")
+                    lines.extend(image_block(preview["warp_preview_path"], f"{source_id} warp preview", 1800, 1200))
     else:
         lines.append("No perspective candidates were available.")
         lines.append("")
@@ -1749,9 +1787,7 @@ def write_markdown_report(
             lines.append(f"- `{proof.get('kind')}` source `{proof.get('source_id')}` score `{float(proof.get('score', 0.0)):.2f}`")
             for key, label in [("annotated_path", "Boxes"), ("motion_path", "Motion-only"), ("audio_path", "Audio proof")]:
                 if proof.get(key) and Path(proof[key]).exists():
-                    rel = md_path(proof[key], out_dir)
-                    lines.append(f"![{label}]({rel})")
-                    lines.append("")
+                    lines.extend(image_block(proof[key], f"event_{event['event_index']}_{label}", 1500, 980))
                     shown += 1
         if shown >= 36:
             break
@@ -1759,9 +1795,7 @@ def write_markdown_report(
         for proof in evidence_index[:12]:
             for key, label in [("annotated_path", "Boxes"), ("motion_path", "Motion-only"), ("audio_path", "Audio proof")]:
                 if proof.get(key) and Path(proof[key]).exists():
-                    rel = md_path(proof[key], out_dir)
-                    lines.append(f"![{label}]({rel})")
-                    lines.append("")
+                    lines.extend(image_block(proof[key], label, 1500, 980))
                     shown += 1
             if shown >= 24:
                 break
