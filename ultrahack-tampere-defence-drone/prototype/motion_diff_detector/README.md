@@ -36,6 +36,13 @@ http://127.0.0.1:8505
 
 The app upload limit is configured to 1536 MB in `.streamlit/config.toml`.
 
+The sidebar has a `Parameter profile` expander for settings files:
+
+- `Export current parameters JSON` saves the current sliders, toggles, backend/output settings, semantic filter settings, and current ROI mask.
+- `Import parameters JSON` restores those controls from the saved file and reruns the UI with the imported values.
+
+The ROI tab still has a separate `Download mask JSON` button for ROI-only reuse.
+
 ## CLI
 
 Run the sample fixed-camera video:

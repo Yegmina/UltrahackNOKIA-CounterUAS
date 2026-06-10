@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -40,386 +41,95 @@ def cuda_device_count() -> int:
     except Exception:
         return 0
 
-if "roi_zones" not in st.session_state:
-    st.session_state["roi_zones"] = []
-if "roi_points" not in st.session_state:
-    st.session_state["roi_points"] = []
-if "roi_mode" not in st.session_state:
-    st.session_state["roi_mode"] = "fixed"
-if "uploaded_video_cache_id" not in st.session_state:
-    st.session_state["uploaded_video_cache_id"] = None
-if "uploaded_video_cache_path" not in st.session_state:
-    st.session_state["uploaded_video_cache_path"] = ""
-if "active_stop_file" not in st.session_state:
-    st.session_state["active_stop_file"] = None
-if "last_summary_path" not in st.session_state:
-    st.session_state["last_summary_path"] = ""
-if "last_run_root" not in st.session_state:
-    st.session_state["last_run_root"] = ""
 
-with st.sidebar:
-    diff_threshold = st.slider(
-        "Difference threshold",
-        1,
-        100,
-        18,
-        1,
-        help="Minimum pixel brightness change needed before a pixel can become motion.",
-    )
-    min_area = st.number_input(
-        "Minimum motion area",
-        min_value=1.0,
-        max_value=100000.0,
-        value=1000.0,
-        help="Smallest connected moving region accepted as a motion box.",
-    )
-    blur_kernel = st.selectbox(
-        "Blur kernel",
-        [1, 3, 5, 7, 9, 11],
-        index=2,
-        help="Pre-blur amount before differencing. Higher values smooth sensor noise but can soften tiny drones.",
-    )
-    morph_kernel = st.selectbox(
-        "Morphology kernel",
-        [1, 3, 5, 7, 9],
-        index=1,
-        help="Cleanup kernel for joining nearby motion pixels and removing isolated specks.",
-    )
-    trail_frames = st.slider(
-        "Trail / hold frames",
-        0,
-        30,
-        3,
-        1,
-        help="Keeps recent accepted motion visible for several frames in motion-only output.",
-    )
-    max_motion_ratio = st.slider(
-        "Max motion ratio",
-        0.01,
-        1.0,
-        0.10,
-        0.01,
-        help="Rejects frames where too much of the image changes at once.",
-    )
-    analysis_scale = st.slider(
-        "Analysis scale",
-        0.10,
-        1.0,
-        0.50,
-        0.05,
-        help="Downscale factor for motion analysis. Lower is faster; higher preserves tiny objects.",
-    )
-    st.divider()
-    st.caption("Performance / outputs")
-    cuda_devices = cuda_device_count()
-    processing_backend = st.selectbox(
-        "Processing backend",
-        ["auto", "cpu", "cuda"],
-        index=0,
-        help="auto uses CUDA for frame differencing when OpenCV reports a CUDA device, otherwise CPU.",
-    )
-    cuda_device = st.number_input(
-        "CUDA device",
-        min_value=0,
-        max_value=max(0, cuda_devices - 1),
-        value=0,
-        step=1,
-        disabled=processing_backend == "cpu" or cuda_devices == 0,
-        help=f"Detected CUDA devices: {cuda_devices}.",
-    )
-    write_overlay_video = st.checkbox(
-        "Write overlay video",
-        value=True,
-        help="Writes the annotated MP4. Turn off for fastest settings searches.",
-    )
-    write_motion_video = st.checkbox(
-        "Write motion-only video",
-        value=True,
-        help="Writes the motion-mask debug MP4. Turn off unless you need the mask view.",
-    )
-    write_jsonl = st.checkbox(
-        "Write detections JSONL",
-        value=True,
-        help="Stores every per-frame detection record. Turn off to reduce I/O during tuning.",
-    )
-    limit_frame_range = st.checkbox(
-        "Limit frame range",
-        value=False,
-        help="Process only a slice of the video for fast tuning or partial previews.",
-    )
-    start_frame = st.number_input(
-        "Start frame",
-        min_value=0,
-        value=0,
-        step=1,
-        disabled=not limit_frame_range,
-        help="First source frame to process when frame range limiting is enabled.",
-    )
-    max_frames = st.number_input(
-        "Max frames",
-        min_value=1,
-        value=300,
-        step=30,
-        disabled=not limit_frame_range,
-        help="Maximum number of frames to process when frame range limiting is enabled.",
-    )
-    st.divider()
-    shake_protection = st.checkbox(
-        "Shake protection",
-        value=True,
-        help="Compensates global camera/floor movement before motion differencing.",
-    )
-    shake_min_shift = st.slider(
-        "Shake min shift",
-        0.0,
-        20.0,
-        1.5,
-        0.1,
-        disabled=not shake_protection,
-        help="Minimum estimated global image shift before shake compensation is considered active.",
-    )
-    shake_consensus = st.slider(
-        "Shake consensus",
-        0.10,
-        1.0,
-        0.72,
-        0.01,
-        disabled=not shake_protection,
-        help="Required share of tracked points agreeing on the same global movement.",
-    )
-    shake_consensus_px = st.slider(
-        "Shake consensus px",
-        0.5,
-        10.0,
-        2.0,
-        0.1,
-        disabled=not shake_protection,
-        help="Pixel tolerance for deciding whether tracked points agree on global movement.",
-    )
-    shake_frame_stride = st.slider(
-        "Shake frame stride",
-        1,
-        10,
-        1,
-        1,
-        disabled=not shake_protection,
-        help="Estimate global shake every N frames and reuse the last estimate between runs. Higher is faster but less reactive.",
-    )
-    shake_analysis_scale = st.slider(
-        "Shake analysis scale",
-        0.10,
-        1.0,
-        1.0,
-        0.05,
-        disabled=not shake_protection,
-        help="Extra downscale used only for shake optical flow. Lower is faster; 1.0 preserves current behavior.",
-    )
-    shake_max_corners = st.slider(
-        "Shake feature points",
-        12,
-        300,
-        240,
-        12,
-        disabled=not shake_protection,
-        help="Maximum tracked feature points for shake estimation. Lower is faster but can reduce consensus quality.",
-    )
-    st.divider()
-    hysteresis = st.checkbox(
-        "Hysteresis thresholding",
-        value=False,
-        help="Keeps weak motion only when it connects to a stronger high-threshold seed.",
-    )
-    hysteresis_high_threshold = st.slider(
-        "Hysteresis high threshold",
-        1,
-        255,
-        36,
-        1,
-        disabled=not hysteresis,
-        help="Strong-pixel seed threshold used by hysteresis.",
-    )
-    temporal_filter = st.checkbox(
-        "Temporal persistence",
-        value=False,
-        help="Rejects motion that appears only once and does not persist across nearby frames.",
-    )
-    track_confirmation = st.checkbox(
-        "Track confirmation",
-        value=False,
-        help="Hides a new motion track until it has been seen enough times.",
-    )
-    direction_consistency = st.checkbox(
-        "Direction consistency",
-        value=False,
-        help="Rejects tracks that jitter back and forth instead of moving consistently.",
-    )
-    track_tuning_enabled = temporal_filter or track_confirmation or direction_consistency
-    temporal_window_frames = st.slider(
-        "Persistence window",
-        1,
-        10,
-        3,
-        1,
-        disabled=not temporal_filter,
-        help="Number of recent frames checked by temporal persistence.",
-    )
-    temporal_min_hits = st.slider(
-        "Persistence min hits",
-        1,
-        10,
-        2,
-        1,
-        disabled=not temporal_filter,
-        help="Minimum detections needed inside the persistence window.",
-    )
-    track_confirm_hits = st.slider(
-        "Track confirm hits",
-        1,
-        10,
-        2,
-        1,
-        disabled=not track_confirmation,
-        help="Number of matched detections needed before a track is drawn.",
-    )
-    track_max_missed = st.slider(
-        "Track max missed",
-        0,
-        10,
-        2,
-        1,
-        disabled=not track_tuning_enabled,
-        help="How many missed frames a track can survive before being deleted.",
-    )
-    track_match_distance = st.slider(
-        "Track match distance",
-        5.0,
-        300.0,
-        80.0,
-        5.0,
-        disabled=not track_tuning_enabled,
-        help="Maximum pixel distance for matching a detection to an existing track.",
-    )
-    direction_min_hits = st.slider(
-        "Direction min hits",
-        2,
-        10,
-        3,
-        1,
-        disabled=not direction_consistency,
-        help="Minimum track hits before direction consistency can reject jitter.",
-    )
-    direction_min_displacement = st.slider(
-        "Direction min displacement",
-        0.0,
-        30.0,
-        2.0,
-        0.5,
-        disabled=not direction_consistency,
-        help="Small movements below this distance are ignored for direction checks.",
-    )
-    direction_cosine = st.slider(
-        "Direction cosine",
-        -1.0,
-        1.0,
-        0.20,
-        0.05,
-        disabled=not direction_consistency,
-        help="Allowed direction similarity. Lower is more tolerant; higher rejects more jitter.",
-    )
-    st.divider()
-    roi_mask_enabled = st.checkbox(
-        "Use current ROI mask",
-        value=False,
-        help="Applies the mask from the ROI tab to reject, penalize, or constrain detections.",
-    )
-    st.divider()
-    semantic_filter = st.checkbox(
-        "Human semantic filter",
-        value=False,
-        help="Runs a person detector and suppresses motion boxes that overlap people.",
-    )
-    semantic_action = st.selectbox(
-        "Human motion action",
-        ["reject", "penalize"],
-        index=0,
-        disabled=not semantic_filter,
-        help="Reject removes overlapping motion; penalize keeps it but tags it lower priority.",
-    )
-    semantic_conf = st.slider(
-        "Person confidence",
-        0.01,
-        0.90,
-        0.05,
-        0.01,
-        disabled=not semantic_filter,
-        help="Minimum person detector confidence. Lower catches distant people but adds false positives.",
-    )
-    semantic_overlap_threshold = st.slider(
-        "Person overlap threshold",
-        0.01,
-        1.0,
-        0.15,
-        0.01,
-        disabled=not semantic_filter,
-        help="Fraction of a motion box covered by a person box before action is applied.",
-    )
-    semantic_frame_stride = st.slider(
-        "Person AI frame stride",
-        1,
-        20,
-        2,
-        1,
-        disabled=not semantic_filter,
-        help="Runs person detection every N frames and holds boxes between runs. Higher is faster.",
-    )
-    semantic_warmup = st.checkbox(
-        "Warm up human model",
-        value=True,
-        disabled=not semantic_filter,
-        help="Runs one untimed inference before processing so the measured frame speed starts closer to steady state.",
-    )
-    semantic_motion_gate = st.checkbox(
-        "Gate human AI by motion",
-        value=False,
-        disabled=not semantic_filter,
-        help="Skips person inference while the previous frame had no raw motion. Faster on quiet clips but can miss the first frame of new motion.",
-    )
-    semantic_imgsz = st.selectbox(
-        "Person AI image size",
-        [640, 960, 1280],
-        index=1,
-        disabled=not semantic_filter,
-        help="Input size for the person detector. Higher can catch smaller people but is slower.",
-    )
-    semantic_device = st.selectbox(
-        "Person AI device",
-        ["mps", "cpu", ""],
-        index=0,
-        disabled=not semantic_filter,
-        help="Inference device. Use mps on Apple Silicon, cpu as fallback.",
-    )
-    with st.expander("Human model"):
-        semantic_model_repo = st.text_input(
-            "Model repo",
-            "devanshty/WingID",
-            disabled=not semantic_filter,
-            help="Hugging Face repository containing the YOLO person model.",
-        )
-        semantic_model_file = st.text_input(
-            "Model file",
-            "yolo11l.pt",
-            disabled=not semantic_filter,
-            help="Model file inside the Hugging Face repository.",
-        )
-        semantic_weights = st.text_input(
-            "Local weights path",
-            "",
-            disabled=not semantic_filter,
-            help="Optional local .pt file. When set, it overrides repo/model download.",
-        )
-
-tabs = st.tabs(["Upload", "Local path", "ROI mask"])
-rendered_summary_path: str | None = None
+PROFILE_TYPE = "motion_diff_detector_parameters"
+PROFILE_VERSION = 1
+SETTING_DEFAULTS: dict[str, Any] = {
+    "diff_threshold": 18,
+    "min_area": 1000.0,
+    "blur_kernel": 5,
+    "morph_kernel": 3,
+    "trail_frames": 3,
+    "max_motion_ratio": 0.10,
+    "analysis_scale": 0.50,
+    "processing_backend": "auto",
+    "cuda_device": 0,
+    "write_overlay_video": True,
+    "write_motion_video": True,
+    "write_jsonl": True,
+    "limit_frame_range": False,
+    "start_frame": 0,
+    "max_frames": 300,
+    "shake_protection": True,
+    "shake_min_shift": 1.5,
+    "shake_consensus": 0.72,
+    "shake_consensus_px": 2.0,
+    "shake_frame_stride": 1,
+    "shake_analysis_scale": 1.0,
+    "shake_max_corners": 240,
+    "hysteresis": False,
+    "hysteresis_high_threshold": 36,
+    "temporal_filter": False,
+    "track_confirmation": False,
+    "direction_consistency": False,
+    "temporal_window_frames": 3,
+    "temporal_min_hits": 2,
+    "track_confirm_hits": 2,
+    "track_max_missed": 2,
+    "track_match_distance": 80.0,
+    "direction_min_hits": 3,
+    "direction_min_displacement": 2.0,
+    "direction_cosine": 0.20,
+    "roi_mask_enabled": False,
+    "semantic_filter": False,
+    "semantic_action": "reject",
+    "semantic_conf": 0.05,
+    "semantic_overlap_threshold": 0.15,
+    "semantic_frame_stride": 2,
+    "semantic_warmup": True,
+    "semantic_motion_gate": False,
+    "semantic_imgsz": 960,
+    "semantic_device": "mps",
+    "semantic_model_repo": "devanshty/WingID",
+    "semantic_model_file": "yolo11l.pt",
+    "semantic_weights": "",
+}
+SETTING_OPTIONS: dict[str, list[Any]] = {
+    "blur_kernel": [1, 3, 5, 7, 9, 11],
+    "morph_kernel": [1, 3, 5, 7, 9],
+    "processing_backend": ["auto", "cpu", "cuda"],
+    "semantic_action": ["reject", "penalize"],
+    "semantic_imgsz": [640, 960, 1280],
+    "semantic_device": ["mps", "cpu", ""],
+}
+SETTING_RANGES: dict[str, tuple[float, float]] = {
+    "diff_threshold": (1, 100),
+    "min_area": (1.0, 100000.0),
+    "trail_frames": (0, 30),
+    "max_motion_ratio": (0.01, 1.0),
+    "analysis_scale": (0.10, 1.0),
+    "cuda_device": (0, 64),
+    "start_frame": (0, 1000000000),
+    "max_frames": (1, 1000000000),
+    "shake_min_shift": (0.0, 20.0),
+    "shake_consensus": (0.10, 1.0),
+    "shake_consensus_px": (0.5, 10.0),
+    "shake_frame_stride": (1, 10),
+    "shake_analysis_scale": (0.10, 1.0),
+    "shake_max_corners": (12, 300),
+    "hysteresis_high_threshold": (1, 255),
+    "temporal_window_frames": (1, 10),
+    "temporal_min_hits": (1, 10),
+    "track_confirm_hits": (1, 10),
+    "track_max_missed": (0, 10),
+    "track_match_distance": (5.0, 300.0),
+    "direction_min_hits": (2, 10),
+    "direction_min_displacement": (0.0, 30.0),
+    "direction_cosine": (-1.0, 1.0),
+    "semantic_conf": (0.01, 0.90),
+    "semantic_overlap_threshold": (0.01, 1.0),
+    "semantic_frame_stride": (1, 20),
+}
 
 
 def clamp01(value: float) -> float:
@@ -461,6 +171,619 @@ def load_roi_mask_payload(payload: dict) -> None:
     st.session_state["roi_zones"] = zones
     st.session_state["roi_points"] = []
     st.session_state["roi_last_click"] = None
+
+
+def coerce_setting(name: str, value: Any) -> Any:
+    default = SETTING_DEFAULTS[name]
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+            return default
+        return bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            coerced = int(default)
+    elif isinstance(default, float):
+        try:
+            coerced = float(value)
+        except (TypeError, ValueError):
+            coerced = float(default)
+    else:
+        coerced = str(value) if value is not None else str(default)
+
+    if name in SETTING_OPTIONS:
+        return coerced if coerced in SETTING_OPTIONS[name] else default
+    if name in SETTING_RANGES and isinstance(coerced, (int, float)):
+        min_value, max_value = SETTING_RANGES[name]
+        coerced = min(max(coerced, min_value), max_value)
+    return coerced
+
+
+def initialize_settings_profile() -> None:
+    if "settings_profile_values" not in st.session_state:
+        st.session_state["settings_profile_values"] = dict(SETTING_DEFAULTS)
+    if "settings_profile_revision" not in st.session_state:
+        st.session_state["settings_profile_revision"] = 0
+
+
+def setting_value(name: str) -> Any:
+    values = st.session_state.get("settings_profile_values", {})
+    return coerce_setting(name, values.get(name, SETTING_DEFAULTS[name]))
+
+
+def setting_key(name: str) -> str:
+    revision = int(st.session_state.get("settings_profile_revision", 0))
+    return f"settings_{revision}_{name}"
+
+
+def select_index(name: str, options: list[Any]) -> int:
+    value = setting_value(name)
+    return options.index(value) if value in options else options.index(SETTING_DEFAULTS[name])
+
+
+def apply_settings_profile(payload: dict) -> tuple[int, list[str]]:
+    if not isinstance(payload, dict):
+        raise ValueError("Parameter profile must be a JSON object.")
+    settings = payload.get("settings", payload)
+    if not isinstance(settings, dict):
+        raise ValueError("Parameter profile settings must be a JSON object.")
+
+    current_values = dict(st.session_state.get("settings_profile_values", SETTING_DEFAULTS))
+    applied = 0
+    unknown: list[str] = []
+    for name, value in settings.items():
+        if name not in SETTING_DEFAULTS:
+            unknown.append(str(name))
+            continue
+        current_values[name] = coerce_setting(name, value)
+        applied += 1
+    st.session_state["settings_profile_values"] = current_values
+
+    roi_payload = payload.get("roi_mask")
+    if isinstance(roi_payload, dict):
+        load_roi_mask_payload(roi_payload)
+
+    st.session_state["settings_profile_revision"] = int(
+        st.session_state.get("settings_profile_revision", 0)
+    ) + 1
+    return applied, unknown
+
+
+def settings_profile_payload(settings: dict[str, Any]) -> dict:
+    return {
+        "version": PROFILE_VERSION,
+        "profile_type": PROFILE_TYPE,
+        "settings": settings,
+        "roi_mask": current_roi_mask_payload(),
+    }
+
+
+if "roi_zones" not in st.session_state:
+    st.session_state["roi_zones"] = []
+if "roi_points" not in st.session_state:
+    st.session_state["roi_points"] = []
+if "roi_mode" not in st.session_state:
+    st.session_state["roi_mode"] = "fixed"
+if "uploaded_video_cache_id" not in st.session_state:
+    st.session_state["uploaded_video_cache_id"] = None
+if "uploaded_video_cache_path" not in st.session_state:
+    st.session_state["uploaded_video_cache_path"] = ""
+if "active_stop_file" not in st.session_state:
+    st.session_state["active_stop_file"] = None
+if "last_summary_path" not in st.session_state:
+    st.session_state["last_summary_path"] = ""
+if "last_run_root" not in st.session_state:
+    st.session_state["last_run_root"] = ""
+initialize_settings_profile()
+
+with st.sidebar:
+    profile_box = st.expander("Parameter profile", expanded=False)
+    with profile_box:
+        profile_message = st.session_state.pop("settings_profile_message", "")
+        if profile_message:
+            st.success(profile_message)
+        uploaded_profile = st.file_uploader(
+            "Import parameters JSON",
+            type=["json"],
+            key="settings_profile_upload",
+            help="Loads saved detector sliders, toggles, model settings, and ROI mask.",
+        )
+        if uploaded_profile is not None:
+            upload_id = f"{uploaded_profile.name}:{uploaded_profile.size}"
+            if st.session_state.get("settings_profile_upload_id") != upload_id:
+                try:
+                    payload = json.loads(uploaded_profile.getvalue().decode("utf-8-sig"))
+                    applied, unknown = apply_settings_profile(payload)
+                except Exception as exc:
+                    st.error(f"Could not load parameters: {type(exc).__name__}: {exc}")
+                else:
+                    st.session_state["settings_profile_upload_id"] = upload_id
+                    suffix = f"; ignored {len(unknown)} unknown keys" if unknown else ""
+                    st.session_state["settings_profile_message"] = (
+                        f"Loaded {applied} parameters{suffix}."
+                    )
+                    st.rerun()
+        profile_download_slot = st.empty()
+
+    st.divider()
+    diff_threshold = st.slider(
+        "Difference threshold",
+        1,
+        100,
+        setting_value("diff_threshold"),
+        1,
+        key=setting_key("diff_threshold"),
+        help="Minimum pixel brightness change needed before a pixel can become motion.",
+    )
+    min_area = st.number_input(
+        "Minimum motion area",
+        min_value=1.0,
+        max_value=100000.0,
+        value=setting_value("min_area"),
+        key=setting_key("min_area"),
+        help="Smallest connected moving region accepted as a motion box.",
+    )
+    blur_kernel = st.selectbox(
+        "Blur kernel",
+        [1, 3, 5, 7, 9, 11],
+        index=select_index("blur_kernel", [1, 3, 5, 7, 9, 11]),
+        key=setting_key("blur_kernel"),
+        help="Pre-blur amount before differencing. Higher values smooth sensor noise but can soften tiny drones.",
+    )
+    morph_kernel = st.selectbox(
+        "Morphology kernel",
+        [1, 3, 5, 7, 9],
+        index=select_index("morph_kernel", [1, 3, 5, 7, 9]),
+        key=setting_key("morph_kernel"),
+        help="Cleanup kernel for joining nearby motion pixels and removing isolated specks.",
+    )
+    trail_frames = st.slider(
+        "Trail / hold frames",
+        0,
+        30,
+        setting_value("trail_frames"),
+        1,
+        key=setting_key("trail_frames"),
+        help="Keeps recent accepted motion visible for several frames in motion-only output.",
+    )
+    max_motion_ratio = st.slider(
+        "Max motion ratio",
+        0.01,
+        1.0,
+        setting_value("max_motion_ratio"),
+        0.01,
+        key=setting_key("max_motion_ratio"),
+        help="Rejects frames where too much of the image changes at once.",
+    )
+    analysis_scale = st.slider(
+        "Analysis scale",
+        0.10,
+        1.0,
+        setting_value("analysis_scale"),
+        0.05,
+        key=setting_key("analysis_scale"),
+        help="Downscale factor for motion analysis. Lower is faster; higher preserves tiny objects.",
+    )
+    st.divider()
+    st.caption("Performance / outputs")
+    cuda_devices = cuda_device_count()
+    processing_backend = st.selectbox(
+        "Processing backend",
+        ["auto", "cpu", "cuda"],
+        index=select_index("processing_backend", ["auto", "cpu", "cuda"]),
+        key=setting_key("processing_backend"),
+        help="auto uses CUDA for frame differencing when OpenCV reports a CUDA device, otherwise CPU.",
+    )
+    cuda_device_default = int(min(setting_value("cuda_device"), max(0, cuda_devices - 1)))
+    cuda_device = st.number_input(
+        "CUDA device",
+        min_value=0,
+        max_value=max(0, cuda_devices - 1),
+        value=cuda_device_default,
+        step=1,
+        key=setting_key("cuda_device"),
+        disabled=processing_backend == "cpu" or cuda_devices == 0,
+        help=f"Detected CUDA devices: {cuda_devices}.",
+    )
+    write_overlay_video = st.checkbox(
+        "Write overlay video",
+        value=setting_value("write_overlay_video"),
+        key=setting_key("write_overlay_video"),
+        help="Writes the annotated MP4. Turn off for fastest settings searches.",
+    )
+    write_motion_video = st.checkbox(
+        "Write motion-only video",
+        value=setting_value("write_motion_video"),
+        key=setting_key("write_motion_video"),
+        help="Writes the motion-mask debug MP4. Turn off unless you need the mask view.",
+    )
+    write_jsonl = st.checkbox(
+        "Write detections JSONL",
+        value=setting_value("write_jsonl"),
+        key=setting_key("write_jsonl"),
+        help="Stores every per-frame detection record. Turn off to reduce I/O during tuning.",
+    )
+    limit_frame_range = st.checkbox(
+        "Limit frame range",
+        value=setting_value("limit_frame_range"),
+        key=setting_key("limit_frame_range"),
+        help="Process only a slice of the video for fast tuning or partial previews.",
+    )
+    start_frame = st.number_input(
+        "Start frame",
+        min_value=0,
+        value=setting_value("start_frame"),
+        step=1,
+        key=setting_key("start_frame"),
+        disabled=not limit_frame_range,
+        help="First source frame to process when frame range limiting is enabled.",
+    )
+    max_frames = st.number_input(
+        "Max frames",
+        min_value=1,
+        value=setting_value("max_frames"),
+        step=30,
+        key=setting_key("max_frames"),
+        disabled=not limit_frame_range,
+        help="Maximum number of frames to process when frame range limiting is enabled.",
+    )
+    st.divider()
+    shake_protection = st.checkbox(
+        "Shake protection",
+        value=setting_value("shake_protection"),
+        key=setting_key("shake_protection"),
+        help="Compensates global camera/floor movement before motion differencing.",
+    )
+    shake_min_shift = st.slider(
+        "Shake min shift",
+        0.0,
+        20.0,
+        setting_value("shake_min_shift"),
+        0.1,
+        key=setting_key("shake_min_shift"),
+        disabled=not shake_protection,
+        help="Minimum estimated global image shift before shake compensation is considered active.",
+    )
+    shake_consensus = st.slider(
+        "Shake consensus",
+        0.10,
+        1.0,
+        setting_value("shake_consensus"),
+        0.01,
+        key=setting_key("shake_consensus"),
+        disabled=not shake_protection,
+        help="Required share of tracked points agreeing on the same global movement.",
+    )
+    shake_consensus_px = st.slider(
+        "Shake consensus px",
+        0.5,
+        10.0,
+        setting_value("shake_consensus_px"),
+        0.1,
+        key=setting_key("shake_consensus_px"),
+        disabled=not shake_protection,
+        help="Pixel tolerance for deciding whether tracked points agree on global movement.",
+    )
+    shake_frame_stride = st.slider(
+        "Shake frame stride",
+        1,
+        10,
+        setting_value("shake_frame_stride"),
+        1,
+        key=setting_key("shake_frame_stride"),
+        disabled=not shake_protection,
+        help="Estimate global shake every N frames and reuse the last estimate between runs. Higher is faster but less reactive.",
+    )
+    shake_analysis_scale = st.slider(
+        "Shake analysis scale",
+        0.10,
+        1.0,
+        setting_value("shake_analysis_scale"),
+        0.05,
+        key=setting_key("shake_analysis_scale"),
+        disabled=not shake_protection,
+        help="Extra downscale used only for shake optical flow. Lower is faster; 1.0 preserves current behavior.",
+    )
+    shake_max_corners = st.slider(
+        "Shake feature points",
+        12,
+        300,
+        setting_value("shake_max_corners"),
+        12,
+        key=setting_key("shake_max_corners"),
+        disabled=not shake_protection,
+        help="Maximum tracked feature points for shake estimation. Lower is faster but can reduce consensus quality.",
+    )
+    st.divider()
+    hysteresis = st.checkbox(
+        "Hysteresis thresholding",
+        value=setting_value("hysteresis"),
+        key=setting_key("hysteresis"),
+        help="Keeps weak motion only when it connects to a stronger high-threshold seed.",
+    )
+    hysteresis_high_threshold = st.slider(
+        "Hysteresis high threshold",
+        1,
+        255,
+        setting_value("hysteresis_high_threshold"),
+        1,
+        key=setting_key("hysteresis_high_threshold"),
+        disabled=not hysteresis,
+        help="Strong-pixel seed threshold used by hysteresis.",
+    )
+    temporal_filter = st.checkbox(
+        "Temporal persistence",
+        value=setting_value("temporal_filter"),
+        key=setting_key("temporal_filter"),
+        help="Rejects motion that appears only once and does not persist across nearby frames.",
+    )
+    track_confirmation = st.checkbox(
+        "Track confirmation",
+        value=setting_value("track_confirmation"),
+        key=setting_key("track_confirmation"),
+        help="Hides a new motion track until it has been seen enough times.",
+    )
+    direction_consistency = st.checkbox(
+        "Direction consistency",
+        value=setting_value("direction_consistency"),
+        key=setting_key("direction_consistency"),
+        help="Rejects tracks that jitter back and forth instead of moving consistently.",
+    )
+    track_tuning_enabled = temporal_filter or track_confirmation or direction_consistency
+    temporal_window_frames = st.slider(
+        "Persistence window",
+        1,
+        10,
+        setting_value("temporal_window_frames"),
+        1,
+        key=setting_key("temporal_window_frames"),
+        disabled=not temporal_filter,
+        help="Number of recent frames checked by temporal persistence.",
+    )
+    temporal_min_hits = st.slider(
+        "Persistence min hits",
+        1,
+        10,
+        setting_value("temporal_min_hits"),
+        1,
+        key=setting_key("temporal_min_hits"),
+        disabled=not temporal_filter,
+        help="Minimum detections needed inside the persistence window.",
+    )
+    track_confirm_hits = st.slider(
+        "Track confirm hits",
+        1,
+        10,
+        setting_value("track_confirm_hits"),
+        1,
+        key=setting_key("track_confirm_hits"),
+        disabled=not track_confirmation,
+        help="Number of matched detections needed before a track is drawn.",
+    )
+    track_max_missed = st.slider(
+        "Track max missed",
+        0,
+        10,
+        setting_value("track_max_missed"),
+        1,
+        key=setting_key("track_max_missed"),
+        disabled=not track_tuning_enabled,
+        help="How many missed frames a track can survive before being deleted.",
+    )
+    track_match_distance = st.slider(
+        "Track match distance",
+        5.0,
+        300.0,
+        setting_value("track_match_distance"),
+        5.0,
+        key=setting_key("track_match_distance"),
+        disabled=not track_tuning_enabled,
+        help="Maximum pixel distance for matching a detection to an existing track.",
+    )
+    direction_min_hits = st.slider(
+        "Direction min hits",
+        2,
+        10,
+        setting_value("direction_min_hits"),
+        1,
+        key=setting_key("direction_min_hits"),
+        disabled=not direction_consistency,
+        help="Minimum track hits before direction consistency can reject jitter.",
+    )
+    direction_min_displacement = st.slider(
+        "Direction min displacement",
+        0.0,
+        30.0,
+        setting_value("direction_min_displacement"),
+        0.5,
+        key=setting_key("direction_min_displacement"),
+        disabled=not direction_consistency,
+        help="Small movements below this distance are ignored for direction checks.",
+    )
+    direction_cosine = st.slider(
+        "Direction cosine",
+        -1.0,
+        1.0,
+        setting_value("direction_cosine"),
+        0.05,
+        key=setting_key("direction_cosine"),
+        disabled=not direction_consistency,
+        help="Allowed direction similarity. Lower is more tolerant; higher rejects more jitter.",
+    )
+    st.divider()
+    roi_mask_enabled = st.checkbox(
+        "Use current ROI mask",
+        value=setting_value("roi_mask_enabled"),
+        key=setting_key("roi_mask_enabled"),
+        help="Applies the mask from the ROI tab to reject, penalize, or constrain detections.",
+    )
+    st.divider()
+    semantic_filter = st.checkbox(
+        "Human semantic filter",
+        value=setting_value("semantic_filter"),
+        key=setting_key("semantic_filter"),
+        help="Runs a person detector and suppresses motion boxes that overlap people.",
+    )
+    semantic_action = st.selectbox(
+        "Human motion action",
+        ["reject", "penalize"],
+        index=select_index("semantic_action", ["reject", "penalize"]),
+        key=setting_key("semantic_action"),
+        disabled=not semantic_filter,
+        help="Reject removes overlapping motion; penalize keeps it but tags it lower priority.",
+    )
+    semantic_conf = st.slider(
+        "Person confidence",
+        0.01,
+        0.90,
+        setting_value("semantic_conf"),
+        0.01,
+        key=setting_key("semantic_conf"),
+        disabled=not semantic_filter,
+        help="Minimum person detector confidence. Lower catches distant people but adds false positives.",
+    )
+    semantic_overlap_threshold = st.slider(
+        "Person overlap threshold",
+        0.01,
+        1.0,
+        setting_value("semantic_overlap_threshold"),
+        0.01,
+        key=setting_key("semantic_overlap_threshold"),
+        disabled=not semantic_filter,
+        help="Fraction of a motion box covered by a person box before action is applied.",
+    )
+    semantic_frame_stride = st.slider(
+        "Person AI frame stride",
+        1,
+        20,
+        setting_value("semantic_frame_stride"),
+        1,
+        key=setting_key("semantic_frame_stride"),
+        disabled=not semantic_filter,
+        help="Runs person detection every N frames and holds boxes between runs. Higher is faster.",
+    )
+    semantic_warmup = st.checkbox(
+        "Warm up human model",
+        value=setting_value("semantic_warmup"),
+        key=setting_key("semantic_warmup"),
+        disabled=not semantic_filter,
+        help="Runs one untimed inference before processing so the measured frame speed starts closer to steady state.",
+    )
+    semantic_motion_gate = st.checkbox(
+        "Gate human AI by motion",
+        value=setting_value("semantic_motion_gate"),
+        key=setting_key("semantic_motion_gate"),
+        disabled=not semantic_filter,
+        help="Skips person inference while the previous frame had no raw motion. Faster on quiet clips but can miss the first frame of new motion.",
+    )
+    semantic_imgsz = st.selectbox(
+        "Person AI image size",
+        [640, 960, 1280],
+        index=select_index("semantic_imgsz", [640, 960, 1280]),
+        key=setting_key("semantic_imgsz"),
+        disabled=not semantic_filter,
+        help="Input size for the person detector. Higher can catch smaller people but is slower.",
+    )
+    semantic_device = st.selectbox(
+        "Person AI device",
+        ["mps", "cpu", ""],
+        index=select_index("semantic_device", ["mps", "cpu", ""]),
+        key=setting_key("semantic_device"),
+        disabled=not semantic_filter,
+        help="Inference device. Use mps on Apple Silicon, cpu as fallback.",
+    )
+    with st.expander("Human model"):
+        semantic_model_repo = st.text_input(
+            "Model repo",
+            setting_value("semantic_model_repo"),
+            key=setting_key("semantic_model_repo"),
+            disabled=not semantic_filter,
+            help="Hugging Face repository containing the YOLO person model.",
+        )
+        semantic_model_file = st.text_input(
+            "Model file",
+            setting_value("semantic_model_file"),
+            key=setting_key("semantic_model_file"),
+            disabled=not semantic_filter,
+            help="Model file inside the Hugging Face repository.",
+        )
+        semantic_weights = st.text_input(
+            "Local weights path",
+            setting_value("semantic_weights"),
+            key=setting_key("semantic_weights"),
+            disabled=not semantic_filter,
+            help="Optional local .pt file. When set, it overrides repo/model download.",
+        )
+
+    current_settings = {
+        "diff_threshold": int(diff_threshold),
+        "min_area": float(min_area),
+        "blur_kernel": int(blur_kernel),
+        "morph_kernel": int(morph_kernel),
+        "trail_frames": int(trail_frames),
+        "max_motion_ratio": float(max_motion_ratio),
+        "analysis_scale": float(analysis_scale),
+        "processing_backend": processing_backend,
+        "cuda_device": int(cuda_device),
+        "write_overlay_video": bool(write_overlay_video),
+        "write_motion_video": bool(write_motion_video),
+        "write_jsonl": bool(write_jsonl),
+        "limit_frame_range": bool(limit_frame_range),
+        "start_frame": int(start_frame),
+        "max_frames": int(max_frames),
+        "shake_protection": bool(shake_protection),
+        "shake_min_shift": float(shake_min_shift),
+        "shake_consensus": float(shake_consensus),
+        "shake_consensus_px": float(shake_consensus_px),
+        "shake_frame_stride": int(shake_frame_stride),
+        "shake_analysis_scale": float(shake_analysis_scale),
+        "shake_max_corners": int(shake_max_corners),
+        "hysteresis": bool(hysteresis),
+        "hysteresis_high_threshold": int(hysteresis_high_threshold),
+        "temporal_filter": bool(temporal_filter),
+        "track_confirmation": bool(track_confirmation),
+        "direction_consistency": bool(direction_consistency),
+        "temporal_window_frames": int(temporal_window_frames),
+        "temporal_min_hits": int(temporal_min_hits),
+        "track_confirm_hits": int(track_confirm_hits),
+        "track_max_missed": int(track_max_missed),
+        "track_match_distance": float(track_match_distance),
+        "direction_min_hits": int(direction_min_hits),
+        "direction_min_displacement": float(direction_min_displacement),
+        "direction_cosine": float(direction_cosine),
+        "roi_mask_enabled": bool(roi_mask_enabled),
+        "semantic_filter": bool(semantic_filter),
+        "semantic_action": semantic_action,
+        "semantic_conf": float(semantic_conf),
+        "semantic_overlap_threshold": float(semantic_overlap_threshold),
+        "semantic_frame_stride": int(semantic_frame_stride),
+        "semantic_warmup": bool(semantic_warmup),
+        "semantic_motion_gate": bool(semantic_motion_gate),
+        "semantic_imgsz": int(semantic_imgsz),
+        "semantic_device": semantic_device,
+        "semantic_model_repo": semantic_model_repo,
+        "semantic_model_file": semantic_model_file,
+        "semantic_weights": semantic_weights,
+    }
+    st.session_state["settings_profile_values"] = dict(current_settings)
+    with profile_download_slot.container():
+        profile_payload = settings_profile_payload(current_settings)
+        st.download_button(
+            "Export current parameters JSON",
+            json.dumps(profile_payload, indent=2),
+            file_name="motion_diff_parameters.json",
+            mime="application/json",
+            help="Saves the current UI parameters and ROI mask for later import.",
+        )
+
+tabs = st.tabs(["Upload", "Local path", "ROI mask"])
+rendered_summary_path: str | None = None
 
 
 def write_current_roi_mask(root: Path) -> Path | None:
