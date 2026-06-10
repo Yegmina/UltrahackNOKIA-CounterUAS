@@ -44,6 +44,8 @@ class MotionConfig:
     max_motion_ratio: float = 0.10
     analysis_scale: float = 0.5
     overlay_merge_distance: float = 0.0
+    overlay_hold_frames: int = 12
+    overlay_hold_expand_px: float = 10.0
     shake_protection: bool = True
     shake_min_shift: float = 1.5
     shake_consensus: float = 0.72
@@ -90,6 +92,8 @@ class MotionConfig:
             max_motion_ratio=max(0.0, float(self.max_motion_ratio)),
             analysis_scale=float(np.clip(self.analysis_scale, 0.05, 1.0)),
             overlay_merge_distance=max(0.0, float(self.overlay_merge_distance)),
+            overlay_hold_frames=max(0, int(self.overlay_hold_frames)),
+            overlay_hold_expand_px=max(0.0, float(self.overlay_hold_expand_px)),
             shake_protection=bool(self.shake_protection),
             shake_min_shift=max(0.0, float(self.shake_min_shift)),
             shake_consensus=float(np.clip(self.shake_consensus, 0.0, 1.0)),
@@ -275,6 +279,29 @@ class MotionDetection:
             if isinstance(value, float):
                 record[key] = round(value, 6)
         return record
+
+
+@dataclass(frozen=True)
+class OverlayBox:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    color: tuple[int, int, int] = (0, 255, 255)
+
+
+@dataclass(frozen=True)
+class HeldOverlayBox:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    color: tuple[int, int, int]
+    remaining_frames: int
+    total_frames: int
+
+    def overlay_box(self) -> OverlayBox:
+        return OverlayBox(self.x1, self.y1, self.x2, self.y2, self.color)
 
 
 @dataclass(frozen=True)
@@ -2000,9 +2027,19 @@ def overlay_color_priority(color: tuple[int, int, int]) -> int:
     return 0
 
 
-def detections_close_for_overlay(
-    first: MotionDetection,
-    second: MotionDetection,
+def detection_overlay_box(detection: MotionDetection) -> OverlayBox:
+    return OverlayBox(
+        x1=detection.x1,
+        y1=detection.y1,
+        x2=detection.x2,
+        y2=detection.y2,
+        color=overlay_detection_color(detection),
+    )
+
+
+def overlay_boxes_close(
+    first: OverlayBox,
+    second: OverlayBox,
     merge_distance: float,
 ) -> bool:
     if box_intersection_area(
@@ -2026,12 +2063,65 @@ def detections_close_for_overlay(
     return float(np.hypot(horizontal_gap, vertical_gap)) <= merge_distance
 
 
+def overlay_box_as_detection(box: OverlayBox) -> MotionDetection:
+    center_x = (box.x1 + box.x2) / 2.0
+    center_y = (box.y1 + box.y2) / 2.0
+    return MotionDetection(
+        x1=box.x1,
+        y1=box.y1,
+        x2=box.x2,
+        y2=box.y2,
+        center_x=center_x,
+        center_y=center_y,
+        area=max(0.0, (box.x2 - box.x1) * (box.y2 - box.y1)),
+    )
+
+
+def overlay_box_allowed_by_roi(
+    box: OverlayBox,
+    roi_mask: RoiMask | None,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    if roi_mask is None or not roi_mask.zones:
+        return True
+
+    detection = overlay_box_as_detection(box)
+    ignore_zones = [zone for zone in roi_mask.zones if zone.type == "ignore"]
+    if any(
+        detection_overlaps_zone(detection, zone, image_width, image_height)
+        for zone in ignore_zones
+    ):
+        return False
+
+    flight_zones = [zone for zone in roi_mask.zones if zone.type == "flight"]
+    if flight_zones and not any(
+        detection_overlaps_zone(detection, zone, image_width, image_height)
+        for zone in flight_zones
+    ):
+        return False
+
+    return True
+
+
+def detections_close_for_overlay(
+    first: MotionDetection,
+    second: MotionDetection,
+    merge_distance: float,
+) -> bool:
+    return overlay_boxes_close(
+        detection_overlay_box(first),
+        detection_overlay_box(second),
+        merge_distance,
+    )
+
+
 def merged_overlay_detection_boxes(
     detections: list[MotionDetection],
     merge_distance: float,
-) -> list[tuple[float, float, float, float, tuple[int, int, int]]]:
+) -> list[OverlayBox]:
     remaining = list(detections)
-    merged: list[tuple[float, float, float, float, tuple[int, int, int]]] = []
+    merged: list[OverlayBox] = []
 
     while remaining:
         group = [remaining.pop(0)]
@@ -2058,9 +2148,112 @@ def merged_overlay_detection_boxes(
             (overlay_detection_color(detection) for detection in group),
             key=overlay_color_priority,
         )
-        merged.append((x1, y1, x2, y2, color))
+        merged.append(OverlayBox(x1, y1, x2, y2, color))
 
     return merged
+
+
+def update_held_overlay_boxes(
+    previous_boxes: list[OverlayBox],
+    current_boxes: list[OverlayBox],
+    held_boxes: list[HeldOverlayBox],
+    hold_frames: int,
+    merge_distance: float,
+    roi_mask: RoiMask | None = None,
+    image_width: int = 0,
+    image_height: int = 0,
+    expand_px: float = 0.0,
+) -> list[HeldOverlayBox]:
+    hold_frames = max(0, int(hold_frames))
+    if hold_frames <= 0:
+        return []
+
+    def allowed(box: OverlayBox) -> bool:
+        if roi_mask is None:
+            return True
+        expanded = expanded_overlay_box(box, expand_px, image_width, image_height)
+        return overlay_box_allowed_by_roi(expanded, roi_mask, image_width, image_height)
+
+    next_held: list[HeldOverlayBox] = []
+    for held in held_boxes:
+        if any(overlay_boxes_close(held.overlay_box(), current, merge_distance) for current in current_boxes):
+            continue
+        if not allowed(held.overlay_box()):
+            continue
+        remaining_frames = held.remaining_frames - 1
+        if remaining_frames > 0:
+            next_held.append(replace(held, remaining_frames=remaining_frames))
+
+    for previous in previous_boxes:
+        if any(overlay_boxes_close(previous, current, merge_distance) for current in current_boxes):
+            continue
+        if not allowed(previous):
+            continue
+        if any(overlay_boxes_close(previous, held.overlay_box(), merge_distance) for held in next_held):
+            continue
+        next_held.append(
+            HeldOverlayBox(
+                x1=previous.x1,
+                y1=previous.y1,
+                x2=previous.x2,
+                y2=previous.y2,
+                color=previous.color,
+                remaining_frames=hold_frames,
+                total_frames=hold_frames,
+            )
+        )
+
+    return next_held
+
+
+def expanded_overlay_box(box: OverlayBox, expand_px: float, image_width: int, image_height: int) -> OverlayBox:
+    max_x = max(0.0, float(image_width - 1))
+    max_y = max(0.0, float(image_height - 1))
+    expand_px = max(0.0, float(expand_px))
+    return OverlayBox(
+        x1=float(np.clip(box.x1 - expand_px, 0.0, max_x)),
+        y1=float(np.clip(box.y1 - expand_px, 0.0, max_y)),
+        x2=float(np.clip(box.x2 + expand_px, 0.0, max_x)),
+        y2=float(np.clip(box.y2 + expand_px, 0.0, max_y)),
+        color=box.color,
+    )
+
+
+def held_overlay_alpha(held: HeldOverlayBox) -> float:
+    if held.total_frames <= 0:
+        return 0.0
+    return float(np.clip(0.55 * held.remaining_frames / held.total_frames, 0.0, 0.55))
+
+
+def draw_overlay_box(
+    output: np.ndarray,
+    box: OverlayBox,
+    alpha: float = 1.0,
+) -> None:
+    height, width = output.shape[:2]
+    clamped = expanded_overlay_box(box, 0.0, width, height)
+    x1, y1, x2, y2 = (
+        int(round(clamped.x1)),
+        int(round(clamped.y1)),
+        int(round(clamped.x2)),
+        int(round(clamped.y2)),
+    )
+    color = clamped.color
+    target = output if alpha >= 0.999 else output.copy()
+    cv2.rectangle(target, (x1, y1), (x2, y2), color, 2)
+    label_y = max(18, y1 - 6)
+    cv2.putText(
+        target,
+        "drone",
+        (x1, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+    if alpha < 0.999:
+        cv2.addWeighted(target, float(np.clip(alpha, 0.0, 1.0)), output, 1.0 - float(np.clip(alpha, 0.0, 1.0)), 0, dst=output)
 
 
 def render_overlay(
@@ -2086,6 +2279,9 @@ def render_overlay(
     semantic_rejected_count: int = 0,
     semantic_penalized_count: int = 0,
     overlay_merge_distance: float = 0.0,
+    overlay_boxes: list[OverlayBox] | None = None,
+    held_overlay_boxes: list[HeldOverlayBox] | None = None,
+    overlay_hold_expand_px: float = 10.0,
 ) -> np.ndarray:
     output = frame_bgr.copy()
     semantic_detections = semantic_detections or []
@@ -2110,29 +2306,21 @@ def render_overlay(
             1,
             cv2.LINE_AA,
         )
-    for box_x1, box_y1, box_x2, box_y2, color in merged_overlay_detection_boxes(
-        detections,
-        overlay_merge_distance,
-    ):
-        x1, y1, x2, y2 = (
-            int(round(box_x1)),
-            int(round(box_y1)),
-            int(round(box_x2)),
-            int(round(box_y2)),
+    real_overlay_boxes = (
+        overlay_boxes
+        if overlay_boxes is not None
+        else merged_overlay_detection_boxes(detections, overlay_merge_distance)
+    )
+    for box in real_overlay_boxes:
+        draw_overlay_box(output, box)
+    for held in held_overlay_boxes or []:
+        expanded = expanded_overlay_box(
+            held.overlay_box(),
+            overlay_hold_expand_px,
+            output.shape[1],
+            output.shape[0],
         )
-        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        label = "drone"
-        label_y = max(18, y1 - 6)
-        cv2.putText(
-            output,
-            label,
-            (x1, label_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
+        draw_overlay_box(output, expanded, alpha=held_overlay_alpha(held))
     if global_motion_rejected:
         cv2.putText(
             output,
@@ -2209,6 +2397,8 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "max_motion_ratio": config.max_motion_ratio,
         "analysis_scale": config.analysis_scale,
         "overlay_merge_distance": config.overlay_merge_distance,
+        "overlay_hold_frames": config.overlay_hold_frames,
+        "overlay_hold_expand_px": config.overlay_hold_expand_px,
         "shake_protection": config.shake_protection,
         "shake_min_shift": config.shake_min_shift,
         "shake_consensus": config.shake_consensus,
@@ -2388,6 +2578,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         max_motion_ratio=args.max_motion_ratio,
         analysis_scale=args.analysis_scale,
         overlay_merge_distance=args.overlay_merge_distance,
+        overlay_hold_frames=args.overlay_hold_frames,
+        overlay_hold_expand_px=args.overlay_hold_expand_px,
         shake_protection=not args.disable_shake_protection,
         shake_min_shift=args.shake_min_shift,
         shake_consensus=args.shake_consensus,
@@ -2565,6 +2757,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     previous_gray: np.ndarray | None = None
     trail_masks: list[np.ndarray] = []
     max_trail_masks = max(1, config.trail_frames + 1)
+    previous_overlay_boxes: list[OverlayBox] = []
+    held_overlay_boxes: list[HeldOverlayBox] = []
     frame_index = 0
     frames_with_motion = 0
     total_detections = 0
@@ -2741,6 +2935,21 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 motion_writer.write(render_motion_only(frame, trail_mask))
             if write_overlay_video:
                 assert overlay_writer is not None
+                current_overlay_boxes = merged_overlay_detection_boxes(
+                    detections,
+                    config.overlay_merge_distance,
+                )
+                held_overlay_boxes = update_held_overlay_boxes(
+                    previous_overlay_boxes,
+                    current_overlay_boxes,
+                    held_overlay_boxes,
+                    config.overlay_hold_frames,
+                    config.overlay_merge_distance,
+                    roi_mask=roi_mask,
+                    image_width=width,
+                    image_height=height,
+                    expand_px=config.overlay_hold_expand_px,
+                )
                 overlay_writer.write(
                     render_overlay(
                         frame_bgr=frame,
@@ -2765,8 +2974,12 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         semantic_rejected_count=semantic_rejected_count,
                         semantic_penalized_count=semantic_penalized_count,
                         overlay_merge_distance=config.overlay_merge_distance,
+                        overlay_boxes=current_overlay_boxes,
+                        held_overlay_boxes=held_overlay_boxes,
+                        overlay_hold_expand_px=config.overlay_hold_expand_px,
                     )
                 )
+                previous_overlay_boxes = current_overlay_boxes
 
             total_raw_detections += raw_detection_count
             total_roi_rejected += roi_rejected_count
@@ -2964,6 +3177,18 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         type=float,
         default=0.0 if not duplicate else default,
         help="Merge overlay drone boxes that overlap or are within this many pixels.",
+    )
+    parser.add_argument(
+        "--overlay-hold-frames",
+        type=int,
+        default=12 if not duplicate else default,
+        help="Keep visual-only fading overlay boxes for this many frames after motion disappears. 0 disables.",
+    )
+    parser.add_argument(
+        "--overlay-hold-expand-px",
+        type=float,
+        default=10.0 if not duplicate else default,
+        help="Expand visual-only held overlay boxes by this many pixels in each direction.",
     )
     parser.add_argument(
         "--backend",

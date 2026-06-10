@@ -5,9 +5,13 @@ import cv2
 
 from motion_diff_detector import (
     build_parser,
+    expanded_overlay_box,
+    held_overlay_alpha,
+    HeldOverlayBox,
     MotionConfig,
     MotionDetection,
     MotionTracker,
+    OverlayBox,
     RoiMask,
     RoiZone,
     SemanticConfig,
@@ -25,6 +29,7 @@ from motion_diff_detector import (
     render_motion_only,
     resolve_backend,
     roi_zone_points_pixels,
+    update_held_overlay_boxes,
 )
 
 
@@ -689,6 +694,118 @@ def test_overlay_boxes_merge_when_overlapping_or_close() -> None:
     assert len(merged_overlay_detection_boxes(overlapping, merge_distance=0)) == 1
     assert len(merged_overlay_detection_boxes(close, merge_distance=4)) == 1
     assert len(merged_overlay_detection_boxes(separate, merge_distance=4)) == 2
+
+
+def test_held_overlay_box_appears_after_real_box_disappears() -> None:
+    previous = [OverlayBox(10, 10, 20, 20)]
+
+    held = update_held_overlay_boxes(
+        previous,
+        current_boxes=[],
+        held_boxes=[],
+        hold_frames=12,
+        merge_distance=4,
+    )
+
+    assert len(held) == 1
+    assert held[0].remaining_frames == 12
+    assert held[0].total_frames == 12
+
+
+def test_held_overlay_box_expands_and_clamps() -> None:
+    box = OverlayBox(2, 3, 8, 9)
+
+    expanded = expanded_overlay_box(box, expand_px=10, image_width=20, image_height=20)
+
+    assert expanded.x1 == 0
+    assert expanded.y1 == 0
+    assert expanded.x2 == 18
+    assert expanded.y2 == 19
+
+
+def test_held_overlay_box_fades_for_exact_frame_count() -> None:
+    previous = [OverlayBox(10, 10, 20, 20)]
+    held: list[HeldOverlayBox] = []
+
+    held = update_held_overlay_boxes(previous, [], held, hold_frames=3, merge_distance=0)
+    assert [box.remaining_frames for box in held] == [3]
+    assert held_overlay_alpha(held[0]) == 0.55
+
+    held = update_held_overlay_boxes([], [], held, hold_frames=3, merge_distance=0)
+    assert [box.remaining_frames for box in held] == [2]
+
+    held = update_held_overlay_boxes([], [], held, hold_frames=3, merge_distance=0)
+    assert [box.remaining_frames for box in held] == [1]
+
+    held = update_held_overlay_boxes([], [], held, hold_frames=3, merge_distance=0)
+    assert held == []
+
+
+def test_held_overlay_box_is_suppressed_by_nearby_real_box() -> None:
+    held = [HeldOverlayBox(10, 10, 20, 20, (0, 255, 255), remaining_frames=12, total_frames=12)]
+    current = [OverlayBox(23, 10, 33, 20)]
+
+    updated = update_held_overlay_boxes(
+        previous_boxes=[],
+        current_boxes=current,
+        held_boxes=held,
+        hold_frames=12,
+        merge_distance=4,
+    )
+
+    assert updated == []
+
+
+def test_held_overlay_disabled_preserves_no_hold_behavior() -> None:
+    previous = [OverlayBox(10, 10, 20, 20)]
+
+    held = update_held_overlay_boxes(
+        previous,
+        current_boxes=[],
+        held_boxes=[],
+        hold_frames=0,
+        merge_distance=4,
+    )
+
+    assert held == []
+
+
+def test_held_overlay_box_is_suppressed_inside_roi_ignore_zone() -> None:
+    previous = [OverlayBox(10, 10, 20, 20)]
+    roi_mask = make_roi_mask("ignore", [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]])
+
+    held = update_held_overlay_boxes(
+        previous,
+        current_boxes=[],
+        held_boxes=[],
+        hold_frames=12,
+        merge_distance=4,
+        roi_mask=roi_mask,
+        image_width=100,
+        image_height=100,
+        expand_px=10,
+    )
+
+    assert held == []
+
+
+def test_held_overlay_box_is_suppressed_when_expansion_crosses_roi_ignore_zone() -> None:
+    previous = [OverlayBox(38, 10, 48, 20)]
+    roi_mask = make_roi_mask("ignore", [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]])
+
+    held = update_held_overlay_boxes(
+        previous,
+        current_boxes=[],
+        held_boxes=[],
+        hold_frames=12,
+        merge_distance=4,
+        roi_mask=roi_mask,
+        image_width=100,
+        image_height=100,
+        expand_px=10,
+    )
+
+    assert held == []
 
 
 def test_shake_estimator_reuses_between_stride_frames() -> None:

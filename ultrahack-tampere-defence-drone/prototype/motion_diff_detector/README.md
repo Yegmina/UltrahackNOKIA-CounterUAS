@@ -50,6 +50,8 @@ the combined overlay/motion videos without starting from frame 0.
 
 `Merge nearby box distance` is an overlay-only display cleanup: overlapping drone boxes always
 draw as one box, and boxes within the configured pixel distance are merged visually too.
+`Held box frames` and `Held box expansion px` are also overlay-only: when a drone box disappears,
+the last box fades out for the configured number of frames unless a real box appears nearby.
 
 Preset files live in `prototype/motion_diff_detector/profiles/` and can be imported from the
 `Parameter profile` panel. `slow_drone_sensitivity.json` is tuned from the aggressive IR profile

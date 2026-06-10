@@ -56,6 +56,8 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "max_motion_ratio": 0.10,
     "analysis_scale": 0.50,
     "overlay_merge_distance": 0.0,
+    "overlay_hold_frames": 12,
+    "overlay_hold_expand_px": 10.0,
     "processing_backend": "auto",
     "cuda_device": 0,
     "write_overlay_video": True,
@@ -125,6 +127,8 @@ SETTING_RANGES: dict[str, tuple[float, float]] = {
     "max_motion_ratio": (0.01, 1.0),
     "analysis_scale": (0.10, 1.0),
     "overlay_merge_distance": (0.0, 500.0),
+    "overlay_hold_frames": (0, 120),
+    "overlay_hold_expand_px": (0.0, 200.0),
     "cuda_device": (0, 64),
     "start_frame": (0, 1000000000),
     "max_frames": (1, 1000000000),
@@ -479,6 +483,25 @@ with st.sidebar:
         5.0,
         key=setting_key("overlay_merge_distance"),
         help="Overlay-only cleanup. Drone boxes that overlap or are within this pixel distance are drawn as one box.",
+    )
+    overlay_hold_frames = st.slider(
+        "Held box frames",
+        0,
+        120,
+        setting_value("overlay_hold_frames"),
+        1,
+        key=setting_key("overlay_hold_frames"),
+        help="Overlay-only hold. Keeps a fading drone box after motion disappears. Set 0 to disable.",
+    )
+    overlay_hold_expand_px = st.slider(
+        "Held box expansion px",
+        0.0,
+        200.0,
+        setting_value("overlay_hold_expand_px"),
+        1.0,
+        key=setting_key("overlay_hold_expand_px"),
+        disabled=overlay_hold_frames == 0,
+        help="Expands held/fading drone boxes by this many pixels on each side.",
     )
     st.divider()
     st.caption("Performance / outputs")
@@ -968,6 +991,8 @@ with st.sidebar:
         "max_motion_ratio": float(max_motion_ratio),
         "analysis_scale": float(analysis_scale),
         "overlay_merge_distance": float(overlay_merge_distance),
+        "overlay_hold_frames": int(overlay_hold_frames),
+        "overlay_hold_expand_px": float(overlay_hold_expand_px),
         "processing_backend": processing_backend,
         "cuda_device": int(cuda_device),
         "write_overlay_video": bool(write_overlay_video),
@@ -1399,6 +1424,10 @@ def common_cli_args(
         str(float(analysis_scale)),
         "--overlay-merge-distance",
         str(float(overlay_merge_distance)),
+        "--overlay-hold-frames",
+        str(int(overlay_hold_frames)),
+        "--overlay-hold-expand-px",
+        str(float(overlay_hold_expand_px)),
         "--backend",
         processing_backend,
         "--cuda-device",
