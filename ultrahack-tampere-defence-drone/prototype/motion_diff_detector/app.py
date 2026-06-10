@@ -58,6 +58,7 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "overlay_merge_distance": 0.0,
     "overlay_hold_frames": 12,
     "overlay_hold_expand_px": 10.0,
+    "overlay_debug_text": False,
     "processing_backend": "auto",
     "cuda_device": 0,
     "write_overlay_video": True,
@@ -531,6 +532,13 @@ with st.sidebar:
         key=setting_key("write_overlay_video"),
         help="Writes the annotated MP4. Turn off for fastest settings searches.",
     )
+    overlay_debug_text = st.checkbox(
+        "Show overlay debug text",
+        value=setting_value("overlay_debug_text"),
+        key=setting_key("overlay_debug_text"),
+        disabled=not write_overlay_video,
+        help="Draws the top-left ROI/filter/semantic/shake diagnostics on the overlay video.",
+    )
     write_motion_video = st.checkbox(
         "Write motion-only video",
         value=setting_value("write_motion_video"),
@@ -993,6 +1001,7 @@ with st.sidebar:
         "overlay_merge_distance": float(overlay_merge_distance),
         "overlay_hold_frames": int(overlay_hold_frames),
         "overlay_hold_expand_px": float(overlay_hold_expand_px),
+        "overlay_debug_text": bool(overlay_debug_text),
         "processing_backend": processing_backend,
         "cuda_device": int(cuda_device),
         "write_overlay_video": bool(write_overlay_video),
@@ -1491,6 +1500,8 @@ def common_cli_args(
         args.append("--no-motion-video")
     if not write_overlay_video:
         args.append("--no-overlay-video")
+    if overlay_debug_text:
+        args.append("--overlay-debug-text")
     if not write_jsonl:
         args.append("--no-jsonl")
     effective_start_frame = (

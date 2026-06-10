@@ -46,6 +46,7 @@ class MotionConfig:
     overlay_merge_distance: float = 0.0
     overlay_hold_frames: int = 12
     overlay_hold_expand_px: float = 10.0
+    overlay_debug_text: bool = False
     shake_protection: bool = True
     shake_min_shift: float = 1.5
     shake_consensus: float = 0.72
@@ -94,6 +95,7 @@ class MotionConfig:
             overlay_merge_distance=max(0.0, float(self.overlay_merge_distance)),
             overlay_hold_frames=max(0, int(self.overlay_hold_frames)),
             overlay_hold_expand_px=max(0.0, float(self.overlay_hold_expand_px)),
+            overlay_debug_text=bool(self.overlay_debug_text),
             shake_protection=bool(self.shake_protection),
             shake_min_shift=max(0.0, float(self.shake_min_shift)),
             shake_consensus=float(np.clip(self.shake_consensus, 0.0, 1.0)),
@@ -1786,7 +1788,12 @@ def analyze_gray_pair(
     cuda_processor: CudaMotionProcessor | None = None,
 ) -> MotionAnalysis:
     config = config.normalized()
-    semantic_detections = semantic_detections or []
+    semantic_detections = filter_semantic_detections_by_roi(
+        semantic_detections or [],
+        roi_mask,
+        image_width,
+        image_height,
+    )
     compare_gray = previous_gray
     global_dx = 0.0
     global_dy = 0.0
@@ -2104,6 +2111,40 @@ def overlay_box_allowed_by_roi(
     return True
 
 
+def semantic_detection_allowed_by_roi(
+    detection: SemanticDetection,
+    roi_mask: RoiMask | None,
+    image_width: int,
+    image_height: int,
+) -> bool:
+    return overlay_box_allowed_by_roi(
+        OverlayBox(detection.x1, detection.y1, detection.x2, detection.y2),
+        roi_mask,
+        image_width,
+        image_height,
+    )
+
+
+def filter_semantic_detections_by_roi(
+    detections: list[SemanticDetection],
+    roi_mask: RoiMask | None,
+    image_width: int,
+    image_height: int,
+) -> list[SemanticDetection]:
+    if roi_mask is None or not roi_mask.zones:
+        return detections
+    return [
+        detection
+        for detection in detections
+        if semantic_detection_allowed_by_roi(
+            detection,
+            roi_mask,
+            image_width,
+            image_height,
+        )
+    ]
+
+
 def detections_close_for_overlay(
     first: MotionDetection,
     second: MotionDetection,
@@ -2116,11 +2157,33 @@ def detections_close_for_overlay(
     )
 
 
+def merged_overlay_box(boxes: list[OverlayBox]) -> OverlayBox:
+    return OverlayBox(
+        min(box.x1 for box in boxes),
+        min(box.y1 for box in boxes),
+        max(box.x2 for box in boxes),
+        max(box.y2 for box in boxes),
+        max((box.color for box in boxes), key=overlay_color_priority),
+    )
+
+
 def merged_overlay_detection_boxes(
     detections: list[MotionDetection],
     merge_distance: float,
+    roi_mask: RoiMask | None = None,
+    image_width: int = 0,
+    image_height: int = 0,
 ) -> list[OverlayBox]:
-    remaining = list(detections)
+    remaining = [
+        detection_overlay_box(detection)
+        for detection in detections
+        if overlay_box_allowed_by_roi(
+            detection_overlay_box(detection),
+            roi_mask,
+            image_width,
+            image_height,
+        )
+    ]
     merged: list[OverlayBox] = []
 
     while remaining:
@@ -2128,27 +2191,30 @@ def merged_overlay_detection_boxes(
         changed = True
         while changed:
             changed = False
-            next_remaining: list[MotionDetection] = []
+            next_remaining: list[OverlayBox] = []
             for candidate in remaining:
                 if any(
-                    detections_close_for_overlay(candidate, existing, merge_distance)
+                    overlay_boxes_close(candidate, existing, merge_distance)
                     for existing in group
                 ):
+                    candidate_merged_box = merged_overlay_box([*group, candidate])
+                    if not overlay_box_allowed_by_roi(
+                        candidate_merged_box,
+                        roi_mask,
+                        image_width,
+                        image_height,
+                    ):
+                        next_remaining.append(candidate)
+                        continue
                     group.append(candidate)
                     changed = True
                 else:
                     next_remaining.append(candidate)
             remaining = next_remaining
 
-        x1 = min(detection.x1 for detection in group)
-        y1 = min(detection.y1 for detection in group)
-        x2 = max(detection.x2 for detection in group)
-        y2 = max(detection.y2 for detection in group)
-        color = max(
-            (overlay_detection_color(detection) for detection in group),
-            key=overlay_color_priority,
-        )
-        merged.append(OverlayBox(x1, y1, x2, y2, color))
+        merged_box = merged_overlay_box(group)
+        if overlay_box_allowed_by_roi(merged_box, roi_mask, image_width, image_height):
+            merged.append(merged_box)
 
     return merged
 
@@ -2282,9 +2348,16 @@ def render_overlay(
     overlay_boxes: list[OverlayBox] | None = None,
     held_overlay_boxes: list[HeldOverlayBox] | None = None,
     overlay_hold_expand_px: float = 10.0,
+    overlay_debug_text: bool = False,
+    roi_mask: RoiMask | None = None,
 ) -> np.ndarray:
     output = frame_bgr.copy()
-    semantic_detections = semantic_detections or []
+    semantic_detections = filter_semantic_detections_by_roi(
+        semantic_detections or [],
+        roi_mask,
+        output.shape[1],
+        output.shape[0],
+    )
     for semantic_detection in semantic_detections:
         x1, y1, x2, y2 = (
             int(round(semantic_detection.x1)),
@@ -2307,9 +2380,19 @@ def render_overlay(
             cv2.LINE_AA,
         )
     real_overlay_boxes = (
-        overlay_boxes
+        [
+            box
+            for box in overlay_boxes
+            if overlay_box_allowed_by_roi(box, roi_mask, output.shape[1], output.shape[0])
+        ]
         if overlay_boxes is not None
-        else merged_overlay_detection_boxes(detections, overlay_merge_distance)
+        else merged_overlay_detection_boxes(
+            detections,
+            overlay_merge_distance,
+            roi_mask=roi_mask,
+            image_width=output.shape[1],
+            image_height=output.shape[0],
+        )
     )
     for box in real_overlay_boxes:
         draw_overlay_box(output, box)
@@ -2321,69 +2404,70 @@ def render_overlay(
             output.shape[0],
         )
         draw_overlay_box(output, expanded, alpha=held_overlay_alpha(held))
-    if global_motion_rejected:
-        cv2.putText(
-            output,
-            "global residual rejected",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    elif global_motion_detected:
-        cv2.putText(
-            output,
-            f"shake compensated dx={global_dx:.1f} dy={global_dy:.1f} c={global_consensus:.2f}",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 220, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    if roi_active:
-        cv2.putText(
-            output,
-            f"ROI rejected={roi_rejected_count} penalized={roi_penalized_count}",
-            (12, 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    if motion_filters_active:
-        cv2.putText(
-            output,
-            (
-                f"Filter rejected temporal={temporal_rejected_count} "
-                f"unconfirmed={unconfirmed_rejected_count} direction={direction_rejected_count} "
-                f"drone={drone_track_rejected_count} screen={screen_decoy_rejected_count} "
-                f"recovered={occlusion_recovered_count}"
-            ),
-            (12, 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    if semantic_active:
-        cv2.putText(
-            output,
-            (
-                f"Semantic objects={len(semantic_detections)} "
-                f"rejected={semantic_rejected_count} penalized={semantic_penalized_count}"
-            ),
-            (12, 112),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    if overlay_debug_text:
+        if global_motion_rejected:
+            cv2.putText(
+                output,
+                "global residual rejected",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        elif global_motion_detected:
+            cv2.putText(
+                output,
+                f"shake compensated dx={global_dx:.1f} dy={global_dy:.1f} c={global_consensus:.2f}",
+                (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 220, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        if roi_active:
+            cv2.putText(
+                output,
+                f"ROI rejected={roi_rejected_count} penalized={roi_penalized_count}",
+                (12, 56),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        if motion_filters_active:
+            cv2.putText(
+                output,
+                (
+                    f"Filter rejected temporal={temporal_rejected_count} "
+                    f"unconfirmed={unconfirmed_rejected_count} direction={direction_rejected_count} "
+                    f"drone={drone_track_rejected_count} screen={screen_decoy_rejected_count} "
+                    f"recovered={occlusion_recovered_count}"
+                ),
+                (12, 84),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        if semantic_active:
+            cv2.putText(
+                output,
+                (
+                    f"Semantic objects={len(semantic_detections)} "
+                    f"rejected={semantic_rejected_count} penalized={semantic_penalized_count}"
+                ),
+                (12, 112),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
     return output
 
 
@@ -2399,6 +2483,7 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "overlay_merge_distance": config.overlay_merge_distance,
         "overlay_hold_frames": config.overlay_hold_frames,
         "overlay_hold_expand_px": config.overlay_hold_expand_px,
+        "overlay_debug_text": config.overlay_debug_text,
         "shake_protection": config.shake_protection,
         "shake_min_shift": config.shake_min_shift,
         "shake_consensus": config.shake_consensus,
@@ -2580,6 +2665,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         overlay_merge_distance=args.overlay_merge_distance,
         overlay_hold_frames=args.overlay_hold_frames,
         overlay_hold_expand_px=args.overlay_hold_expand_px,
+        overlay_debug_text=args.overlay_debug_text,
         shake_protection=not args.disable_shake_protection,
         shake_min_shift=args.shake_min_shift,
         shake_consensus=args.shake_consensus,
@@ -2938,6 +3024,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 current_overlay_boxes = merged_overlay_detection_boxes(
                     detections,
                     config.overlay_merge_distance,
+                    roi_mask=roi_mask,
+                    image_width=width,
+                    image_height=height,
                 )
                 held_overlay_boxes = update_held_overlay_boxes(
                     previous_overlay_boxes,
@@ -2977,6 +3066,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         overlay_boxes=current_overlay_boxes,
                         held_overlay_boxes=held_overlay_boxes,
                         overlay_hold_expand_px=config.overlay_hold_expand_px,
+                        overlay_debug_text=config.overlay_debug_text,
+                        roi_mask=roi_mask,
                     )
                 )
                 previous_overlay_boxes = current_overlay_boxes
@@ -3189,6 +3280,12 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         type=float,
         default=10.0 if not duplicate else default,
         help="Expand visual-only held overlay boxes by this many pixels in each direction.",
+    )
+    parser.add_argument(
+        "--overlay-debug-text",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Draw top-left diagnostic text on the annotated overlay MP4.",
     )
     parser.add_argument(
         "--backend",

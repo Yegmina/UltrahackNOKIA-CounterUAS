@@ -27,6 +27,7 @@ from motion_diff_detector import (
     process_video,
     progress_payload,
     render_motion_only,
+    render_overlay,
     resolve_backend,
     roi_zone_points_pixels,
     update_held_overlay_boxes,
@@ -806,6 +807,78 @@ def test_held_overlay_box_is_suppressed_when_expansion_crosses_roi_ignore_zone()
     )
 
     assert held == []
+
+
+def test_overlay_debug_text_is_disabled_by_default() -> None:
+    frame = np.zeros((120, 220, 3), dtype=np.uint8)
+
+    output = render_overlay(
+        frame_bgr=frame,
+        detections=[],
+        global_motion_detected=True,
+        global_dx=1.0,
+        global_dy=2.0,
+        global_consensus=0.9,
+        roi_active=True,
+        roi_rejected_count=2,
+        motion_filters_active=True,
+        temporal_rejected_count=3,
+        semantic_active=True,
+        semantic_rejected_count=4,
+    )
+
+    assert np.array_equal(output, frame)
+
+
+def test_overlay_debug_text_can_be_enabled() -> None:
+    frame = np.zeros((120, 220, 3), dtype=np.uint8)
+
+    output = render_overlay(
+        frame_bgr=frame,
+        detections=[],
+        roi_active=True,
+        roi_rejected_count=2,
+        overlay_debug_text=True,
+    )
+
+    assert not np.array_equal(output, frame)
+
+
+def test_semantic_overlay_boxes_respect_roi_ignore_zone() -> None:
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    roi_mask = make_roi_mask("ignore", [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]])
+    semantic_detections = [
+        SemanticDetection("person", "person", 0.9, 10.0, 10.0, 30.0, 40.0),
+        SemanticDetection("person", "person", 0.9, 70.0, 10.0, 90.0, 40.0),
+    ]
+
+    output = render_overlay(
+        frame_bgr=frame,
+        detections=[],
+        semantic_detections=semantic_detections,
+        roi_mask=roi_mask,
+    )
+
+    assert not np.any(output[:, :50])
+    assert np.any(output[:, 50:])
+
+
+def test_merged_overlay_boxes_do_not_bridge_roi_ignore_zone() -> None:
+    roi_mask = make_roi_mask("ignore", [[0.4, 0.0], [0.6, 0.0], [0.6, 1.0], [0.4, 1.0]])
+    detections = [
+        make_detection(30.0, 50.0),
+        make_detection(70.0, 50.0),
+    ]
+
+    boxes = merged_overlay_detection_boxes(
+        detections,
+        merge_distance=50.0,
+        roi_mask=roi_mask,
+        image_width=100,
+        image_height=100,
+    )
+
+    assert len(boxes) == 2
 
 
 def test_shake_estimator_reuses_between_stride_frames() -> None:
