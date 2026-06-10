@@ -15,4 +15,6 @@ cache/
 .env
 .venv*/
 __pycache__/
-.streamlit/
+.streamlit/*
+!.streamlit/
+!.streamlit/config.toml

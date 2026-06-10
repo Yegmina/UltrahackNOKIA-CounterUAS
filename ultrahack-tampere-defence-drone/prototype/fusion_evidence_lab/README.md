@@ -26,6 +26,8 @@ Open:
 http://127.0.0.1:8511
 ```
 
+The UI is configured for uploads up to `8192 MB` per file. For very large local files, the path inputs are still faster than browser upload.
+
 ## CLI
 
 ```powershell
