@@ -41,6 +41,12 @@ if "uploaded_video_cache_id" not in st.session_state:
     st.session_state["uploaded_video_cache_id"] = None
 if "uploaded_video_cache_path" not in st.session_state:
     st.session_state["uploaded_video_cache_path"] = ""
+if "active_stop_file" not in st.session_state:
+    st.session_state["active_stop_file"] = None
+if "last_summary_path" not in st.session_state:
+    st.session_state["last_summary_path"] = ""
+if "last_run_root" not in st.session_state:
+    st.session_state["last_run_root"] = ""
 
 with st.sidebar:
     diff_threshold = st.slider(
@@ -388,6 +394,7 @@ with st.sidebar:
         )
 
 tabs = st.tabs(["Upload", "Local path", "ROI mask"])
+rendered_summary_path: str | None = None
 
 
 def clamp01(value: float) -> float:
@@ -450,6 +457,21 @@ def make_run_root() -> Path:
 
 def request_stop_file(path: str) -> None:
     Path(path).write_text("stop\n", encoding="utf-8")
+
+
+def remember_run_paths(run_root: Path, out_dir: Path) -> None:
+    st.session_state["last_run_root"] = str(run_root)
+    st.session_state["last_summary_path"] = str(out_dir / "summary.json")
+
+
+def load_summary_file(path: str | Path) -> dict | None:
+    summary_path = Path(path)
+    if not summary_path.exists():
+        return None
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def safe_cache_name(name: str) -> str:
@@ -1003,6 +1025,7 @@ with tabs[0]:
         run_root = make_run_root()
         out_dir = run_root / "outputs"
         stop_file = run_root / "stop_requested"
+        remember_run_paths(run_root, out_dir)
         st.session_state["active_stop_file"] = str(stop_file)
         roi_mask_path = write_current_roi_mask(run_root)
         if roi_mask_enabled and roi_mask_path is None:
@@ -1013,12 +1036,14 @@ with tabs[0]:
                     ["video", str(uploaded_video_path), *common_cli_args(out_dir, roi_mask_path)],
                     stop_file=stop_file,
                 )
+                st.session_state["last_summary_path"] = str(summary.get("summary_path", out_dir / "summary.json"))
             except Exception as exc:
                 st.error(f"Detector failed: {type(exc).__name__}: {exc}")
                 st.stop()
             finally:
                 st.session_state["active_stop_file"] = None
         render_outputs(summary)
+        rendered_summary_path = str(summary.get("summary_path", ""))
 
 
 with tabs[1]:
@@ -1031,6 +1056,7 @@ with tabs[1]:
         run_root = make_run_root()
         out_dir = run_root / "outputs"
         stop_file = run_root / "stop_requested"
+        remember_run_paths(run_root, out_dir)
         st.session_state["active_stop_file"] = str(stop_file)
         roi_mask_path = write_current_roi_mask(run_root)
         if roi_mask_enabled and roi_mask_path is None:
@@ -1041,12 +1067,14 @@ with tabs[1]:
                     ["video", local_path.strip(), *common_cli_args(out_dir, roi_mask_path)],
                     stop_file=stop_file,
                 )
+                st.session_state["last_summary_path"] = str(summary.get("summary_path", out_dir / "summary.json"))
             except Exception as exc:
                 st.error(f"Detector failed: {type(exc).__name__}: {exc}")
                 st.stop()
             finally:
                 st.session_state["active_stop_file"] = None
         render_outputs(summary)
+        rendered_summary_path = str(summary.get("summary_path", ""))
 
 
 with tabs[2]:
@@ -1198,3 +1226,14 @@ with tabs[2]:
         st.metric("Zones", len(st.session_state["roi_zones"]))
         st.metric("Pending points", len(st.session_state["roi_points"]))
         st.json(current_roi_mask_payload(), expanded=False)
+
+
+last_summary_path = st.session_state.get("last_summary_path", "")
+if last_summary_path and last_summary_path != rendered_summary_path:
+    latest_summary = load_summary_file(last_summary_path)
+    if latest_summary is not None:
+        st.divider()
+        st.subheader("Latest run output")
+        render_outputs(latest_summary)
+    elif st.session_state.get("last_run_root"):
+        st.info("Latest run output is still finalizing. Refresh after a moment if it does not appear.")
