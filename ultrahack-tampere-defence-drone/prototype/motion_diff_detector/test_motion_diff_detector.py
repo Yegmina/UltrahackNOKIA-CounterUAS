@@ -9,7 +9,10 @@ from motion_diff_detector import (
     MotionTracker,
     RoiMask,
     RoiZone,
+    SemanticConfig,
+    SemanticDetection,
     analyze_gray_pair,
+    filter_candidates_by_semantics,
     prepare_gray,
     render_motion_only,
     roi_zone_points_pixels,
@@ -39,6 +42,25 @@ def make_detection(center_x: float, center_y: float, area: float = 100.0) -> Mot
 
 def dummy_contour() -> np.ndarray:
     return np.array([[[0, 0]], [[1, 0]], [[1, 1]], [[0, 1]]], dtype=np.int32)
+
+
+def make_semantic_detection(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    label: str = "person",
+    confidence: float = 0.8,
+) -> SemanticDetection:
+    return SemanticDetection(
+        label=label,
+        raw_label=label,
+        confidence=confidence,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+    )
 
 
 def test_static_frames_produce_no_motion() -> None:
@@ -259,6 +281,47 @@ def test_roi_penalty_zone_keeps_and_tags_detection() -> None:
     assert detection.zone_name == "penalty_zone"
     assert detection.roi_penalty == 0.35
     assert np.count_nonzero(analysis.accepted_mask) > 0
+
+
+def test_semantic_person_filter_rejects_overlapping_motion() -> None:
+    result = filter_candidates_by_semantics(
+        [(make_detection(20, 20), dummy_contour())],
+        [make_semantic_detection(10, 10, 30, 30)],
+        SemanticConfig(enabled=True, labels=("person",), action="reject", overlap_threshold=0.15),
+    )
+
+    assert result.candidates == []
+    assert result.rejected_count == 1
+    assert result.penalized_count == 0
+
+
+def test_semantic_person_filter_keeps_non_overlapping_motion() -> None:
+    result = filter_candidates_by_semantics(
+        [(make_detection(80, 80), dummy_contour())],
+        [make_semantic_detection(10, 10, 30, 30)],
+        SemanticConfig(enabled=True, labels=("person",), action="reject", overlap_threshold=0.15),
+    )
+
+    assert len(result.candidates) == 1
+    assert result.rejected_count == 0
+    assert result.candidates[0][0].semantic_action == "keep"
+
+
+def test_semantic_person_filter_can_penalize_overlapping_motion() -> None:
+    result = filter_candidates_by_semantics(
+        [(make_detection(20, 20), dummy_contour())],
+        [make_semantic_detection(10, 10, 30, 30, confidence=0.6)],
+        SemanticConfig(enabled=True, labels=("person",), action="penalize", overlap_threshold=0.15),
+    )
+
+    assert result.rejected_count == 0
+    assert result.penalized_count == 1
+    assert len(result.candidates) == 1
+    detection = result.candidates[0][0]
+    assert detection.semantic_action == "penalize"
+    assert detection.semantic_label == "person"
+    assert detection.semantic_confidence == 0.6
+    assert detection.semantic_overlap == 1.0
 
 
 def test_threshold_filters_weak_noise() -> None:

@@ -72,8 +72,57 @@ Common options:
 --direction-min-displacement 2
 --direction-cosine 0.20
 --roi-mask path\to\roi_mask.json
+--enable-semantic-filter
+--semantic-labels person
+--semantic-action reject
+--semantic-conf 0.05
+--semantic-imgsz 960
+--semantic-device mps
+--semantic-frame-stride 2
+--semantic-overlap-threshold 0.15
 --json
 ```
+
+## Flying Object AI Overlay
+
+Run the pretrained `devanshty/WingID` model on a video and draw detected `Bird` boxes:
+
+```bash
+python3 prototype/motion_diff_detector/flying_object_annotator.py \
+  "/path/to/fake-bird-video.MOV" \
+  --out-dir local_tests/flying_object_ai \
+  --labels bird \
+  --conf 0.03 \
+  --imgsz 960 \
+  --frame-stride 1
+```
+
+This is a semantic overlay test only. It does not yet suppress or boost motion-diff detections. Outputs:
+
+- `*_flying_objects.mp4`
+- `*_flying_objects.jsonl`
+- `*_flying_objects_summary.json`
+
+The earlier `Javvanny/yolov8m_flying_objects_detection` test was kept optional via `--model-repo` and `--model-file`, but on the `IMG_2781.MOV` fake-bird clip it mostly mislabeled the hanging props and arena geometry as `airplane`.
+
+## Human Semantic Filter
+
+The motion-diff runner can optionally use the WingID/YOLO11l `person` class to suppress false motion from people:
+
+```bash
+python3 prototype/motion_diff_detector/motion_diff_detector.py video \
+  "/path/to/video.mp4" \
+  --enable-semantic-filter \
+  --semantic-labels person \
+  --semantic-action reject \
+  --semantic-conf 0.05 \
+  --semantic-imgsz 960 \
+  --semantic-device mps \
+  --semantic-frame-stride 2 \
+  --semantic-overlap-threshold 0.15
+```
+
+Person boxes are drawn in green on the overlay. Motion boxes overlapping person boxes are rejected by default, or tagged as semantic penalties when `--semantic-action penalize` is used. Summary JSON includes `semantic_detection_count`, `semantic_rejected_count`, `semantic_penalized_count`, and `processing_ms_per_frame`.
 
 ## Small Drone Noise Filters
 

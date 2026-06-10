@@ -17,6 +17,17 @@ import numpy as np
 DEFAULT_OUTPUT_ROOT = Path(__file__).with_name("outputs")
 ROI_ZONE_TYPES = {"ignore", "penalty", "flight"}
 ROI_MASK_MODES = {"fixed", "handheld"}
+DEFAULT_SEMANTIC_MODEL_REPO = "devanshty/WingID"
+DEFAULT_SEMANTIC_MODEL_FILE = "yolo11l.pt"
+SEMANTIC_ACTIONS = {"reject", "penalize"}
+SEMANTIC_LABEL_ALIASES = {
+    "human": "person",
+    "person": "person",
+    "people": "person",
+    "pedestrian": "person",
+    "bird": "bird",
+    "птица": "bird",
+}
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,65 @@ class RoiMask:
 
 
 @dataclass(frozen=True)
+class SemanticConfig:
+    enabled: bool = False
+    labels: tuple[str, ...] = ("person",)
+    action: str = "reject"
+    model_repo: str = DEFAULT_SEMANTIC_MODEL_REPO
+    model_file: str = DEFAULT_SEMANTIC_MODEL_FILE
+    weights: str | None = None
+    confidence: float = 0.05
+    iou: float = 0.50
+    image_size: int = 960
+    device: str | None = None
+    frame_stride: int = 2
+    overlap_threshold: float = 0.15
+
+    def normalized(self) -> "SemanticConfig":
+        labels = tuple(
+            dict.fromkeys(
+                canonical_semantic_label(label)
+                for label in self.labels
+                if canonical_semantic_label(label)
+            )
+        )
+        action = self.action if self.action in SEMANTIC_ACTIONS else "reject"
+        device = str(self.device).strip() if self.device is not None else None
+        return SemanticConfig(
+            enabled=bool(self.enabled),
+            labels=labels or ("person",),
+            action=action,
+            model_repo=str(self.model_repo or DEFAULT_SEMANTIC_MODEL_REPO),
+            model_file=str(self.model_file or DEFAULT_SEMANTIC_MODEL_FILE),
+            weights=str(self.weights).strip() or None if self.weights else None,
+            confidence=float(np.clip(self.confidence, 0.001, 1.0)),
+            iou=float(np.clip(self.iou, 0.01, 1.0)),
+            image_size=max(320, int(self.image_size)),
+            device=device or None,
+            frame_stride=max(1, int(self.frame_stride)),
+            overlap_threshold=float(np.clip(self.overlap_threshold, 0.0, 1.0)),
+        )
+
+
+@dataclass(frozen=True)
+class SemanticDetection:
+    label: str
+    raw_label: str
+    confidence: float
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+    def to_json_dict(self) -> dict[str, Any]:
+        record = asdict(self)
+        for key, value in record.items():
+            if isinstance(value, float):
+                record[key] = round(value, 6)
+        return record
+
+
+@dataclass(frozen=True)
 class MotionDetection:
     x1: float
     y1: float
@@ -113,6 +183,10 @@ class MotionDetection:
     motion_dx: float = 0.0
     motion_dy: float = 0.0
     direction_consistent: bool = True
+    semantic_action: str = "keep"
+    semantic_label: str | None = None
+    semantic_confidence: float = 0.0
+    semantic_overlap: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         record = asdict(self)
@@ -139,9 +213,13 @@ class MotionFrameResult:
     raw_detection_count: int
     roi_rejected_count: int
     roi_penalized_count: int
+    semantic_detection_count: int
+    semantic_rejected_count: int
+    semantic_penalized_count: int
     temporal_rejected_count: int
     unconfirmed_rejected_count: int
     direction_rejected_count: int
+    semantic_detections: list[SemanticDetection]
     detections: list[MotionDetection]
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -161,9 +239,15 @@ class MotionFrameResult:
             "raw_detection_count": int(self.raw_detection_count),
             "roi_rejected_count": int(self.roi_rejected_count),
             "roi_penalized_count": int(self.roi_penalized_count),
+            "semantic_detection_count": int(self.semantic_detection_count),
+            "semantic_rejected_count": int(self.semantic_rejected_count),
+            "semantic_penalized_count": int(self.semantic_penalized_count),
             "temporal_rejected_count": int(self.temporal_rejected_count),
             "unconfirmed_rejected_count": int(self.unconfirmed_rejected_count),
             "direction_rejected_count": int(self.direction_rejected_count),
+            "semantic_detections": [
+                detection.to_json_dict() for detection in self.semantic_detections
+            ],
             "detections": [detection.to_json_dict() for detection in self.detections],
         }
 
@@ -182,9 +266,18 @@ class MotionAnalysis:
     raw_detection_count: int = 0
     roi_rejected_count: int = 0
     roi_penalized_count: int = 0
+    semantic_detections: list[SemanticDetection] = field(default_factory=list)
+    semantic_detection_count: int = 0
+    semantic_rejected_count: int = 0
+    semantic_penalized_count: int = 0
     temporal_rejected_count: int = 0
     unconfirmed_rejected_count: int = 0
     direction_rejected_count: int = 0
+
+
+def canonical_semantic_label(label: str) -> str:
+    normalized = str(label).strip().lower()
+    return SEMANTIC_LABEL_ALIASES.get(normalized, normalized)
 
 
 def odd_kernel(value: int) -> int:
@@ -381,6 +474,189 @@ def filter_detection_by_roi(
             )
 
     return detection
+
+
+def box_intersection_area(
+    ax1: float,
+    ay1: float,
+    ax2: float,
+    ay2: float,
+    bx1: float,
+    by1: float,
+    bx2: float,
+    by2: float,
+) -> float:
+    x1 = max(ax1, bx1)
+    y1 = max(ay1, by1)
+    x2 = min(ax2, bx2)
+    y2 = min(ay2, by2)
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def point_in_semantic_box(x: float, y: float, semantic_detection: SemanticDetection) -> bool:
+    return (
+        semantic_detection.x1 <= x <= semantic_detection.x2
+        and semantic_detection.y1 <= y <= semantic_detection.y2
+    )
+
+
+def semantic_overlap_ratio(
+    detection: MotionDetection,
+    semantic_detection: SemanticDetection,
+) -> float:
+    detection_area = max(1e-9, (detection.x2 - detection.x1) * (detection.y2 - detection.y1))
+    intersection = box_intersection_area(
+        detection.x1,
+        detection.y1,
+        detection.x2,
+        detection.y2,
+        semantic_detection.x1,
+        semantic_detection.y1,
+        semantic_detection.x2,
+        semantic_detection.y2,
+    )
+    if intersection > 0.0:
+        return float(np.clip(intersection / detection_area, 0.0, 1.0))
+    if point_in_semantic_box(detection.center_x, detection.center_y, semantic_detection):
+        return 1.0
+    return 0.0
+
+
+@dataclass(frozen=True)
+class SemanticFilterResult:
+    candidates: list[tuple[MotionDetection, np.ndarray]]
+    rejected_count: int = 0
+    penalized_count: int = 0
+
+
+def filter_candidates_by_semantics(
+    candidates: list[tuple[MotionDetection, np.ndarray]],
+    semantic_detections: list[SemanticDetection],
+    semantic_config: SemanticConfig | None,
+) -> SemanticFilterResult:
+    if semantic_config is None or not semantic_config.enabled or not semantic_detections:
+        return SemanticFilterResult(candidates=candidates)
+
+    config = semantic_config.normalized()
+    semantic_detections = [
+        semantic_detection
+        for semantic_detection in semantic_detections
+        if semantic_detection.label in config.labels
+        and semantic_detection.confidence >= config.confidence
+    ]
+    if not semantic_detections:
+        return SemanticFilterResult(candidates=candidates)
+
+    kept: list[tuple[MotionDetection, np.ndarray]] = []
+    rejected_count = 0
+    penalized_count = 0
+    for detection, contour in candidates:
+        best_detection: SemanticDetection | None = None
+        best_overlap = 0.0
+        for semantic_detection in semantic_detections:
+            overlap = semantic_overlap_ratio(detection, semantic_detection)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_detection = semantic_detection
+
+        if best_detection is None or best_overlap < config.overlap_threshold:
+            kept.append((detection, contour))
+            continue
+
+        tagged_detection = replace(
+            detection,
+            semantic_action=config.action,
+            semantic_label=best_detection.label,
+            semantic_confidence=best_detection.confidence,
+            semantic_overlap=best_overlap,
+        )
+        if config.action == "reject":
+            rejected_count += 1
+            continue
+
+        penalized_count += 1
+        kept.append((tagged_detection, contour))
+
+    return SemanticFilterResult(
+        candidates=kept,
+        rejected_count=rejected_count,
+        penalized_count=penalized_count,
+    )
+
+
+class SemanticDetector:
+    def __init__(self, config: SemanticConfig):
+        self.config = config.normalized()
+        self.last_detections: list[SemanticDetection] = []
+        try:
+            from huggingface_hub import hf_hub_download
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing semantic filter dependencies. Install ultralytics and huggingface-hub."
+            ) from exc
+
+        weights_path = Path(self.config.weights) if self.config.weights else None
+        if weights_path is None:
+            weights_path = Path(
+                hf_hub_download(
+                    repo_id=self.config.model_repo,
+                    filename=self.config.model_file,
+                )
+            )
+        self.weights_path = weights_path
+        self.model = YOLO(str(weights_path))
+
+    def detect(self, frame_bgr: np.ndarray, frame_index: int) -> list[SemanticDetection]:
+        if frame_index % self.config.frame_stride != 0:
+            return self.last_detections
+
+        predict_kwargs: dict[str, Any] = {
+            "conf": self.config.confidence,
+            "iou": self.config.iou,
+            "imgsz": self.config.image_size,
+            "verbose": False,
+        }
+        if self.config.device is not None:
+            predict_kwargs["device"] = self.config.device
+
+        results = self.model.predict(frame_bgr, **predict_kwargs)
+        result = results[0]
+        names = getattr(result, "names", {})
+        boxes = getattr(result, "boxes", None)
+        detections: list[SemanticDetection] = []
+        if boxes is None:
+            self.last_detections = detections
+            return detections
+
+        for box in boxes:
+            class_id = int(box.cls[0].item())
+            if isinstance(names, dict):
+                raw_label = str(names.get(class_id, class_id))
+            elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+                raw_label = str(names[class_id])
+            else:
+                raw_label = str(class_id)
+            label = canonical_semantic_label(raw_label)
+            if label not in self.config.labels:
+                continue
+            confidence = float(box.conf[0].item())
+            x1, y1, x2, y2 = [float(value) for value in box.xyxy[0].tolist()]
+            detections.append(
+                SemanticDetection(
+                    label=label,
+                    raw_label=raw_label,
+                    confidence=confidence,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                )
+            )
+
+        detections.sort(key=lambda detection: detection.confidence, reverse=True)
+        self.last_detections = detections
+        return detections
 
 
 @dataclass
@@ -676,10 +952,13 @@ def analyze_gray_pair(
     image_width: int,
     image_height: int,
     roi_mask: RoiMask | None = None,
+    semantic_detections: list[SemanticDetection] | None = None,
+    semantic_config: SemanticConfig | None = None,
     motion_tracker: MotionTracker | None = None,
     frame_index: int = 0,
 ) -> MotionAnalysis:
     config = config.normalized()
+    semantic_detections = semantic_detections or []
     compare_gray = previous_gray
     global_dx = 0.0
     global_dy = 0.0
@@ -728,6 +1007,8 @@ def analyze_gray_pair(
             global_dy,
             global_consensus,
             tracked_vectors,
+            semantic_detections=semantic_detections,
+            semantic_detection_count=len(semantic_detections),
         )
 
     scale_x = raw_mask.shape[1] / float(image_width)
@@ -780,6 +1061,17 @@ def analyze_gray_pair(
             roi_penalized_count += 1
         kept_candidates.append((filtered_detection, contour))
 
+    semantic_rejected_count = 0
+    semantic_penalized_count = 0
+    semantic_filter_result = filter_candidates_by_semantics(
+        kept_candidates,
+        semantic_detections,
+        semantic_config,
+    )
+    kept_candidates = semantic_filter_result.candidates
+    semantic_rejected_count = semantic_filter_result.rejected_count
+    semantic_penalized_count = semantic_filter_result.penalized_count
+
     temporal_rejected_count = 0
     unconfirmed_rejected_count = 0
     direction_rejected_count = 0
@@ -808,6 +1100,10 @@ def analyze_gray_pair(
         len(raw_candidates),
         roi_rejected_count,
         roi_penalized_count,
+        semantic_detections,
+        len(semantic_detections),
+        semantic_rejected_count,
+        semantic_penalized_count,
         temporal_rejected_count,
         unconfirmed_rejected_count,
         direction_rejected_count,
@@ -838,6 +1134,7 @@ def render_motion_only(frame_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def render_overlay(
     frame_bgr: np.ndarray,
     detections: list[MotionDetection],
+    semantic_detections: list[SemanticDetection] | None = None,
     global_motion_rejected: bool = False,
     global_motion_detected: bool = False,
     global_dx: float = 0.0,
@@ -850,8 +1147,33 @@ def render_overlay(
     temporal_rejected_count: int = 0,
     unconfirmed_rejected_count: int = 0,
     direction_rejected_count: int = 0,
+    semantic_active: bool = False,
+    semantic_rejected_count: int = 0,
+    semantic_penalized_count: int = 0,
 ) -> np.ndarray:
     output = frame_bgr.copy()
+    semantic_detections = semantic_detections or []
+    for semantic_detection in semantic_detections:
+        x1, y1, x2, y2 = (
+            int(round(semantic_detection.x1)),
+            int(round(semantic_detection.y1)),
+            int(round(semantic_detection.x2)),
+            int(round(semantic_detection.y2)),
+        )
+        color = (80, 255, 80) if semantic_detection.label == "person" else (255, 200, 0)
+        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+        label = f"{semantic_detection.label} {semantic_detection.confidence:.2f}"
+        label_y = max(18, y1 - 6)
+        cv2.putText(
+            output,
+            label,
+            (x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
     for detection in detections:
         x1, y1, x2, y2 = (
             int(round(detection.x1)),
@@ -860,10 +1182,14 @@ def render_overlay(
             int(round(detection.y2)),
         )
         color = (0, 165, 255) if detection.roi_action == "penalize" else (0, 255, 255)
+        if detection.semantic_action == "penalize":
+            color = (255, 80, 255)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         label = f"motion {detection.area:.0f}px"
         if detection.roi_action == "penalize":
             label = f"penalty {detection.area:.0f}px"
+        if detection.semantic_action == "penalize":
+            label = f"{detection.semantic_label} penalty {detection.semantic_overlap:.2f}"
         if detection.track_id is not None:
             label = f"{label} t{detection.track_id} h{detection.track_hits}"
         label_y = max(18, y1 - 6)
@@ -924,6 +1250,20 @@ def render_overlay(
             2,
             cv2.LINE_AA,
         )
+    if semantic_active:
+        cv2.putText(
+            output,
+            (
+                f"Semantic objects={len(semantic_detections)} "
+                f"rejected={semantic_rejected_count} penalized={semantic_penalized_count}"
+            ),
+            (12, 112),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     return output
 
 
@@ -953,6 +1293,24 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "direction_min_hits": config.direction_min_hits,
         "direction_min_displacement": config.direction_min_displacement,
         "direction_cosine": config.direction_cosine,
+    }
+
+
+def serialize_semantic_config(config: SemanticConfig) -> dict[str, Any]:
+    config = config.normalized()
+    return {
+        "enabled": config.enabled,
+        "labels": list(config.labels),
+        "action": config.action,
+        "model_repo": config.model_repo,
+        "model_file": config.model_file,
+        "weights": config.weights,
+        "confidence": config.confidence,
+        "iou": config.iou,
+        "image_size": config.image_size,
+        "device": config.device,
+        "frame_stride": config.frame_stride,
+        "overlap_threshold": config.overlap_threshold,
     }
 
 
@@ -1010,6 +1368,21 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     ).normalized()
     roi_mask = load_roi_mask(args.roi_mask)
     motion_tracker = MotionTracker(config)
+    semantic_config = SemanticConfig(
+        enabled=args.enable_semantic_filter,
+        labels=tuple(part.strip() for part in args.semantic_labels.split(",") if part.strip()),
+        action=args.semantic_action,
+        model_repo=args.semantic_model_repo,
+        model_file=args.semantic_model_file,
+        weights=args.semantic_weights,
+        confidence=args.semantic_conf,
+        iou=args.semantic_iou,
+        image_size=args.semantic_imgsz,
+        device=args.semantic_device,
+        frame_stride=args.semantic_frame_stride,
+        overlap_threshold=args.semantic_overlap_threshold,
+    ).normalized()
+    semantic_detector = SemanticDetector(semantic_config) if semantic_config.enabled else None
     out_dir = make_output_dir(args.out_dir)
 
     capture = cv2.VideoCapture(str(source))
@@ -1040,6 +1413,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     total_raw_detections = 0
     total_roi_rejected = 0
     total_roi_penalized = 0
+    total_semantic_detections = 0
+    total_semantic_rejected = 0
+    total_semantic_penalized = 0
     total_temporal_rejected = 0
     total_unconfirmed_rejected = 0
     total_direction_rejected = 0
@@ -1055,6 +1431,11 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     break
 
                 timestamp_s = frame_index / max(fps, 0.001)
+                semantic_detections = (
+                    semantic_detector.detect(frame, frame_index)
+                    if semantic_detector is not None
+                    else []
+                )
                 current_gray = prepare_gray(frame, config)
 
                 if previous_gray is None:
@@ -1070,6 +1451,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count = 0
                     roi_rejected_count = 0
                     roi_penalized_count = 0
+                    semantic_detection_count = len(semantic_detections)
+                    semantic_rejected_count = 0
+                    semantic_penalized_count = 0
                     temporal_rejected_count = 0
                     unconfirmed_rejected_count = 0
                     direction_rejected_count = 0
@@ -1081,6 +1465,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         image_width=width,
                         image_height=height,
                         roi_mask=roi_mask,
+                        semantic_detections=semantic_detections,
+                        semantic_config=semantic_config,
                         motion_tracker=motion_tracker,
                         frame_index=frame_index,
                     )
@@ -1096,6 +1482,10 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count = analysis.raw_detection_count
                     roi_rejected_count = analysis.roi_rejected_count
                     roi_penalized_count = analysis.roi_penalized_count
+                    semantic_detections = analysis.semantic_detections
+                    semantic_detection_count = analysis.semantic_detection_count
+                    semantic_rejected_count = analysis.semantic_rejected_count
+                    semantic_penalized_count = analysis.semantic_penalized_count
                     temporal_rejected_count = analysis.temporal_rejected_count
                     unconfirmed_rejected_count = analysis.unconfirmed_rejected_count
                     direction_rejected_count = analysis.direction_rejected_count
@@ -1112,13 +1502,14 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 motion_writer.write(render_motion_only(frame, trail_mask))
                 overlay_writer.write(
                     render_overlay(
-                        frame,
-                        detections,
-                        global_motion_rejected,
-                        global_motion_detected,
-                        global_dx,
-                        global_dy,
-                        global_consensus,
+                        frame_bgr=frame,
+                        detections=detections,
+                        semantic_detections=semantic_detections,
+                        global_motion_rejected=global_motion_rejected,
+                        global_motion_detected=global_motion_detected,
+                        global_dx=global_dx,
+                        global_dy=global_dy,
+                        global_consensus=global_consensus,
                         roi_active=roi_mask is not None,
                         roi_rejected_count=roi_rejected_count,
                         roi_penalized_count=roi_penalized_count,
@@ -1126,12 +1517,18 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         temporal_rejected_count=temporal_rejected_count,
                         unconfirmed_rejected_count=unconfirmed_rejected_count,
                         direction_rejected_count=direction_rejected_count,
+                        semantic_active=semantic_detector is not None,
+                        semantic_rejected_count=semantic_rejected_count,
+                        semantic_penalized_count=semantic_penalized_count,
                     )
                 )
 
                 total_raw_detections += raw_detection_count
                 total_roi_rejected += roi_rejected_count
                 total_roi_penalized += roi_penalized_count
+                total_semantic_detections += semantic_detection_count
+                total_semantic_rejected += semantic_rejected_count
+                total_semantic_penalized += semantic_penalized_count
                 total_temporal_rejected += temporal_rejected_count
                 total_unconfirmed_rejected += unconfirmed_rejected_count
                 total_direction_rejected += direction_rejected_count
@@ -1157,9 +1554,13 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     raw_detection_count=raw_detection_count,
                     roi_rejected_count=roi_rejected_count,
                     roi_penalized_count=roi_penalized_count,
+                    semantic_detection_count=semantic_detection_count,
+                    semantic_rejected_count=semantic_rejected_count,
+                    semantic_penalized_count=semantic_penalized_count,
                     temporal_rejected_count=temporal_rejected_count,
                     unconfirmed_rejected_count=unconfirmed_rejected_count,
                     direction_rejected_count=direction_rejected_count,
+                    semantic_detections=semantic_detections,
                     detections=detections,
                 )
                 jsonl.write(json.dumps(record.to_json_dict(), separators=(",", ":")) + "\n")
@@ -1174,6 +1575,8 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     if frame_index == 0:
         raise RuntimeError(f"No frames were read from video: {source}")
 
+    processing_seconds = time.time() - started_at
+    processing_seconds_per_frame = processing_seconds / max(1, frame_index)
     summary = {
         "mode": "video",
         "source": str(source),
@@ -1187,19 +1590,28 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "raw_detection_count": total_raw_detections,
         "roi_rejected_count": total_roi_rejected,
         "roi_penalized_count": total_roi_penalized,
+        "semantic_detection_count": total_semantic_detections,
+        "semantic_rejected_count": total_semantic_rejected,
+        "semantic_penalized_count": total_semantic_penalized,
         "temporal_rejected_count": total_temporal_rejected,
         "unconfirmed_rejected_count": total_unconfirmed_rejected,
         "direction_rejected_count": total_direction_rejected,
         "kept_detection_count": total_detections,
         "global_motion_rejected_frames": rejected_frame_count,
         "global_motion_detected_frames": global_motion_detected_count,
-        "processing_seconds": round(time.time() - started_at, 3),
+        "processing_seconds": round(processing_seconds, 3),
+        "processing_seconds_per_frame": round(processing_seconds_per_frame, 6),
+        "processing_ms_per_frame": round(processing_seconds_per_frame * 1000.0, 3),
         "config": serialize_config(config),
         "roi_mask": {
             "enabled": roi_mask is not None,
             "path": str(args.roi_mask) if args.roi_mask else None,
             "mode": roi_mask.mode if roi_mask else None,
             "zone_count": len(roi_mask.zones) if roi_mask else 0,
+        },
+        "semantic_filter": {
+            **serialize_semantic_config(semantic_config),
+            "weights_path": str(semantic_detector.weights_path) if semantic_detector else None,
         },
         "motion_only_path": str(motion_only_path),
         "overlay_path": str(overlay_path),
@@ -1269,6 +1681,43 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     )
     parser.add_argument("--direction-cosine", type=float, default=0.20 if not duplicate else default)
     parser.add_argument("--roi-mask", default=default, help="Path to normalized ROI mask JSON.")
+    parser.add_argument(
+        "--enable-semantic-filter",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Run a semantic detector and reject/penalize overlapping motion boxes.",
+    )
+    parser.add_argument(
+        "--semantic-labels",
+        default="person" if not duplicate else default,
+        help="Comma-separated semantic labels to draw/filter, e.g. person,bird.",
+    )
+    parser.add_argument(
+        "--semantic-action",
+        choices=sorted(SEMANTIC_ACTIONS),
+        default="reject" if not duplicate else default,
+        help="How to handle motion boxes overlapping semantic labels.",
+    )
+    parser.add_argument(
+        "--semantic-model-repo",
+        default=DEFAULT_SEMANTIC_MODEL_REPO if not duplicate else default,
+    )
+    parser.add_argument(
+        "--semantic-model-file",
+        default=DEFAULT_SEMANTIC_MODEL_FILE if not duplicate else default,
+    )
+    parser.add_argument("--semantic-weights", default=default, help="Optional local YOLO weights path.")
+    parser.add_argument("--semantic-conf", type=float, default=0.05 if not duplicate else default)
+    parser.add_argument("--semantic-iou", type=float, default=0.50 if not duplicate else default)
+    parser.add_argument("--semantic-imgsz", type=int, default=960 if not duplicate else default)
+    parser.add_argument("--semantic-device", default=default, help="Ultralytics device, e.g. mps or cpu.")
+    parser.add_argument("--semantic-frame-stride", type=int, default=2 if not duplicate else default)
+    parser.add_argument(
+        "--semantic-overlap-threshold",
+        type=float,
+        default=0.15 if not duplicate else default,
+        help="Reject when semantic-box intersection covers this fraction of the motion box.",
+    )
     parser.add_argument("--out-dir", default=default)
     parser.add_argument(
         "--json",

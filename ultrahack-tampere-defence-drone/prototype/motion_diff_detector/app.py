@@ -39,33 +39,271 @@ if "uploaded_video_cache_path" not in st.session_state:
     st.session_state["uploaded_video_cache_path"] = ""
 
 with st.sidebar:
-    diff_threshold = st.slider("Difference threshold", 1, 100, 18, 1)
-    min_area = st.number_input("Minimum motion area", min_value=1.0, max_value=100000.0, value=1000.0)
-    blur_kernel = st.selectbox("Blur kernel", [1, 3, 5, 7, 9, 11], index=2)
-    morph_kernel = st.selectbox("Morphology kernel", [1, 3, 5, 7, 9], index=1)
-    trail_frames = st.slider("Trail / hold frames", 0, 30, 3, 1)
-    max_motion_ratio = st.slider("Max motion ratio", 0.01, 1.0, 0.10, 0.01)
-    analysis_scale = st.slider("Analysis scale", 0.10, 1.0, 0.50, 0.05)
-    shake_protection = st.checkbox("Shake protection", value=True)
-    shake_min_shift = st.slider("Shake min shift", 0.0, 20.0, 1.5, 0.1)
-    shake_consensus = st.slider("Shake consensus", 0.10, 1.0, 0.72, 0.01)
-    shake_consensus_px = st.slider("Shake consensus px", 0.5, 10.0, 2.0, 0.1)
+    diff_threshold = st.slider(
+        "Difference threshold",
+        1,
+        100,
+        18,
+        1,
+        help="Minimum pixel brightness change needed before a pixel can become motion.",
+    )
+    min_area = st.number_input(
+        "Minimum motion area",
+        min_value=1.0,
+        max_value=100000.0,
+        value=1000.0,
+        help="Smallest connected moving region accepted as a motion box.",
+    )
+    blur_kernel = st.selectbox(
+        "Blur kernel",
+        [1, 3, 5, 7, 9, 11],
+        index=2,
+        help="Pre-blur amount before differencing. Higher values smooth sensor noise but can soften tiny drones.",
+    )
+    morph_kernel = st.selectbox(
+        "Morphology kernel",
+        [1, 3, 5, 7, 9],
+        index=1,
+        help="Cleanup kernel for joining nearby motion pixels and removing isolated specks.",
+    )
+    trail_frames = st.slider(
+        "Trail / hold frames",
+        0,
+        30,
+        3,
+        1,
+        help="Keeps recent accepted motion visible for several frames in motion-only output.",
+    )
+    max_motion_ratio = st.slider(
+        "Max motion ratio",
+        0.01,
+        1.0,
+        0.10,
+        0.01,
+        help="Rejects frames where too much of the image changes at once.",
+    )
+    analysis_scale = st.slider(
+        "Analysis scale",
+        0.10,
+        1.0,
+        0.50,
+        0.05,
+        help="Downscale factor for motion analysis. Lower is faster; higher preserves tiny objects.",
+    )
+    shake_protection = st.checkbox(
+        "Shake protection",
+        value=True,
+        help="Compensates global camera/floor movement before motion differencing.",
+    )
+    shake_min_shift = st.slider(
+        "Shake min shift",
+        0.0,
+        20.0,
+        1.5,
+        0.1,
+        disabled=not shake_protection,
+        help="Minimum estimated global image shift before shake compensation is considered active.",
+    )
+    shake_consensus = st.slider(
+        "Shake consensus",
+        0.10,
+        1.0,
+        0.72,
+        0.01,
+        disabled=not shake_protection,
+        help="Required share of tracked points agreeing on the same global movement.",
+    )
+    shake_consensus_px = st.slider(
+        "Shake consensus px",
+        0.5,
+        10.0,
+        2.0,
+        0.1,
+        disabled=not shake_protection,
+        help="Pixel tolerance for deciding whether tracked points agree on global movement.",
+    )
     st.divider()
-    hysteresis = st.checkbox("Hysteresis thresholding", value=False)
-    hysteresis_high_threshold = st.slider("Hysteresis high threshold", 1, 255, 36, 1)
-    temporal_filter = st.checkbox("Temporal persistence", value=False)
-    temporal_window_frames = st.slider("Persistence window", 1, 10, 3, 1)
-    temporal_min_hits = st.slider("Persistence min hits", 1, 10, 2, 1)
-    track_confirmation = st.checkbox("Track confirmation", value=False)
-    track_confirm_hits = st.slider("Track confirm hits", 1, 10, 2, 1)
-    track_max_missed = st.slider("Track max missed", 0, 10, 2, 1)
-    track_match_distance = st.slider("Track match distance", 5.0, 300.0, 80.0, 5.0)
-    direction_consistency = st.checkbox("Direction consistency", value=False)
-    direction_min_hits = st.slider("Direction min hits", 2, 10, 3, 1)
-    direction_min_displacement = st.slider("Direction min displacement", 0.0, 30.0, 2.0, 0.5)
-    direction_cosine = st.slider("Direction cosine", -1.0, 1.0, 0.20, 0.05)
+    hysteresis = st.checkbox(
+        "Hysteresis thresholding",
+        value=False,
+        help="Keeps weak motion only when it connects to a stronger high-threshold seed.",
+    )
+    hysteresis_high_threshold = st.slider(
+        "Hysteresis high threshold",
+        1,
+        255,
+        36,
+        1,
+        disabled=not hysteresis,
+        help="Strong-pixel seed threshold used by hysteresis.",
+    )
+    temporal_filter = st.checkbox(
+        "Temporal persistence",
+        value=False,
+        help="Rejects motion that appears only once and does not persist across nearby frames.",
+    )
+    track_confirmation = st.checkbox(
+        "Track confirmation",
+        value=False,
+        help="Hides a new motion track until it has been seen enough times.",
+    )
+    direction_consistency = st.checkbox(
+        "Direction consistency",
+        value=False,
+        help="Rejects tracks that jitter back and forth instead of moving consistently.",
+    )
+    track_tuning_enabled = temporal_filter or track_confirmation or direction_consistency
+    temporal_window_frames = st.slider(
+        "Persistence window",
+        1,
+        10,
+        3,
+        1,
+        disabled=not temporal_filter,
+        help="Number of recent frames checked by temporal persistence.",
+    )
+    temporal_min_hits = st.slider(
+        "Persistence min hits",
+        1,
+        10,
+        2,
+        1,
+        disabled=not temporal_filter,
+        help="Minimum detections needed inside the persistence window.",
+    )
+    track_confirm_hits = st.slider(
+        "Track confirm hits",
+        1,
+        10,
+        2,
+        1,
+        disabled=not track_confirmation,
+        help="Number of matched detections needed before a track is drawn.",
+    )
+    track_max_missed = st.slider(
+        "Track max missed",
+        0,
+        10,
+        2,
+        1,
+        disabled=not track_tuning_enabled,
+        help="How many missed frames a track can survive before being deleted.",
+    )
+    track_match_distance = st.slider(
+        "Track match distance",
+        5.0,
+        300.0,
+        80.0,
+        5.0,
+        disabled=not track_tuning_enabled,
+        help="Maximum pixel distance for matching a detection to an existing track.",
+    )
+    direction_min_hits = st.slider(
+        "Direction min hits",
+        2,
+        10,
+        3,
+        1,
+        disabled=not direction_consistency,
+        help="Minimum track hits before direction consistency can reject jitter.",
+    )
+    direction_min_displacement = st.slider(
+        "Direction min displacement",
+        0.0,
+        30.0,
+        2.0,
+        0.5,
+        disabled=not direction_consistency,
+        help="Small movements below this distance are ignored for direction checks.",
+    )
+    direction_cosine = st.slider(
+        "Direction cosine",
+        -1.0,
+        1.0,
+        0.20,
+        0.05,
+        disabled=not direction_consistency,
+        help="Allowed direction similarity. Lower is more tolerant; higher rejects more jitter.",
+    )
     st.divider()
-    roi_mask_enabled = st.checkbox("Use current ROI mask", value=False)
+    roi_mask_enabled = st.checkbox(
+        "Use current ROI mask",
+        value=False,
+        help="Applies the mask from the ROI tab to reject, penalize, or constrain detections.",
+    )
+    st.divider()
+    semantic_filter = st.checkbox(
+        "Human semantic filter",
+        value=False,
+        help="Runs a person detector and suppresses motion boxes that overlap people.",
+    )
+    semantic_action = st.selectbox(
+        "Human motion action",
+        ["reject", "penalize"],
+        index=0,
+        disabled=not semantic_filter,
+        help="Reject removes overlapping motion; penalize keeps it but tags it lower priority.",
+    )
+    semantic_conf = st.slider(
+        "Person confidence",
+        0.01,
+        0.90,
+        0.05,
+        0.01,
+        disabled=not semantic_filter,
+        help="Minimum person detector confidence. Lower catches distant people but adds false positives.",
+    )
+    semantic_overlap_threshold = st.slider(
+        "Person overlap threshold",
+        0.01,
+        1.0,
+        0.15,
+        0.01,
+        disabled=not semantic_filter,
+        help="Fraction of a motion box covered by a person box before action is applied.",
+    )
+    semantic_frame_stride = st.slider(
+        "Person AI frame stride",
+        1,
+        20,
+        2,
+        1,
+        disabled=not semantic_filter,
+        help="Runs person detection every N frames and holds boxes between runs. Higher is faster.",
+    )
+    semantic_imgsz = st.selectbox(
+        "Person AI image size",
+        [640, 960, 1280],
+        index=1,
+        disabled=not semantic_filter,
+        help="Input size for the person detector. Higher can catch smaller people but is slower.",
+    )
+    semantic_device = st.selectbox(
+        "Person AI device",
+        ["mps", "cpu", ""],
+        index=0,
+        disabled=not semantic_filter,
+        help="Inference device. Use mps on Apple Silicon, cpu as fallback.",
+    )
+    with st.expander("Human model"):
+        semantic_model_repo = st.text_input(
+            "Model repo",
+            "devanshty/WingID",
+            disabled=not semantic_filter,
+            help="Hugging Face repository containing the YOLO person model.",
+        )
+        semantic_model_file = st.text_input(
+            "Model file",
+            "yolo11l.pt",
+            disabled=not semantic_filter,
+            help="Model file inside the Hugging Face repository.",
+        )
+        semantic_weights = st.text_input(
+            "Local weights path",
+            "",
+            disabled=not semantic_filter,
+            help="Optional local .pt file. When set, it overrides repo/model download.",
+        )
 
 tabs = st.tabs(["Upload", "Local path", "ROI mask"])
 
@@ -308,6 +546,32 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         args.append("--enable-direction-consistency")
     if roi_mask_path is not None:
         args.extend(["--roi-mask", str(roi_mask_path)])
+    if semantic_filter:
+        args.extend(
+            [
+                "--enable-semantic-filter",
+                "--semantic-labels",
+                "person",
+                "--semantic-action",
+                semantic_action,
+                "--semantic-model-repo",
+                semantic_model_repo,
+                "--semantic-model-file",
+                semantic_model_file,
+                "--semantic-conf",
+                str(float(semantic_conf)),
+                "--semantic-imgsz",
+                str(int(semantic_imgsz)),
+                "--semantic-frame-stride",
+                str(int(semantic_frame_stride)),
+                "--semantic-overlap-threshold",
+                str(float(semantic_overlap_threshold)),
+            ]
+        )
+        if semantic_device:
+            args.extend(["--semantic-device", semantic_device])
+        if semantic_weights.strip():
+            args.extend(["--semantic-weights", semantic_weights.strip()])
     return args
 
 
@@ -343,12 +607,13 @@ def render_outputs(summary: dict) -> None:
     summary_bytes = Path(summary["summary_path"]).read_bytes()
     records = read_jsonl(summary["jsonl_path"])
 
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(6)
     metric_cols[0].metric("Frames", summary["frame_count"])
     metric_cols[1].metric("Motion frames", summary["frames_with_motion"])
     metric_cols[2].metric("Detections", summary["detection_count"])
     metric_cols[3].metric("Shake frames", summary.get("global_motion_detected_frames", 0))
     metric_cols[4].metric("Rejected frames", summary["global_motion_rejected_frames"])
+    metric_cols[5].metric("ms / frame", summary.get("processing_ms_per_frame", 0.0))
 
     roi_cols = st.columns(4)
     roi_cols[0].metric("Raw detections", summary.get("raw_detection_count", summary["detection_count"]))
@@ -359,11 +624,23 @@ def render_outputs(summary: dict) -> None:
     filter_cols[0].metric("Temporal rejected", summary.get("temporal_rejected_count", 0))
     filter_cols[1].metric("Unconfirmed rejected", summary.get("unconfirmed_rejected_count", 0))
     filter_cols[2].metric("Direction rejected", summary.get("direction_rejected_count", 0))
+    semantic_cols = st.columns(4)
+    semantic_cols[0].metric("Semantic objects", summary.get("semantic_detection_count", 0))
+    semantic_cols[1].metric("Semantic rejected", summary.get("semantic_rejected_count", 0))
+    semantic_cols[2].metric("Semantic penalized", summary.get("semantic_penalized_count", 0))
+    semantic_cols[3].metric("Processing seconds", summary.get("processing_seconds", 0.0))
     roi_summary = summary.get("roi_mask", {})
     if roi_summary.get("enabled"):
         st.caption(
             f"ROI mode={roi_summary.get('mode')} zones={roi_summary.get('zone_count')} "
             f"path={roi_summary.get('path')}"
+        )
+    semantic_summary = summary.get("semantic_filter", {})
+    if semantic_summary.get("enabled"):
+        st.caption(
+            f"Semantic labels={','.join(semantic_summary.get('labels', []))} "
+            f"action={semantic_summary.get('action')} conf={semantic_summary.get('confidence')} "
+            f"stride={semantic_summary.get('frame_stride')} model={semantic_summary.get('model_repo')}"
         )
 
     preview_cols = st.columns(2)
@@ -459,22 +736,39 @@ with tabs[2]:
             ["fixed", "handheld"],
             index=0 if st.session_state.get("roi_mode", "fixed") == "fixed" else 1,
             horizontal=True,
+            help="Fixed masks are arena-relative; handheld masks are screen-relative guardrails.",
         )
         st.session_state["roi_mode"] = mode
 
         uploaded_preview_path = st.session_state.get("uploaded_video_cache_path", "")
         default_path = uploaded_preview_path or (str(SAMPLE_PATH) if SAMPLE_PATH.exists() else "")
-        preview_path = st.text_input("Preview video path", default_path, key="roi_preview_path")
+        preview_path = st.text_input(
+            "Preview video path",
+            default_path,
+            key="roi_preview_path",
+            help="Video used only for choosing the frame where you draw ROI polygons.",
+        )
         if uploaded_preview_path and preview_path == uploaded_preview_path:
             st.caption(f"Using uploaded video for ROI preview: {Path(uploaded_preview_path).name}")
-        frame_index = st.number_input("Frame number", min_value=0, value=0, step=1)
+        frame_index = st.number_input(
+            "Frame number",
+            min_value=0,
+            value=0,
+            step=1,
+            help="Frame displayed for clicking ROI polygon vertices.",
+        )
 
         zone_cols = st.columns([2, 1, 1])
         zone_name = zone_cols[0].text_input(
             "Zone name",
             value=f"zone_{len(st.session_state['roi_zones']) + 1}",
+            help="Label stored in the mask JSON for debugging and summaries.",
         )
-        zone_type = zone_cols[1].selectbox("Zone type", ["ignore", "penalty", "flight"])
+        zone_type = zone_cols[1].selectbox(
+            "Zone type",
+            ["ignore", "penalty", "flight"],
+            help="Ignore rejects motion, penalty marks lower confidence, flight keeps only motion inside flight zones.",
+        )
         penalty = zone_cols[2].number_input(
             "Penalty",
             min_value=0.0,
@@ -482,15 +776,20 @@ with tabs[2]:
             value=0.5,
             step=0.1,
             disabled=zone_type != "penalty",
+            help="Penalty value saved for penalty zones; disabled for ignore and flight zones.",
         )
 
         action_cols = st.columns(4)
-        if action_cols[0].button("Undo point"):
+        if action_cols[0].button("Undo point", help="Removes the last clicked polygon vertex."):
             if st.session_state["roi_points"]:
                 st.session_state["roi_points"].pop()
             st.session_state["roi_last_click"] = None
             st.rerun()
-        if action_cols[1].button("Close zone", disabled=len(st.session_state["roi_points"]) < 3):
+        if action_cols[1].button(
+            "Close zone",
+            disabled=len(st.session_state["roi_points"]) < 3,
+            help="Saves the pending polygon as a zone after at least three points.",
+        ):
             st.session_state["roi_zones"].append(
                 normalize_zone(
                     {
@@ -504,7 +803,7 @@ with tabs[2]:
             st.session_state["roi_points"] = []
             st.session_state["roi_last_click"] = None
             st.rerun()
-        if action_cols[2].button("Clear zones"):
+        if action_cols[2].button("Clear zones", help="Deletes all zones from the current in-memory mask."):
             st.session_state["roi_zones"] = []
             st.session_state["roi_points"] = []
             st.session_state["roi_last_click"] = None
@@ -514,6 +813,7 @@ with tabs[2]:
             json.dumps(current_roi_mask_payload(), indent=2),
             file_name="roi_mask.json",
             mime="application/json",
+            help="Downloads the normalized mask JSON for reuse.",
         )
 
         if streamlit_image_coordinates is None:
@@ -553,7 +853,12 @@ with tabs[2]:
             st.info("Enter a local preview video path to click polygon vertices.")
 
     with mask_cols[1]:
-        uploaded_mask = st.file_uploader("Upload mask JSON", type=["json"], key="roi_mask_upload")
+        uploaded_mask = st.file_uploader(
+            "Upload mask JSON",
+            type=["json"],
+            key="roi_mask_upload",
+            help="Loads a previously saved normalized ROI mask.",
+        )
         if uploaded_mask is not None:
             upload_id = f"{uploaded_mask.name}:{uploaded_mask.size}"
             if st.session_state.get("roi_loaded_upload_id") != upload_id:
