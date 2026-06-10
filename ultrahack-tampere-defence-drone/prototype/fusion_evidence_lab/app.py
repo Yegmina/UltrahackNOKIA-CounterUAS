@@ -40,6 +40,11 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "max_motion_ratio": 0.18,
     "analysis_scale": 0.5,
     "audio_window_s": 0.5,
+    "auto_perspective": True,
+    "auto_perspective_reference": "",
+    "auto_perspective_samples": 3,
+    "auto_perspective_min_matches": 24,
+    "auto_perspective_min_inliers": 18,
     "perspective_json": "",
 }
 
@@ -194,19 +199,45 @@ def render_evidence_cards(evidence: list[dict[str, Any]], max_items: int = 48) -
 
 def render_downloads(summary: dict[str, Any]) -> None:
     st.subheader("Artifacts")
-    cols = st.columns(5)
+    cols = st.columns(7)
     artifact_keys = [
         ("summary", "run_summary.json"),
         ("events", "events.json"),
         ("fusion_timeline", "fusion_timeline.json"),
         ("sync_report", "sync_report.json"),
+        ("auto_perspective", "auto_perspective.json"),
         ("evidence_index", "evidence_index.json"),
+        ("result_report", "result_report.md"),
     ]
     for column, (key, filename) in zip(cols, artifact_keys):
         path = Path(summary["paths"][key])
         if path.exists():
-            column.download_button(filename, path.read_bytes(), file_name=filename, mime="application/json")
+            mime = "text/markdown" if filename.endswith(".md") else "application/json"
+            column.download_button(filename, path.read_bytes(), file_name=filename, mime=mime)
     st.code(summary["paths"]["run_dir"])
+
+
+def render_auto_perspective(summary: dict[str, Any]) -> None:
+    path = Path(summary["paths"]["auto_perspective"])
+    if not path.exists():
+        st.info("No auto perspective report was saved.")
+        return
+    payload = read_json(path)
+    st.json(payload)
+    for source_id, item in payload.get("transforms", {}).items():
+        if not isinstance(item, dict):
+            continue
+        preview = item.get("preview") or {}
+        if not preview:
+            continue
+        st.write(f"**{source_id}**")
+        columns = st.columns(2)
+        matches = preview.get("matches_path")
+        warp = preview.get("warp_preview_path")
+        if matches and Path(matches).exists():
+            columns[0].image(matches, caption="shared landmark matches", use_container_width=True)
+        if warp and Path(warp).exists():
+            columns[1].image(warp, caption="reference / auto-warp / overlay", use_container_width=True)
 
 
 initialize_state()
@@ -249,12 +280,18 @@ with st.sidebar:
     st.number_input("Audio window seconds", min_value=0.1, max_value=5.0, key="audio_window_s", step=0.1)
 
     st.header("Perspective")
-    st.text_area(
-        "Perspective JSON",
-        key="perspective_json",
-        height=150,
-        placeholder='{"sources":{"demo1":{"src":[[0.1,0.2],[0.9,0.2],[0.95,0.9],[0.05,0.9]],"dst":[[0,0],[1,0],[1,1],[0,1]]}}}',
-    )
+    st.checkbox("Autonomous perspective correction", key="auto_perspective")
+    st.text_input("Reference source id", key="auto_perspective_reference", placeholder="auto")
+    st.number_input("Auto sample frames per pair", min_value=1, max_value=9, key="auto_perspective_samples", step=1)
+    st.number_input("Minimum landmark matches", min_value=8, max_value=200, key="auto_perspective_min_matches", step=2)
+    st.number_input("Minimum RANSAC inliers", min_value=6, max_value=160, key="auto_perspective_min_inliers", step=2)
+    with st.expander("Manual perspective override"):
+        st.text_area(
+            "Perspective JSON",
+            key="perspective_json",
+            height=150,
+            placeholder='{"sources":{"demo1":{"src":[[0.1,0.2],[0.9,0.2],[0.95,0.9],[0.05,0.9]],"dst":[[0,0],[1,0],[1,1],[0,1]]}}}',
+        )
 
     st.header("Profiles")
     profile_upload = st.file_uploader("Import settings", type=["json"], key="profile_upload")
@@ -269,7 +306,7 @@ with st.sidebar:
     )
 
 
-tabs = st.tabs(["Analyze", "Events", "Timeline", "Sync", "All Proofs"])
+tabs = st.tabs(["Analyze", "Events", "Timeline", "Sync", "Perspective", "All Proofs"])
 
 with tabs[0]:
     st.subheader("Run Analysis")
@@ -309,7 +346,17 @@ with tabs[0]:
             str(float(st.session_state.analysis_scale)),
             "--audio-window-s",
             str(float(st.session_state.audio_window_s)),
+            "--auto-perspective-samples",
+            str(int(st.session_state.auto_perspective_samples)),
+            "--auto-perspective-min-matches",
+            str(int(st.session_state.auto_perspective_min_matches)),
+            "--auto-perspective-min-inliers",
+            str(int(st.session_state.auto_perspective_min_inliers)),
         ]
+        if not st.session_state.auto_perspective:
+            cli_args.append("--no-auto-perspective")
+        if st.session_state.auto_perspective_reference.strip():
+            cli_args.extend(["--auto-perspective-reference", st.session_state.auto_perspective_reference.strip()])
         for path in parse_lines(st.session_state.extra_videos):
             cli_args.extend(["--extra-video", path])
         for path in parse_lines(st.session_state.detector_json):
@@ -357,6 +404,13 @@ with tabs[3]:
         st.info("Run analysis first.")
 
 with tabs[4]:
+    st.subheader("Autonomous Perspective")
+    if summary:
+        render_auto_perspective(summary)
+    else:
+        st.info("Run analysis first.")
+
+with tabs[5]:
     st.subheader("All Proofs")
     if summary:
         evidence_index = read_json(summary["paths"]["evidence_index"])

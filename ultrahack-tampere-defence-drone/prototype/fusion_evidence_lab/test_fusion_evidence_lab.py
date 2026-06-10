@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from fusion_evidence_lab import (
     MotionConfig,
     detect_motion,
+    estimate_homography_from_shared_landmarks,
     estimate_extra_video_sync,
     fuse_records,
     import_detector_records,
@@ -43,6 +44,29 @@ class FusionEvidenceLabTests(unittest.TestCase):
         transformed = cv2.perspectiveTransform(point, matrix)
         self.assertAlmostEqual(float(transformed[0, 0, 0]), 99.0, delta=0.01)
         self.assertAlmostEqual(float(transformed[0, 0, 1]), 49.0, delta=0.01)
+
+    def test_auto_homography_finds_shared_landmarks(self) -> None:
+        reference = np.zeros((240, 320, 3), dtype=np.uint8)
+        rng = np.random.default_rng(7)
+        for index in range(80):
+            x = int(rng.integers(30, 290))
+            y = int(rng.integers(30, 210))
+            color = (int(rng.integers(80, 255)), int(rng.integers(80, 255)), int(rng.integers(80, 255)))
+            cv2.circle(reference, (x, y), int(rng.integers(3, 8)), color, -1)
+            cv2.putText(reference, str(index % 10), (x + 4, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        ref_to_source = np.array([[1.0, 0.02, 22.0], [-0.01, 1.0, 14.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        source = cv2.warpPerspective(reference, ref_to_source, (320, 240))
+
+        matrix, diagnostics, preview = estimate_homography_from_shared_landmarks(source, reference, min_matches=8, min_inliers=6)
+
+        self.assertIsNotNone(matrix)
+        self.assertTrue(diagnostics["accepted"])
+        self.assertIsNotNone(preview)
+        point = np.array([[[122.0, 114.0]]], dtype=np.float32)
+        transformed = cv2.perspectiveTransform(point, matrix)
+        expected = cv2.perspectiveTransform(point, np.linalg.inv(ref_to_source))
+        self.assertAlmostEqual(float(transformed[0, 0, 0]), float(expected[0, 0, 0]), delta=8.0)
+        self.assertAlmostEqual(float(transformed[0, 0, 1]), float(expected[0, 0, 1]), delta=8.0)
 
     def test_static_frames_produce_no_motion(self) -> None:
         config = MotionConfig(min_area=5).normalized()

@@ -64,6 +64,15 @@ class SourceVideo:
     metadata_offset_s: float | None = None
 
 
+@dataclass
+class PerspectiveTransform:
+    matrix: np.ndarray
+    target_size: tuple[int, int]
+    mode: str
+    reference_id: str | None
+    diagnostics: dict[str, Any]
+
+
 def emit_progress(message: str) -> None:
     print(f"{PROGRESS_PREFIX}{message}", flush=True)
 
@@ -327,6 +336,421 @@ def apply_perspective(frame: np.ndarray, matrix: np.ndarray | None) -> np.ndarra
     return cv2.warpPerspective(frame, matrix, (width, height), flags=cv2.INTER_LINEAR)
 
 
+def apply_perspective_transform(frame: np.ndarray, transform: PerspectiveTransform | None) -> np.ndarray:
+    if transform is None:
+        return frame
+    target_width, target_height = transform.target_size
+    return cv2.warpPerspective(frame, transform.matrix, (target_width, target_height), flags=cv2.INTER_LINEAR)
+
+
+def read_video_frame_at_index(path: Path, frame_index: int) -> np.ndarray | None:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_index)))
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
+
+
+def resize_for_features(frame: np.ndarray, max_dim: int = 960) -> tuple[np.ndarray, float, float]:
+    height, width = frame.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(width, height, 1)))
+    if scale >= 0.999:
+        return frame, 1.0, 1.0
+    resized = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+    return resized, resized.shape[1] / float(width), resized.shape[0] / float(height)
+
+
+def source_session_range(
+    source: SourceVideo,
+    probe: dict[str, Any],
+    frame_utc_by_index: dict[int, int],
+    session_start_utc_ns: int | None,
+) -> tuple[float, float] | None:
+    if frame_utc_by_index and session_start_utc_ns:
+        values = [(utc_ns - session_start_utc_ns) / 1_000_000_000 for utc_ns in frame_utc_by_index.values()]
+        return min(values), max(values)
+    duration = float(probe.get("duration_s") or 0.0)
+    if source.metadata_offset_s is not None and duration > 0:
+        return source.metadata_offset_s, source.metadata_offset_s + duration
+    if source.creation_utc_ns is not None and session_start_utc_ns is not None and duration > 0:
+        start = (source.creation_utc_ns - session_start_utc_ns) / 1_000_000_000
+        return start, start + duration
+    return None
+
+
+def frame_index_near_session_s(
+    source: SourceVideo,
+    probe: dict[str, Any],
+    frame_utc_by_index: dict[int, int],
+    session_start_utc_ns: int | None,
+    session_s: float,
+) -> int | None:
+    fps = float(probe.get("fps") or 30.0)
+    frame_count = int(probe.get("frame_count") or 0)
+    if frame_utc_by_index and session_start_utc_ns:
+        target_ns = session_start_utc_ns + int(session_s * 1_000_000_000)
+        return min(frame_utc_by_index, key=lambda index: abs(frame_utc_by_index[index] - target_ns))
+    if source.metadata_offset_s is not None:
+        local_s = session_s - source.metadata_offset_s
+    elif source.creation_utc_ns is not None and session_start_utc_ns is not None:
+        local_s = session_s - ((source.creation_utc_ns - session_start_utc_ns) / 1_000_000_000)
+    else:
+        local_s = float(probe.get("duration_s") or 0.0) / 2.0
+    if local_s < 0:
+        return None
+    index = int(round(local_s * fps))
+    if frame_count:
+        index = int(np.clip(index, 0, max(0, frame_count - 1)))
+    return index
+
+
+def session_s_for_frame_index(
+    source: SourceVideo,
+    probe: dict[str, Any],
+    frame_utc_by_index: dict[int, int],
+    session_start_utc_ns: int | None,
+    frame_index: int,
+) -> float | None:
+    fps = float(probe.get("fps") or 30.0)
+    if frame_index in frame_utc_by_index and session_start_utc_ns:
+        return (frame_utc_by_index[frame_index] - session_start_utc_ns) / 1_000_000_000
+    local_s = frame_index / fps if fps > 0 else float(frame_index)
+    if source.metadata_offset_s is not None:
+        return source.metadata_offset_s + local_s
+    if source.creation_utc_ns is not None and session_start_utc_ns is not None:
+        return ((source.creation_utc_ns - session_start_utc_ns) / 1_000_000_000) + local_s
+    return None
+
+
+def representative_frame_indices(probe: dict[str, Any], count: int) -> list[int]:
+    frame_count = int(probe.get("frame_count") or 0)
+    if frame_count <= 1:
+        return [0]
+    if count <= 1:
+        return [frame_count // 2]
+    start = max(0, int(frame_count * 0.18))
+    stop = min(frame_count - 1, int(frame_count * 0.82))
+    return [int(value) for value in np.linspace(start, stop, max(1, count)).tolist()]
+
+
+def transformed_corner_area(matrix: np.ndarray, source_size: tuple[int, int], target_size: tuple[int, int]) -> float:
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    corners = np.array(
+        [[[0.0, 0.0], [source_width - 1.0, 0.0], [source_width - 1.0, source_height - 1.0], [0.0, source_height - 1.0]]],
+        dtype=np.float32,
+    )
+    transformed = cv2.perspectiveTransform(corners, matrix)[0]
+    if not np.isfinite(transformed).all():
+        return 0.0
+    area = float(abs(cv2.contourArea(transformed)))
+    return area / float(max(1, target_width * target_height))
+
+
+def estimate_homography_from_shared_landmarks(
+    source_frame: np.ndarray,
+    reference_frame: np.ndarray,
+    min_matches: int,
+    min_inliers: int,
+) -> tuple[np.ndarray | None, dict[str, Any], np.ndarray | None]:
+    source_small, sx, sy = resize_for_features(source_frame)
+    reference_small, rx, ry = resize_for_features(reference_frame)
+    orb = cv2.ORB_create(nfeatures=5000, fastThreshold=7)
+    source_gray = cv2.cvtColor(source_small, cv2.COLOR_BGR2GRAY)
+    reference_gray = cv2.cvtColor(reference_small, cv2.COLOR_BGR2GRAY)
+    source_kp, source_desc = orb.detectAndCompute(source_gray, None)
+    reference_kp, reference_desc = orb.detectAndCompute(reference_gray, None)
+    diagnostics: dict[str, Any] = {
+        "source_keypoints": len(source_kp or []),
+        "reference_keypoints": len(reference_kp or []),
+        "good_matches": 0,
+        "inliers": 0,
+        "inlier_ratio": 0.0,
+        "accepted": False,
+        "reason": "",
+    }
+    if source_desc is None or reference_desc is None or not source_kp or not reference_kp:
+        diagnostics["reason"] = "not_enough_keypoints"
+        return None, diagnostics, None
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    raw_matches = matcher.knnMatch(source_desc, reference_desc, k=2)
+    good_matches = []
+    for pair in raw_matches:
+        if len(pair) != 2:
+            continue
+        first, second = pair
+        if first.distance < 0.74 * second.distance:
+            good_matches.append(first)
+    diagnostics["good_matches"] = len(good_matches)
+    if len(good_matches) < min_matches:
+        diagnostics["reason"] = "not_enough_good_matches"
+        return None, diagnostics, None
+
+    source_points = np.float32(
+        [[source_kp[match.queryIdx].pt[0] / sx, source_kp[match.queryIdx].pt[1] / sy] for match in good_matches]
+    )
+    reference_points = np.float32(
+        [[reference_kp[match.trainIdx].pt[0] / rx, reference_kp[match.trainIdx].pt[1] / ry] for match in good_matches]
+    )
+    matrix, inlier_mask = cv2.findHomography(source_points, reference_points, cv2.RANSAC, 5.0)
+    if matrix is None or inlier_mask is None:
+        diagnostics["reason"] = "homography_failed"
+        return None, diagnostics, None
+
+    inliers = int(inlier_mask.ravel().sum())
+    inlier_ratio = inliers / float(max(1, len(good_matches)))
+    diagnostics["inliers"] = inliers
+    diagnostics["inlier_ratio"] = inlier_ratio
+    area_ratio = transformed_corner_area(
+        matrix,
+        (source_frame.shape[1], source_frame.shape[0]),
+        (reference_frame.shape[1], reference_frame.shape[0]),
+    )
+    diagnostics["warped_area_ratio"] = area_ratio
+    if inliers < min_inliers:
+        diagnostics["reason"] = "not_enough_ransac_inliers"
+        return None, diagnostics, None
+    if inlier_ratio < 0.18:
+        diagnostics["reason"] = "low_inlier_ratio"
+        return None, diagnostics, None
+    if not (0.08 <= area_ratio <= 3.8):
+        diagnostics["reason"] = "unstable_warp_area"
+        return None, diagnostics, None
+
+    inlier_matches = [match for match, keep in zip(good_matches, inlier_mask.ravel()) if keep]
+    preview_matches = inlier_matches[:80]
+    preview = cv2.drawMatches(
+        source_small,
+        source_kp,
+        reference_small,
+        reference_kp,
+        preview_matches,
+        None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    )
+    diagnostics["accepted"] = True
+    diagnostics["reason"] = "accepted"
+    diagnostics["score"] = float(inliers * inlier_ratio)
+    return matrix, diagnostics, preview
+
+
+def save_auto_perspective_preview(
+    out_dir: Path,
+    source_id: str,
+    reference_id: str,
+    source_frame: np.ndarray,
+    reference_frame: np.ndarray,
+    matrix: np.ndarray,
+    match_preview: np.ndarray | None,
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    stem = f"{slugify(source_id)}_to_{slugify(reference_id)}"
+    if match_preview is not None:
+        match_path = out_dir / f"{stem}_matches.png"
+        cv2.imwrite(str(match_path), match_preview)
+        paths["matches_path"] = str(match_path)
+    warped = cv2.warpPerspective(source_frame, matrix, (reference_frame.shape[1], reference_frame.shape[0]))
+    alpha = cv2.addWeighted(reference_frame, 0.55, warped, 0.45, 0.0)
+    preview = np.hstack(
+        [
+            cv2.resize(reference_frame, (reference_frame.shape[1] // 2, reference_frame.shape[0] // 2)),
+            cv2.resize(warped, (reference_frame.shape[1] // 2, reference_frame.shape[0] // 2)),
+            cv2.resize(alpha, (reference_frame.shape[1] // 2, reference_frame.shape[0] // 2)),
+        ]
+    )
+    cv2.putText(preview, "reference", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        preview,
+        "auto-warped source",
+        (reference_frame.shape[1] // 2 + 10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        preview,
+        "overlay",
+        (reference_frame.shape[1] + 10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    warp_path = out_dir / f"{stem}_warp_preview.png"
+    cv2.imwrite(str(warp_path), preview)
+    paths["warp_preview_path"] = str(warp_path)
+    return paths
+
+
+def build_auto_perspective_transforms(
+    sources: list[SourceVideo],
+    session_start_utc_ns: int | None,
+    manual_sources: dict[str, Any],
+    out_dir: Path,
+    enabled: bool,
+    reference_id: str,
+    sample_count: int,
+    min_matches: int,
+    min_inliers: int,
+) -> tuple[dict[str, PerspectiveTransform], dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "enabled": enabled,
+        "reference_id": None,
+        "transforms": {},
+        "notes": [],
+    }
+    if not enabled:
+        diagnostics["notes"].append("auto_perspective_disabled")
+        return {}, diagnostics
+    if len(sources) < 2:
+        diagnostics["notes"].append("need_at_least_two_video_sources")
+        return {}, diagnostics
+
+    probes = {source.source_id: probe_video(source.path) for source in sources}
+    timing_maps = {source.source_id: load_frame_utc_by_index(source.timing_path) for source in sources}
+    source_by_id = {source.source_id: source for source in sources}
+    if reference_id and reference_id in source_by_id:
+        reference = source_by_id[reference_id]
+    else:
+        archive_sources = [source for source in sources if source.origin == "archive"]
+        reference = max(archive_sources or sources, key=lambda src: probes[src.source_id]["width"] * probes[src.source_id]["height"])
+    diagnostics["reference_id"] = reference.source_id
+
+    reference_probe = probes[reference.source_id]
+    reference_timing = timing_maps[reference.source_id]
+    reference_range = source_session_range(reference, reference_probe, reference_timing, session_start_utc_ns)
+    transforms: dict[str, PerspectiveTransform] = {}
+    preview_dir = out_dir / "auto_perspective"
+
+    for source in sources:
+        if source.source_id == reference.source_id:
+            diagnostics["transforms"][source.source_id] = {"accepted": False, "reason": "reference_source"}
+            continue
+        if source.source_id in manual_sources:
+            diagnostics["transforms"][source.source_id] = {"accepted": False, "reason": "manual_override_present"}
+            continue
+        source_probe = probes[source.source_id]
+        source_timing = timing_maps[source.source_id]
+        source_range = source_session_range(source, source_probe, source_timing, session_start_utc_ns)
+        pair_diag: dict[str, Any] = {
+            "source_id": source.source_id,
+            "reference_id": reference.source_id,
+            "accepted": False,
+            "source_range_s": source_range,
+            "reference_range_s": reference_range,
+            "attempts": [],
+        }
+        sample_pairs: list[tuple[float | None, int, int]] = []
+        if source_range and reference_range:
+            overlap_start = max(source_range[0], reference_range[0])
+            overlap_stop = min(source_range[1], reference_range[1])
+            if overlap_stop > overlap_start:
+                if overlap_stop - overlap_start > 2.0:
+                    overlap_start += 0.5
+                    overlap_stop -= 0.5
+                for session_s in np.linspace(overlap_start, overlap_stop, max(1, int(sample_count))).tolist():
+                    source_index = frame_index_near_session_s(
+                        source, source_probe, source_timing, session_start_utc_ns, float(session_s)
+                    )
+                    reference_index = frame_index_near_session_s(
+                        reference, reference_probe, reference_timing, session_start_utc_ns, float(session_s)
+                    )
+                    if source_index is not None and reference_index is not None:
+                        sample_pairs.append((float(session_s), int(source_index), int(reference_index)))
+            else:
+                pair_diag["fallback"] = "no_session_overlap_using_representative_frames"
+        else:
+            pair_diag["fallback"] = "missing_session_timing_using_representative_frames"
+
+        if not sample_pairs:
+            source_indices = representative_frame_indices(source_probe, max(1, int(sample_count)))
+            reference_indices = representative_frame_indices(reference_probe, max(1, int(sample_count)))
+            sample_pairs = [(None, source_index, reference_index) for source_index, reference_index in zip(source_indices, reference_indices)]
+
+        best: tuple[float, np.ndarray, dict[str, Any], np.ndarray | None, np.ndarray, np.ndarray] | None = None
+        for session_s, source_index, reference_index in sample_pairs:
+            source_frame = read_video_frame_at_index(source.path, source_index)
+            reference_frame = read_video_frame_at_index(reference.path, reference_index)
+            if source_frame is None or reference_frame is None:
+                continue
+            matrix, attempt_diag, match_preview = estimate_homography_from_shared_landmarks(
+                source_frame,
+                reference_frame,
+                min_matches,
+                min_inliers,
+            )
+            attempt_diag.update(
+                {
+                    "session_s": float(session_s) if session_s is not None else None,
+                    "source_frame_index": int(source_index),
+                    "reference_frame_index": int(reference_index),
+                }
+            )
+            pair_diag["attempts"].append(attempt_diag)
+            if matrix is not None:
+                score = float(attempt_diag.get("score", 0.0))
+                if best is None or score > best[0]:
+                    best = (score, matrix, attempt_diag, match_preview, source_frame, reference_frame)
+
+        if best is None:
+            pair_diag["reason"] = "no_reliable_landmark_match"
+            diagnostics["transforms"][source.source_id] = pair_diag
+            continue
+        score, matrix, best_diag, match_preview, source_frame, reference_frame = best
+        source_local_s = float(best_diag["source_frame_index"]) / float(source_probe.get("fps") or 30.0)
+        reference_session_s = session_s_for_frame_index(
+            reference,
+            reference_probe,
+            reference_timing,
+            session_start_utc_ns,
+            int(best_diag["reference_frame_index"]),
+        )
+        if reference_session_s is not None:
+            pair_diag["visual_sync_offset_s"] = reference_session_s - source_local_s
+            pair_diag["visual_sync_basis"] = {
+                "source_frame_index": int(best_diag["source_frame_index"]),
+                "source_local_s": source_local_s,
+                "reference_frame_index": int(best_diag["reference_frame_index"]),
+                "reference_session_s": reference_session_s,
+            }
+        preview_paths = save_auto_perspective_preview(
+            preview_dir,
+            source.source_id,
+            reference.source_id,
+            source_frame,
+            reference_frame,
+            matrix,
+            match_preview,
+        )
+        pair_diag.update(
+            {
+                "accepted": True,
+                "reason": "accepted",
+                "best": best_diag,
+                "preview": preview_paths,
+                "target_size": [int(reference_frame.shape[1]), int(reference_frame.shape[0])],
+            }
+        )
+        transforms[source.source_id] = PerspectiveTransform(
+            matrix=matrix,
+            target_size=(int(reference_frame.shape[1]), int(reference_frame.shape[0])),
+            mode="auto_landmark_homography",
+            reference_id=reference.source_id,
+            diagnostics=pair_diag,
+        )
+        diagnostics["transforms"][source.source_id] = pair_diag
+    return transforms, diagnostics
+
+
 def draw_label(image: np.ndarray, text: str, x: int, y: int, color: tuple[int, int, int]) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.45
@@ -450,6 +874,7 @@ def analyze_video_source(
     sample_every: int,
     max_frames: int,
     perspective_sources: dict[str, Any],
+    perspective_transforms: dict[str, PerspectiveTransform],
     max_evidence: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     emit_progress(f"Analyzing video source {source.source_id}")
@@ -458,7 +883,17 @@ def analyze_video_source(
     height = int(probe["height"])
     fps = float(probe["fps"])
     frame_utc_by_index = load_frame_utc_by_index(source.timing_path)
-    matrix = perspective_matrix_for_source(perspective_sources, source.source_id, width, height)
+    transform = perspective_transforms.get(source.source_id)
+    if transform is None:
+        matrix = perspective_matrix_for_source(perspective_sources, source.source_id, width, height)
+        if matrix is not None:
+            transform = PerspectiveTransform(
+                matrix=matrix,
+                target_size=(width, height),
+                mode="manual_four_point",
+                reference_id=None,
+                diagnostics={"accepted": True, "reason": "manual_json"},
+            )
     cap = cv2.VideoCapture(str(source.path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {source.path}")
@@ -480,7 +915,8 @@ def analyze_video_source(
             break
         if frame_index % sample_every != 0:
             continue
-        frame = apply_perspective(frame, matrix)
+        frame = apply_perspective_transform(frame, transform)
+        analysis_height, analysis_width = frame.shape[:2]
         next_gray, mask, detections, motion_ratio, global_rejected = detect_motion(prev_gray, frame, config, mask_history)
         prev_gray = next_gray
         local_s = frame_index / fps if fps > 0 else float(frame_index)
@@ -518,14 +954,16 @@ def analyze_video_source(
                 "session_s": session_s,
                 "utc_ns": utc_ns,
                 "utc_iso": utc_ns_to_iso(utc_ns),
-                "image_width": width,
-                "image_height": height,
+                "image_width": analysis_width,
+                "image_height": analysis_height,
                 "motion_ratio": motion_ratio,
                 "global_motion_rejected": global_rejected,
                 "motion_score": motion_score,
                 "detections": detections,
                 "evidence": evidence_paths,
-                "perspective_corrected": matrix is not None,
+                "perspective_corrected": transform is not None,
+                "perspective_mode": transform.mode if transform else None,
+                "perspective_reference_id": transform.reference_id if transform else None,
             }
         )
     cap.release()
@@ -537,7 +975,10 @@ def analyze_video_source(
         "probe": {key: value for key, value in probe.items() if key != "ffprobe"},
         "sampled_records": len(records),
         "evidence_images": evidence_count,
-        "perspective_corrected": matrix is not None,
+        "perspective_corrected": transform is not None,
+        "perspective_mode": transform.mode if transform else None,
+        "perspective_reference_id": transform.reference_id if transform else None,
+        "perspective_diagnostics": transform.diagnostics if transform else None,
     }
     return records, summary
 
@@ -826,6 +1267,45 @@ def choose_sync_offsets(
             "audio": audio,
         }
     return combined
+
+
+def refine_sync_report_with_visual_landmarks(sync_report: dict[str, dict[str, Any]], auto_perspective: dict[str, Any]) -> None:
+    transforms = auto_perspective.get("transforms", {})
+    for source_id, transform in transforms.items():
+        if not isinstance(transform, dict) or not transform.get("visual_sync_applied"):
+            continue
+        report = sync_report.get(source_id)
+        if not report:
+            continue
+        report["visual_sync_offset_s"] = transform.get("visual_sync_offset_s")
+        report["visual_sync_basis"] = transform.get("visual_sync_basis")
+        report["previous_metadata_offset_s"] = transform.get("previous_metadata_offset_s")
+        report["chosen_method"] = "visual_landmark_sync"
+
+        best_kind = None
+        best_candidate = None
+        best_corr = 0.0
+        for kind in ["motion", "audio"]:
+            candidate_report = report.get(kind, {})
+            candidate = candidate_report.get("suggested_offset_s")
+            corr = float(candidate_report.get("correlation", 0.0) or 0.0)
+            if candidate is None or corr < 0.80:
+                continue
+            start = candidate_report.get("search_start_s")
+            stop = candidate_report.get("search_stop_s")
+            bin_width = float(candidate_report.get("bin_s", 0.5) or 0.5)
+            if start is not None and abs(float(candidate) - float(start)) <= bin_width:
+                continue
+            if stop is not None and abs(float(candidate) - float(stop)) <= bin_width:
+                continue
+            if corr > best_corr:
+                best_kind = kind
+                best_candidate = float(candidate)
+                best_corr = corr
+        if best_candidate is not None:
+            report["suggested_offset_s"] = best_candidate
+            report["chosen_method"] = f"visual_landmark_then_{best_kind}_correlation"
+            report["correlation_refined_from_visual_sync"] = True
 
 
 def apply_extra_sync_offsets(
@@ -1168,6 +1648,140 @@ def inspect_inputs(args: argparse.Namespace) -> dict[str, Any]:
     return {"archive": archive_summary, "extra_videos": extra_summaries}
 
 
+def md_path(path_text: str, out_dir: Path) -> str:
+    path = Path(path_text)
+    try:
+        return path.resolve().relative_to(out_dir.resolve()).as_posix()
+    except Exception:
+        return path.resolve().as_posix()
+
+
+def write_markdown_report(
+    report_path: Path,
+    summary: dict[str, Any],
+    events: list[dict[str, Any]],
+    sync_report: dict[str, Any],
+    auto_perspective: dict[str, Any],
+    evidence_index: list[dict[str, Any]],
+) -> None:
+    out_dir = report_path.parent
+    lines: list[str] = [
+        "# Fusion Evidence Lab Result Report",
+        "",
+        "## Run Summary",
+        "",
+        f"- Archive: `{summary.get('archive')}`",
+        f"- Session: `{summary.get('session_id')}`",
+        f"- Session start UTC: `{summary.get('session_start_utc')}`",
+        f"- Fused threshold: `{summary.get('threshold')}`",
+        f"- Timeline bins: `{summary.get('timeline_bins')}`",
+        f"- Events: `{summary.get('event_count')}`",
+        f"- Indexed proof items: `{summary.get('evidence_count')}`",
+        f"- Extra video audio sources: `{summary.get('extra_video_audio_sources')}`",
+        "",
+        "## Autonomous Perspective Correction",
+        "",
+        f"- Enabled: `{auto_perspective.get('enabled')}`",
+        f"- Reference source: `{auto_perspective.get('reference_id')}`",
+        "",
+    ]
+    transforms = auto_perspective.get("transforms", {})
+    if transforms:
+        lines.append("| Source | Accepted | Reason | Inliers | Inlier ratio |")
+        lines.append("| --- | ---: | --- | ---: | ---: |")
+        for source_id, item in transforms.items():
+            best = item.get("best", {}) if isinstance(item, dict) else {}
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(source_id),
+                        str(bool(item.get("accepted"))) if isinstance(item, dict) else "False",
+                        str(item.get("reason", "")) if isinstance(item, dict) else "",
+                        str(best.get("inliers", "")),
+                        f"{float(best.get('inlier_ratio', 0.0)):.3f}" if best else "",
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+        for source_id, item in transforms.items():
+            if not isinstance(item, dict):
+                continue
+            preview = item.get("preview") or {}
+            if preview.get("matches_path") or preview.get("warp_preview_path"):
+                lines.append(f"### Perspective Proof: `{source_id}`")
+                lines.append("")
+                if preview.get("matches_path"):
+                    rel = md_path(preview["matches_path"], out_dir)
+                    lines.append(f"![Feature matches]({rel})")
+                    lines.append("")
+                if preview.get("warp_preview_path"):
+                    rel = md_path(preview["warp_preview_path"], out_dir)
+                    lines.append(f"![Warp preview]({rel})")
+                    lines.append("")
+    else:
+        lines.append("No perspective candidates were available.")
+        lines.append("")
+
+    lines.extend(["## Sync Report", "", "```json", json.dumps(sync_report, indent=2), "```", ""])
+
+    lines.extend(["## Top Fused Events", ""])
+    if events:
+        lines.append("| Event | Start s | End s | Peak | Sources | Proofs |")
+        lines.append("| ---: | ---: | ---: | ---: | --- | ---: |")
+        for event in events[:20]:
+            lines.append(
+                f"| {event['event_index']} | {event['start_s']:.2f} | {event['end_s']:.2f} | "
+                f"{event['peak_score']:.3f} | {', '.join(event.get('sources', []))} | {len(event.get('evidence', []))} |"
+            )
+        lines.append("")
+    else:
+        lines.append("No events passed the current threshold.")
+        lines.append("")
+
+    lines.extend(["## Proof Screenshots", ""])
+    shown = 0
+    for event in events[:12]:
+        lines.append(f"### Event {event['event_index']} - peak {event['peak_score']:.2f}")
+        lines.append("")
+        for proof in event.get("evidence", [])[:4]:
+            lines.append(f"- `{proof.get('kind')}` source `{proof.get('source_id')}` score `{float(proof.get('score', 0.0)):.2f}`")
+            for key, label in [("annotated_path", "Boxes"), ("motion_path", "Motion-only"), ("audio_path", "Audio proof")]:
+                if proof.get(key) and Path(proof[key]).exists():
+                    rel = md_path(proof[key], out_dir)
+                    lines.append(f"![{label}]({rel})")
+                    lines.append("")
+                    shown += 1
+        if shown >= 36:
+            break
+    if not shown and evidence_index:
+        for proof in evidence_index[:12]:
+            for key, label in [("annotated_path", "Boxes"), ("motion_path", "Motion-only"), ("audio_path", "Audio proof")]:
+                if proof.get(key) and Path(proof[key]).exists():
+                    rel = md_path(proof[key], out_dir)
+                    lines.append(f"![{label}]({rel})")
+                    lines.append("")
+                    shown += 1
+            if shown >= 24:
+                break
+
+    lines.extend(
+        [
+            "## Saved Artifacts",
+            "",
+            f"- Run directory: `{summary['paths']['run_dir']}`",
+            f"- Events JSON: `{summary['paths']['events']}`",
+            f"- Timeline JSON: `{summary['paths']['fusion_timeline']}`",
+            f"- Sync JSON: `{summary['paths']['sync_report']}`",
+            f"- Auto perspective JSON: `{summary['paths']['auto_perspective']}`",
+            f"- Evidence index: `{summary['paths']['evidence_index']}`",
+            "",
+        ]
+    )
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def analyze(args: argparse.Namespace) -> dict[str, Any]:
     archive_path = Path(args.archive) if args.archive else DEFAULT_ARCHIVE
     out_dir = (Path(args.out_dir) if args.out_dir else DEFAULT_OUTPUT_ROOT / datetime.now().strftime("fusion_%Y%m%dT%H%M%S")).resolve()
@@ -1205,6 +1819,41 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
 
+    all_video_sources = videos + extra_sources
+    perspective_transforms, auto_perspective = build_auto_perspective_transforms(
+        all_video_sources,
+        session_start_utc_ns,
+        perspective_sources,
+        out_dir,
+        args.auto_perspective,
+        args.auto_perspective_reference,
+        args.auto_perspective_samples,
+        args.auto_perspective_min_matches,
+        args.auto_perspective_min_inliers,
+    )
+    updated_extra_sources: list[SourceVideo] = []
+    for source in extra_sources:
+        transform_diag = auto_perspective.get("transforms", {}).get(source.source_id, {})
+        visual_offset = transform_diag.get("visual_sync_offset_s") if isinstance(transform_diag, dict) else None
+        if visual_offset is not None and (
+            source.metadata_offset_s is None or abs(float(source.metadata_offset_s) - float(visual_offset)) > 30.0
+        ):
+            transform_diag["visual_sync_applied"] = True
+            transform_diag["previous_metadata_offset_s"] = source.metadata_offset_s
+            source = SourceVideo(
+                source_id=source.source_id,
+                label=source.label,
+                path=source.path,
+                origin=source.origin,
+                timing_path=source.timing_path,
+                creation_utc_ns=source.creation_utc_ns,
+                metadata_offset_s=float(visual_offset),
+            )
+        elif isinstance(transform_diag, dict):
+            transform_diag["visual_sync_applied"] = False
+        updated_extra_sources.append(source)
+    extra_sources = updated_extra_sources
+
     all_motion_records: list[dict[str, Any]] = []
     video_summaries: list[dict[str, Any]] = []
     archive_motion: list[dict[str, Any]] = []
@@ -1220,6 +1869,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             args.sample_every,
             args.max_frames,
             perspective_sources,
+            perspective_transforms,
             args.max_evidence_per_source,
         )
         archive_motion.extend(records)
@@ -1235,6 +1885,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             args.sample_every,
             args.max_frames,
             perspective_sources,
+            perspective_transforms,
             args.max_evidence_per_source,
         )
         extra_records_by_source[source.source_id] = records
@@ -1280,6 +1931,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     }
     audio_sync_report = estimate_extra_video_sync(archive_audio_for_sync, extra_audio_by_source, metadata_offsets, args.bin_s)
     sync_report = choose_sync_offsets(motion_sync_report, audio_sync_report, metadata_offsets)
+    refine_sync_report_with_visual_landmarks(sync_report, auto_perspective)
     apply_extra_sync_offsets(extra_records_by_source, sync_report, session_start_utc_ns)
     apply_extra_sync_offsets(
         {source_id: [item for item in extra_audio_records if item.get("source_id") == source_id] for source_id in metadata_offsets},
@@ -1305,14 +1957,17 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "fusion_timeline": str(out_dir / "fusion_timeline.json"),
         "events": str(out_dir / "events.json"),
         "sync_report": str(out_dir / "sync_report.json"),
+        "auto_perspective": str(out_dir / "auto_perspective.json"),
         "evidence_index": str(out_dir / "evidence_index.json"),
         "motion_records": str(out_dir / "motion_records.jsonl"),
         "audio_records": str(out_dir / "audio_records.jsonl"),
+        "result_report": str(out_dir / "result_report.md"),
         "summary": str(out_dir / "run_summary.json"),
     }
     write_json(out_dir / "fusion_timeline.json", timeline)
     write_json(out_dir / "events.json", events)
     write_json(out_dir / "sync_report.json", sync_report)
+    write_json(out_dir / "auto_perspective.json", auto_perspective)
     write_json(out_dir / "evidence_index.json", evidence_index)
     with (out_dir / "motion_records.jsonl").open("w", encoding="utf-8") as handle:
         for record in all_motion_records:
@@ -1331,6 +1986,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "motion_config": asdict(config),
         "video_summaries": video_summaries,
         "audio_summaries": audio_summaries,
+        "auto_perspective": auto_perspective,
         "extra_video_audio_sources": len(extra_audio_sources),
         "imported_detector_records": len(imported_records),
         "timeline_bins": len(timeline),
@@ -1338,6 +1994,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_count": len(evidence_index),
         "paths": paths,
     }
+    write_markdown_report(out_dir / "result_report.md", summary, events, sync_report, auto_perspective, evidence_index)
     write_json(out_dir / "run_summary.json", summary)
     return summary
 
@@ -1371,6 +2028,12 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--max-evidence-per-source", type=int, default=40)
     analyze_parser.add_argument("--max-audio-evidence-per-source", type=int, default=8)
     analyze_parser.add_argument("--perspective-json", default="")
+    analyze_parser.add_argument("--auto-perspective", dest="auto_perspective", action="store_true", default=True)
+    analyze_parser.add_argument("--no-auto-perspective", dest="auto_perspective", action="store_false")
+    analyze_parser.add_argument("--auto-perspective-reference", default="")
+    analyze_parser.add_argument("--auto-perspective-samples", type=int, default=3)
+    analyze_parser.add_argument("--auto-perspective-min-matches", type=int, default=24)
+    analyze_parser.add_argument("--auto-perspective-min-inliers", type=int, default=18)
     analyze_parser.add_argument("--no-extra-video-audio", action="store_true")
     analyze_parser.add_argument("--json", action="store_true")
     return parser

@@ -65,14 +65,17 @@ py -3 prototype\fusion_evidence_lab\fusion_evidence_lab.py inspect `
 2. Extract synchronized camera/audio files into a run cache.
 3. Analyze camera and extra-video frames using fixed-camera motion differencing.
 4. Score audio windows using RMS plus drone-like band energy.
-5. Estimate extra-video sync from embedded creation time, then refine with motion correlation where overlap exists.
-6. Bin all evidence on one session-relative UTC timeline.
-7. Boost fused confidence when multiple sensors agree in the same time bin.
-8. Save event windows with proof artifacts for review.
+5. Estimate autonomous perspective correction by matching shared visual landmarks across camera/video sources and fitting a RANSAC homography.
+6. Estimate extra-video sync from embedded creation time, then refine with motion/audio correlation where overlap exists.
+7. Bin all evidence on one session-relative UTC timeline.
+8. Boost fused confidence when multiple sensors agree in the same time bin.
+9. Save event windows with proof artifacts for review.
 
 ## Perspective Correction
 
-Optional perspective correction uses a JSON object. Points can be normalized `0..1` or absolute pixels.
+Perspective correction is automatic by default. The analyzer picks a reference camera/video source, samples overlapping frames, matches stable ORB landmarks that appear in both views, fits a homography with RANSAC, and applies it only when the match passes conservative quality gates. It saves `auto_perspective.json` plus match/warp preview screenshots.
+
+Manual JSON is only an override for difficult scenes. Points can be normalized `0..1` or absolute pixels.
 
 ```json
 {
@@ -86,6 +89,12 @@ Optional perspective correction uses a JSON object. Points can be normalized `0.
 ```
 
 Source keys match stream slugs such as `demo1`, `hp_wide_vision_hd_camera`, or an extra-video slug.
+
+Disable automatic correction only for debugging:
+
+```powershell
+py -3 prototype\fusion_evidence_lab\fusion_evidence_lab.py analyze --no-auto-perspective ...
+```
 
 ## Detector Imports
 
