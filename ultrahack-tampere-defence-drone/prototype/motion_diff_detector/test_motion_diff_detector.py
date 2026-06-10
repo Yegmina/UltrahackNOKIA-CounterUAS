@@ -14,6 +14,7 @@ from motion_diff_detector import (
     SemanticDetection,
     ShakeEstimator,
     analyze_gray_pair,
+    apply_semantic_device_override,
     cuda_is_available,
     filter_candidates_by_semantics,
     load_roi_mask,
@@ -227,6 +228,128 @@ def test_direction_consistency_rejects_jittering_track() -> None:
     assert len(second.candidates) == 1
     assert third.candidates == []
     assert third.direction_rejected_count == 1
+
+
+def test_drone_track_filter_waits_for_min_hits() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            drone_track_filter=True,
+            drone_min_track_hits=3,
+            drone_min_normalized_speed=0.1,
+            drone_max_normalized_speed=10.0,
+            track_match_distance=30,
+        )
+    )
+    contour = dummy_contour()
+
+    first = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=1)
+    second = tracker.filter_candidates([(make_detection(20, 10), contour)], frame_index=2)
+    third = tracker.filter_candidates([(make_detection(30, 10), contour)], frame_index=3)
+
+    assert first.candidates == []
+    assert first.drone_track_rejected_count == 1
+    assert second.candidates == []
+    assert second.drone_track_rejected_count == 1
+    assert len(third.candidates) == 1
+    assert third.candidates[0][0].normalized_speed > 0.1
+
+
+def test_screen_decoy_rejection_drops_constant_smooth_track() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            screen_decoy_rejection=True,
+            screen_min_track_hits=3,
+            screen_max_area_cv=0.05,
+            screen_max_aspect_cv=0.05,
+            screen_min_path_smoothness=0.95,
+            track_match_distance=40,
+        )
+    )
+    contour = dummy_contour()
+
+    tracker.filter_candidates(
+        [(make_detection(10, 10, area=100), contour)],
+        frame_index=1,
+        image_width=100,
+        image_height=100,
+    )
+    tracker.filter_candidates(
+        [(make_detection(20, 10, area=100), contour)],
+        frame_index=2,
+        image_width=100,
+        image_height=100,
+    )
+    third = tracker.filter_candidates(
+        [(make_detection(30, 10, area=100), contour)],
+        frame_index=3,
+        image_width=100,
+        image_height=100,
+    )
+
+    assert third.candidates == []
+    assert third.screen_decoy_rejected_count == 1
+
+
+def test_screen_decoy_rejection_keeps_changing_size_track() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            screen_decoy_rejection=True,
+            screen_min_track_hits=3,
+            screen_max_area_cv=0.05,
+            screen_max_aspect_cv=0.05,
+            screen_min_path_smoothness=0.95,
+            track_match_distance=40,
+        )
+    )
+    contour = dummy_contour()
+
+    tracker.filter_candidates(
+        [(make_detection(10, 10, area=100), contour)],
+        frame_index=1,
+        image_width=100,
+        image_height=100,
+    )
+    tracker.filter_candidates(
+        [(make_detection(20, 10, area=140), contour)],
+        frame_index=2,
+        image_width=100,
+        image_height=100,
+    )
+    third = tracker.filter_candidates(
+        [(make_detection(30, 10, area=190), contour)],
+        frame_index=3,
+        image_width=100,
+        image_height=100,
+    )
+
+    assert len(third.candidates) == 1
+    assert third.screen_decoy_rejected_count == 0
+    assert third.candidates[0][0].track_area_cv > 0.05
+
+
+def test_occlusion_recovery_rematches_predicted_track() -> None:
+    tracker = MotionTracker(
+        MotionConfig(
+            occlusion_recovery=True,
+            occlusion_max_frames=3,
+            track_match_distance=5,
+            occlusion_gate_distance=15,
+        )
+    )
+    contour = dummy_contour()
+
+    first = tracker.filter_candidates([(make_detection(10, 10), contour)], frame_index=1)
+    second = tracker.filter_candidates([(make_detection(20, 10), contour)], frame_index=2)
+    missed = tracker.filter_candidates([], frame_index=3)
+    recovered = tracker.filter_candidates([(make_detection(40, 10), contour)], frame_index=4)
+
+    assert first.candidates[0][0].track_id == 1
+    assert second.candidates[0][0].track_id == 1
+    assert missed.candidates == []
+    assert len(recovered.candidates) == 1
+    assert recovered.candidates[0][0].track_id == 1
+    assert recovered.candidates[0][0].occlusion_recovered
+    assert recovered.occlusion_recovered_count == 1
 
 
 def test_roi_normalized_points_scale_to_video_size() -> None:
@@ -493,6 +616,7 @@ def test_backend_auto_resolves_to_cpu_or_cuda() -> None:
     assert backend.requested == "auto"
     assert backend.used in {"cpu", "cuda"}
     assert backend.cuda_available == cuda_is_available()
+    assert backend.semantic_device in {"cpu", "cuda", "mps"}
 
 
 def test_backend_cpu_forces_cpu() -> None:
@@ -500,18 +624,36 @@ def test_backend_cpu_forces_cpu() -> None:
 
     assert backend.requested == "cpu"
     assert backend.used == "cpu"
+    assert backend.semantic_device == "cpu"
 
 
-def test_backend_cuda_requires_available_device() -> None:
+def test_backend_cuda_falls_back_without_motion_device() -> None:
+    backend = resolve_backend("cuda")
+
     if cuda_is_available():
-        assert resolve_backend("cuda").used == "cuda"
+        assert backend.used == "cuda"
     else:
-        try:
-            resolve_backend("cuda")
-        except RuntimeError as exc:
-            assert "CUDA backend was requested" in str(exc)
-        else:
-            raise AssertionError("Expected CUDA backend to fail without a CUDA device.")
+        assert backend.used == "cpu"
+        assert "fell back to CPU" in backend.message
+
+
+def test_backend_mps_uses_cpu_motion_backend() -> None:
+    backend = resolve_backend("mps")
+
+    assert backend.requested == "mps"
+    assert backend.used == "cpu"
+    assert backend.semantic_device in {"cpu", "mps"}
+
+
+def test_semantic_device_override_falls_back_to_cpu_when_unavailable() -> None:
+    backend = resolve_backend("cpu")
+    backend = apply_semantic_device_override(backend, "mps")
+
+    if backend.semantic_mps_available:
+        assert backend.semantic_device == "mps"
+    else:
+        assert backend.semantic_device == "cpu"
+        assert "fell back to CPU" in backend.message
 
 
 def test_progress_payload_reports_recent_speed() -> None:

@@ -22,7 +22,7 @@ DEFAULT_SEMANTIC_MODEL_REPO = "devanshty/WingID"
 DEFAULT_SEMANTIC_MODEL_FILE = "yolo11l.pt"
 PROGRESS_PREFIX = "PROGRESS "
 SEMANTIC_ACTIONS = {"reject", "penalize"}
-PROCESSING_BACKENDS = {"auto", "cpu", "cuda"}
+PROCESSING_BACKENDS = {"auto", "cpu", "cuda", "mps"}
 STOP_REQUESTED = False
 SEMANTIC_LABEL_ALIASES = {
     "human": "person",
@@ -63,6 +63,20 @@ class MotionConfig:
     direction_min_hits: int = 3
     direction_min_displacement: float = 2.0
     direction_cosine: float = 0.20
+    drone_track_filter: bool = False
+    drone_min_track_hits: int = 3
+    drone_min_normalized_speed: float = 0.10
+    drone_max_normalized_speed: float = 30.0
+    screen_decoy_rejection: bool = False
+    screen_min_track_hits: int = 8
+    screen_max_area_cv: float = 0.08
+    screen_max_aspect_cv: float = 0.10
+    screen_min_path_smoothness: float = 0.90
+    screen_min_perimeter_fraction: float = 0.0
+    screen_perimeter_margin: float = 0.10
+    occlusion_recovery: bool = False
+    occlusion_max_frames: int = 8
+    occlusion_gate_distance: float = 140.0
 
     def normalized(self) -> "MotionConfig":
         diff_threshold = int(np.clip(self.diff_threshold, 1, 255))
@@ -96,6 +110,20 @@ class MotionConfig:
             direction_min_hits=max(2, int(self.direction_min_hits)),
             direction_min_displacement=max(0.0, float(self.direction_min_displacement)),
             direction_cosine=float(np.clip(self.direction_cosine, -1.0, 1.0)),
+            drone_track_filter=bool(self.drone_track_filter),
+            drone_min_track_hits=max(1, int(self.drone_min_track_hits)),
+            drone_min_normalized_speed=max(0.0, float(self.drone_min_normalized_speed)),
+            drone_max_normalized_speed=max(0.0, float(self.drone_max_normalized_speed)),
+            screen_decoy_rejection=bool(self.screen_decoy_rejection),
+            screen_min_track_hits=max(2, int(self.screen_min_track_hits)),
+            screen_max_area_cv=max(0.0, float(self.screen_max_area_cv)),
+            screen_max_aspect_cv=max(0.0, float(self.screen_max_aspect_cv)),
+            screen_min_path_smoothness=float(np.clip(self.screen_min_path_smoothness, 0.0, 1.0)),
+            screen_min_perimeter_fraction=float(np.clip(self.screen_min_perimeter_fraction, 0.0, 1.0)),
+            screen_perimeter_margin=float(np.clip(self.screen_perimeter_margin, 0.0, 0.5)),
+            occlusion_recovery=bool(self.occlusion_recovery),
+            occlusion_max_frames=max(0, int(self.occlusion_max_frames)),
+            occlusion_gate_distance=max(1.0, float(self.occlusion_gate_distance)),
         )
 
 
@@ -106,15 +134,22 @@ class BackendInfo:
     cuda_available: bool
     cuda_device_count: int
     cuda_device: int | None = None
+    semantic_device: str = "cpu"
+    semantic_cuda_available: bool = False
+    semantic_mps_available: bool = False
     message: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "requested": self.requested,
             "used": self.used,
+            "motion_backend": self.used,
             "cuda_available": self.cuda_available,
             "cuda_device_count": self.cuda_device_count,
             "cuda_device": self.cuda_device,
+            "semantic_device": self.semantic_device,
+            "semantic_cuda_available": self.semantic_cuda_available,
+            "semantic_mps_available": self.semantic_mps_available,
             "message": self.message,
         }
 
@@ -217,6 +252,16 @@ class MotionDetection:
     motion_dx: float = 0.0
     motion_dy: float = 0.0
     direction_consistent: bool = True
+    normalized_speed: float = 0.0
+    track_area_cv: float = 0.0
+    track_aspect_cv: float = 0.0
+    track_path_smoothness: float = 0.0
+    track_perimeter_fraction: float = 0.0
+    drone_score: float = 0.0
+    screen_decoy_score: float = 0.0
+    track_action: str = "keep"
+    track_filter_reason: str | None = None
+    occlusion_recovered: bool = False
     semantic_action: str = "keep"
     semantic_label: str | None = None
     semantic_confidence: float = 0.0
@@ -253,6 +298,9 @@ class MotionFrameResult:
     temporal_rejected_count: int
     unconfirmed_rejected_count: int
     direction_rejected_count: int
+    drone_track_rejected_count: int
+    screen_decoy_rejected_count: int
+    occlusion_recovered_count: int
     semantic_detections: list[SemanticDetection]
     detections: list[MotionDetection]
 
@@ -279,6 +327,9 @@ class MotionFrameResult:
             "temporal_rejected_count": int(self.temporal_rejected_count),
             "unconfirmed_rejected_count": int(self.unconfirmed_rejected_count),
             "direction_rejected_count": int(self.direction_rejected_count),
+            "drone_track_rejected_count": int(self.drone_track_rejected_count),
+            "screen_decoy_rejected_count": int(self.screen_decoy_rejected_count),
+            "occlusion_recovered_count": int(self.occlusion_recovered_count),
             "semantic_detections": [
                 detection.to_json_dict() for detection in self.semantic_detections
             ],
@@ -309,6 +360,9 @@ class MotionAnalysis:
     temporal_rejected_count: int = 0
     unconfirmed_rejected_count: int = 0
     direction_rejected_count: int = 0
+    drone_track_rejected_count: int = 0
+    screen_decoy_rejected_count: int = 0
+    occlusion_recovered_count: int = 0
 
 
 def canonical_semantic_label(label: str) -> str:
@@ -336,26 +390,88 @@ def cuda_is_available() -> bool:
     return get_cuda_device_count() > 0
 
 
+def torch_cuda_is_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def torch_mps_is_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    try:
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        return bool(mps_backend is not None and mps_backend.is_available())
+    except Exception:
+        return False
+
+
+def resolve_semantic_device_for_backend(
+    requested: str,
+    semantic_cuda_available: bool,
+    semantic_mps_available: bool,
+) -> str:
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        return "cuda" if semantic_cuda_available else "cpu"
+    if requested == "mps":
+        return "mps" if semantic_mps_available else "cpu"
+    if semantic_cuda_available:
+        return "cuda"
+    if semantic_mps_available:
+        return "mps"
+    return "cpu"
+
+
 def resolve_backend(requested: str, cuda_device: int = 0) -> BackendInfo:
     requested = str(requested or "auto").strip().lower()
     if requested not in PROCESSING_BACKENDS:
         raise ValueError(f"Unsupported processing backend: {requested}")
 
     device_count = get_cuda_device_count()
-    available = device_count > 0
+    motion_cuda_available = device_count > 0
+    semantic_cuda_available = torch_cuda_is_available()
+    semantic_mps_available = torch_mps_is_available()
+    semantic_device = resolve_semantic_device_for_backend(
+        requested,
+        semantic_cuda_available,
+        semantic_mps_available,
+    )
+
     if requested == "cpu":
         return BackendInfo(
             requested=requested,
             used="cpu",
-            cuda_available=available,
+            cuda_available=motion_cuda_available,
             cuda_device_count=device_count,
+            semantic_device="cpu",
+            semantic_cuda_available=semantic_cuda_available,
+            semantic_mps_available=semantic_mps_available,
             message="CPU backend selected.",
         )
 
-    if available:
+    if requested in {"auto", "cuda"} and motion_cuda_available:
         if cuda_device < 0 or cuda_device >= device_count:
-            raise RuntimeError(
-                f"CUDA device {cuda_device} is not available. Detected {device_count} CUDA device(s)."
+            return BackendInfo(
+                requested=requested,
+                used="cpu",
+                cuda_available=True,
+                cuda_device_count=device_count,
+                semantic_device=semantic_device,
+                semantic_cuda_available=semantic_cuda_available,
+                semantic_mps_available=semantic_mps_available,
+                message=(
+                    f"CUDA device {cuda_device} is not available; motion backend fell back to CPU. "
+                    f"Detected {device_count} CUDA device(s)."
+                ),
             )
         return BackendInfo(
             requested=requested,
@@ -363,21 +479,89 @@ def resolve_backend(requested: str, cuda_device: int = 0) -> BackendInfo:
             cuda_available=True,
             cuda_device_count=device_count,
             cuda_device=int(cuda_device),
-            message=f"CUDA backend selected on device {cuda_device}.",
+            semantic_device=semantic_device,
+            semantic_cuda_available=semantic_cuda_available,
+            semantic_mps_available=semantic_mps_available,
+            message=(
+                f"CUDA motion backend selected on device {cuda_device}; "
+                f"semantic device={semantic_device}."
+            ),
         )
 
     if requested == "cuda":
-        raise RuntimeError(
-            "CUDA backend was requested, but OpenCV reports no CUDA-enabled devices. "
-            "Install an OpenCV build with CUDA support and a working NVIDIA driver, or use --backend auto/cpu."
+        return BackendInfo(
+            requested=requested,
+            used="cpu",
+            cuda_available=False,
+            cuda_device_count=device_count,
+            semantic_device=semantic_device,
+            semantic_cuda_available=semantic_cuda_available,
+            semantic_mps_available=semantic_mps_available,
+            message=(
+                "CUDA was requested, but OpenCV reports no CUDA motion device; "
+                f"motion backend fell back to CPU and semantic device={semantic_device}."
+            ),
+        )
+
+    if requested == "mps":
+        return BackendInfo(
+            requested=requested,
+            used="cpu",
+            cuda_available=motion_cuda_available,
+            cuda_device_count=device_count,
+            semantic_device=semantic_device,
+            semantic_cuda_available=semantic_cuda_available,
+            semantic_mps_available=semantic_mps_available,
+            message=(
+                "MPS is only available for the semantic AI model; "
+                f"motion backend uses CPU and semantic device={semantic_device}."
+            ),
         )
 
     return BackendInfo(
         requested=requested,
         used="cpu",
-        cuda_available=False,
+        cuda_available=motion_cuda_available,
         cuda_device_count=device_count,
-        message="CUDA unavailable; auto backend fell back to CPU.",
+        semantic_device=semantic_device,
+        semantic_cuda_available=semantic_cuda_available,
+        semantic_mps_available=semantic_mps_available,
+        message=f"Auto selected CPU motion backend and semantic device={semantic_device}.",
+    )
+
+
+def apply_semantic_device_override(
+    backend_info: BackendInfo,
+    semantic_device: str | None,
+) -> BackendInfo:
+    requested_device = str(semantic_device or "").strip().lower()
+    if not requested_device:
+        return backend_info
+    if requested_device == "cpu":
+        selected_device = "cpu"
+        message = "Semantic device override selected CPU."
+    elif requested_device == "cuda":
+        selected_device = "cuda" if backend_info.semantic_cuda_available else "cpu"
+        message = (
+            "Semantic device override selected CUDA."
+            if selected_device == "cuda"
+            else "Semantic CUDA override unavailable; semantic device fell back to CPU."
+        )
+    elif requested_device == "mps":
+        selected_device = "mps" if backend_info.semantic_mps_available else "cpu"
+        message = (
+            "Semantic device override selected MPS."
+            if selected_device == "mps"
+            else "Semantic MPS override unavailable; semantic device fell back to CPU."
+        )
+    else:
+        selected_device = requested_device
+        message = f"Semantic device override selected '{requested_device}'."
+
+    return replace(
+        backend_info,
+        semantic_device=selected_device,
+        message=f"{backend_info.message} {message}",
     )
 
 
@@ -482,9 +666,7 @@ def create_cuda_processor(backend_info: BackendInfo) -> CudaMotionProcessor | No
     assert backend_info.cuda_device is not None
     try:
         return CudaMotionProcessor(backend_info.cuda_device)
-    except Exception as exc:
-        if backend_info.requested == "cuda":
-            raise RuntimeError(f"Could not initialize CUDA backend: {exc}") from exc
+    except Exception:
         return None
 
 
@@ -942,8 +1124,13 @@ class MotionTrack:
     missed: int = 0
     seen_frames: list[int] = field(default_factory=list)
     displacements: list[tuple[float, float]] = field(default_factory=list)
+    centers: list[tuple[float, float]] = field(default_factory=list)
+    areas: list[float] = field(default_factory=list)
+    aspects: list[float] = field(default_factory=list)
     last_dx: float = 0.0
     last_dy: float = 0.0
+    last_width: float = 0.0
+    last_height: float = 0.0
 
     def age_at(self, frame_index: int) -> int:
         return max(1, frame_index - self.created_frame_index + 1)
@@ -952,6 +1139,13 @@ class MotionTrack:
         first_frame = frame_index - max(1, window_frames) + 1
         return sum(1 for seen_frame in self.seen_frames if seen_frame >= first_frame)
 
+    def predicted_center(self, frame_index: int) -> tuple[float, float]:
+        elapsed_frames = max(1, frame_index - self.last_frame_index)
+        return (
+            self.center_x + self.last_dx * elapsed_frames,
+            self.center_y + self.last_dy * elapsed_frames,
+        )
+
 
 @dataclass(frozen=True)
 class MotionTrackFilterResult:
@@ -959,9 +1153,69 @@ class MotionTrackFilterResult:
     temporal_rejected_count: int = 0
     unconfirmed_rejected_count: int = 0
     direction_rejected_count: int = 0
+    drone_track_rejected_count: int = 0
+    screen_decoy_rejected_count: int = 0
+    occlusion_recovered_count: int = 0
+
+
+@dataclass(frozen=True)
+class MotionTrackStats:
+    normalized_speed: float = 0.0
+    area_cv: float = 0.0
+    aspect_cv: float = 0.0
+    path_smoothness: float = 0.0
+    perimeter_fraction: float = 0.0
+    drone_score: float = 0.0
+    screen_decoy_score: float = 0.0
+
+
+def coefficient_of_variation(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    array = np.asarray(values, dtype=np.float32)
+    mean = float(np.mean(array))
+    if abs(mean) < 1e-9:
+        return 0.0
+    return float(np.std(array) / abs(mean))
+
+
+def track_path_smoothness(centers: list[tuple[float, float]]) -> float:
+    if len(centers) < 3:
+        return 0.0
+    points = np.asarray(centers, dtype=np.float32)
+    steps = np.linalg.norm(points[1:] - points[:-1], axis=1)
+    path_length = float(np.sum(steps))
+    if path_length < 1e-9:
+        return 0.0
+    net_displacement = float(np.linalg.norm(points[-1] - points[0]))
+    return float(np.clip(net_displacement / path_length, 0.0, 1.0))
+
+
+def track_perimeter_fraction(
+    centers: list[tuple[float, float]],
+    image_width: int,
+    image_height: int,
+    margin_fraction: float,
+) -> float:
+    if not centers or image_width <= 0 or image_height <= 0 or margin_fraction <= 0.0:
+        return 0.0
+    margin_x = image_width * margin_fraction
+    margin_y = image_height * margin_fraction
+    perimeter_hits = 0
+    for center_x, center_y in centers:
+        if (
+            center_x <= margin_x
+            or center_x >= image_width - margin_x
+            or center_y <= margin_y
+            or center_y >= image_height - margin_y
+        ):
+            perimeter_hits += 1
+    return perimeter_hits / float(len(centers))
 
 
 class MotionTracker:
+    HISTORY_LIMIT = 30
+
     def __init__(self, config: MotionConfig):
         self.config = config.normalized()
         self.tracks: dict[int, MotionTrack] = {}
@@ -973,6 +1227,9 @@ class MotionTracker:
             self.config.temporal_filter
             or self.config.track_confirmation
             or self.config.direction_consistency
+            or self.config.drone_track_filter
+            or self.config.screen_decoy_rejection
+            or self.config.occlusion_recovery
         )
 
     def reset(self) -> None:
@@ -983,26 +1240,40 @@ class MotionTracker:
         self,
         candidates: list[tuple[MotionDetection, np.ndarray]],
         frame_index: int,
+        image_width: int = 0,
+        image_height: int = 0,
     ) -> MotionTrackFilterResult:
         if not self.active:
             return MotionTrackFilterResult(candidates)
 
-        assignments: list[tuple[MotionDetection, np.ndarray, MotionTrack]] = []
+        assignments: list[tuple[MotionDetection, np.ndarray, MotionTrack, bool]] = []
         matched_track_ids: set[int] = set()
+        max_missed = self._max_missed_frames()
         active_tracks = [
             track
             for track in self.tracks.values()
-            if frame_index - track.last_frame_index <= self.config.track_max_missed + 1
+            if frame_index - track.last_frame_index <= max_missed + 1
         ]
+        occlusion_recovered = 0
 
         for detection, contour in sorted(candidates, key=lambda item: item[0].area, reverse=True):
-            track = self._best_track_for_detection(detection, active_tracks, matched_track_ids)
+            track = self._best_track_for_detection(
+                detection,
+                active_tracks,
+                matched_track_ids,
+                frame_index,
+            )
+            recovered_from_occlusion = (
+                track is not None and self.config.occlusion_recovery and track.missed > 0
+            )
             if track is None:
                 track = self._create_track(detection, frame_index)
             else:
                 self._update_track(track, detection, frame_index)
+            if recovered_from_occlusion:
+                occlusion_recovered += 1
             matched_track_ids.add(track.track_id)
-            assignments.append((detection, contour, track))
+            assignments.append((detection, contour, track, recovered_from_occlusion))
 
         self._age_unmatched_tracks(matched_track_ids)
 
@@ -1010,11 +1281,14 @@ class MotionTracker:
         temporal_rejected = 0
         unconfirmed_rejected = 0
         direction_rejected = 0
+        drone_track_rejected = 0
+        screen_decoy_rejected = 0
 
-        for detection, contour, track in assignments:
+        for detection, contour, track, recovered_from_occlusion in assignments:
             recent_hits = track.recent_hits(frame_index, self.config.temporal_window_frames)
             track_confirmed = track.hits >= self.config.track_confirm_hits
             direction_consistent = self._direction_consistent(track)
+            stats = self._track_stats(track, image_width, image_height)
             annotated = replace(
                 detection,
                 track_id=track.track_id,
@@ -1024,6 +1298,14 @@ class MotionTracker:
                 motion_dx=track.last_dx,
                 motion_dy=track.last_dy,
                 direction_consistent=direction_consistent,
+                normalized_speed=stats.normalized_speed,
+                track_area_cv=stats.area_cv,
+                track_aspect_cv=stats.aspect_cv,
+                track_path_smoothness=stats.path_smoothness,
+                track_perimeter_fraction=stats.perimeter_fraction,
+                drone_score=stats.drone_score,
+                screen_decoy_score=stats.screen_decoy_score,
+                occlusion_recovered=recovered_from_occlusion,
             )
 
             if self.config.temporal_filter and recent_hits < self.config.temporal_min_hits:
@@ -1035,13 +1317,23 @@ class MotionTracker:
             if self.config.direction_consistency and not direction_consistent:
                 direction_rejected += 1
                 continue
+            track_rejection_reason = self._track_rejection_reason(track, stats)
+            if track_rejection_reason == "drone_track":
+                drone_track_rejected += 1
+                continue
+            if track_rejection_reason == "screen_decoy":
+                screen_decoy_rejected += 1
+                continue
             kept.append((annotated, contour))
 
         return MotionTrackFilterResult(
-            kept,
-            temporal_rejected,
-            unconfirmed_rejected,
-            direction_rejected,
+            candidates=kept,
+            temporal_rejected_count=temporal_rejected,
+            unconfirmed_rejected_count=unconfirmed_rejected,
+            direction_rejected_count=direction_rejected,
+            drone_track_rejected_count=drone_track_rejected,
+            screen_decoy_rejected_count=screen_decoy_rejected,
+            occlusion_recovered_count=occlusion_recovered,
         )
 
     def _best_track_for_detection(
@@ -1049,17 +1341,23 @@ class MotionTracker:
         detection: MotionDetection,
         active_tracks: list[MotionTrack],
         matched_track_ids: set[int],
+        frame_index: int,
     ) -> MotionTrack | None:
         best_track: MotionTrack | None = None
         best_distance = float("inf")
         for track in active_tracks:
             if track.track_id in matched_track_ids:
                 continue
+            track_x, track_y = track.center_x, track.center_y
+            if self.config.occlusion_recovery and track.missed > 0:
+                track_x, track_y = track.predicted_center(frame_index)
             distance = float(
-                np.hypot(detection.center_x - track.center_x, detection.center_y - track.center_y)
+                np.hypot(detection.center_x - track_x, detection.center_y - track_y)
             )
             area_scale = max(np.sqrt(max(detection.area, track.area, 1.0)) * 1.5, 1.0)
             distance_limit = max(self.config.track_match_distance, area_scale)
+            if self.config.occlusion_recovery and track.missed > 0:
+                distance_limit = max(distance_limit, self.config.occlusion_gate_distance)
             if distance <= distance_limit and distance < best_distance:
                 best_track = track
                 best_distance = distance
@@ -1074,6 +1372,11 @@ class MotionTracker:
             center_y=detection.center_y,
             area=detection.area,
             seen_frames=[frame_index],
+            centers=[(detection.center_x, detection.center_y)],
+            areas=[float(detection.area)],
+            aspects=[self._detection_aspect(detection)],
+            last_width=max(0.0, detection.x2 - detection.x1),
+            last_height=max(0.0, detection.y2 - detection.y1),
         )
         self.tracks[track.track_id] = track
         self.next_track_id += 1
@@ -1085,28 +1388,38 @@ class MotionTracker:
         detection: MotionDetection,
         frame_index: int,
     ) -> None:
-        dx = detection.center_x - track.center_x
-        dy = detection.center_y - track.center_y
+        elapsed_frames = max(1, frame_index - track.last_frame_index)
+        dx = (detection.center_x - track.center_x) / elapsed_frames
+        dy = (detection.center_y - track.center_y) / elapsed_frames
         if frame_index != track.last_frame_index:
             track.displacements.append((float(dx), float(dy)))
-            track.displacements = track.displacements[-5:]
+            track.displacements = track.displacements[-self.HISTORY_LIMIT:]
         track.center_x = detection.center_x
         track.center_y = detection.center_y
         track.area = detection.area
+        track.last_width = max(0.0, detection.x2 - detection.x1)
+        track.last_height = max(0.0, detection.y2 - detection.y1)
         track.last_frame_index = frame_index
         track.hits += 1
         track.missed = 0
         track.seen_frames.append(frame_index)
         track.seen_frames = track.seen_frames[-max(10, self.config.temporal_window_frames):]
+        track.centers.append((detection.center_x, detection.center_y))
+        track.centers = track.centers[-self.HISTORY_LIMIT:]
+        track.areas.append(float(detection.area))
+        track.areas = track.areas[-self.HISTORY_LIMIT:]
+        track.aspects.append(self._detection_aspect(detection))
+        track.aspects = track.aspects[-self.HISTORY_LIMIT:]
         track.last_dx = float(dx)
         track.last_dy = float(dy)
 
     def _age_unmatched_tracks(self, matched_track_ids: set[int]) -> None:
         expired_track_ids: list[int] = []
+        max_missed = self._max_missed_frames()
         for track_id, track in self.tracks.items():
             if track_id not in matched_track_ids:
                 track.missed += 1
-            if track.missed > self.config.track_max_missed:
+            if track.missed > max_missed:
                 expired_track_ids.append(track_id)
         for track_id in expired_track_ids:
             del self.tracks[track_id]
@@ -1128,6 +1441,138 @@ class MotionTracker:
             return True
         cosine = float(np.dot(current, previous_mean) / max(current_norm * previous_norm, 1e-9))
         return cosine >= self.config.direction_cosine
+
+    def _max_missed_frames(self) -> int:
+        if self.config.occlusion_recovery:
+            return max(self.config.track_max_missed, self.config.occlusion_max_frames)
+        return self.config.track_max_missed
+
+    def _track_rejection_reason(
+        self,
+        track: MotionTrack,
+        stats: MotionTrackStats,
+    ) -> str | None:
+        if self.config.drone_track_filter:
+            speed_max = max(
+                self.config.drone_min_normalized_speed,
+                self.config.drone_max_normalized_speed,
+            )
+            if track.hits < self.config.drone_min_track_hits:
+                return "drone_track"
+            if stats.normalized_speed < self.config.drone_min_normalized_speed:
+                return "drone_track"
+            if stats.normalized_speed > speed_max:
+                return "drone_track"
+
+        if self.config.screen_decoy_rejection and track.hits >= self.config.screen_min_track_hits:
+            perimeter_ok = stats.perimeter_fraction >= self.config.screen_min_perimeter_fraction
+            stable_area = stats.area_cv <= self.config.screen_max_area_cv
+            stable_aspect = stats.aspect_cv <= self.config.screen_max_aspect_cv
+            smooth_path = stats.path_smoothness >= self.config.screen_min_path_smoothness
+            if perimeter_ok and stable_area and stable_aspect and smooth_path:
+                return "screen_decoy"
+        return None
+
+    def _track_stats(
+        self,
+        track: MotionTrack,
+        image_width: int,
+        image_height: int,
+    ) -> MotionTrackStats:
+        normalized_speed = self._normalized_speed(track)
+        area_cv = coefficient_of_variation(track.areas)
+        aspect_cv = coefficient_of_variation(track.aspects)
+        path_smoothness = track_path_smoothness(track.centers)
+        perimeter_fraction = track_perimeter_fraction(
+            track.centers,
+            image_width,
+            image_height,
+            self.config.screen_perimeter_margin,
+        )
+        screen_decoy_score = self._screen_decoy_score(
+            area_cv,
+            aspect_cv,
+            path_smoothness,
+            perimeter_fraction,
+        )
+        drone_score = self._drone_score(track, normalized_speed, screen_decoy_score)
+        return MotionTrackStats(
+            normalized_speed=normalized_speed,
+            area_cv=area_cv,
+            aspect_cv=aspect_cv,
+            path_smoothness=path_smoothness,
+            perimeter_fraction=perimeter_fraction,
+            drone_score=drone_score,
+            screen_decoy_score=screen_decoy_score,
+        )
+
+    def _normalized_speed(self, track: MotionTrack) -> float:
+        if not track.displacements:
+            return 0.0
+        speed_px = float(np.hypot(track.displacements[-1][0], track.displacements[-1][1]))
+        object_scale = max(1.0, float(np.sqrt(max(track.area, 1.0))))
+        return speed_px / object_scale
+
+    def _screen_decoy_score(
+        self,
+        area_cv: float,
+        aspect_cv: float,
+        path_smoothness: float,
+        perimeter_fraction: float,
+    ) -> float:
+        area_component = 1.0 - float(
+            np.clip(area_cv / max(self.config.screen_max_area_cv, 1e-9), 0.0, 1.0)
+        )
+        aspect_component = 1.0 - float(
+            np.clip(aspect_cv / max(self.config.screen_max_aspect_cv, 1e-9), 0.0, 1.0)
+        )
+        smooth_component = float(np.clip(path_smoothness, 0.0, 1.0))
+        if self.config.screen_min_perimeter_fraction > 0.0:
+            perimeter_component = float(
+                np.clip(
+                    perimeter_fraction / self.config.screen_min_perimeter_fraction,
+                    0.0,
+                    1.0,
+                )
+            )
+        else:
+            perimeter_component = float(np.clip(perimeter_fraction, 0.0, 1.0))
+        score = (
+            0.30 * area_component
+            + 0.25 * aspect_component
+            + 0.30 * smooth_component
+            + 0.15 * perimeter_component
+        )
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _drone_score(
+        self,
+        track: MotionTrack,
+        normalized_speed: float,
+        screen_decoy_score: float,
+    ) -> float:
+        min_hits = max(1, self.config.drone_min_track_hits)
+        hit_component = float(np.clip(track.hits / float(min_hits), 0.0, 1.0))
+        speed_max = max(
+            self.config.drone_min_normalized_speed,
+            self.config.drone_max_normalized_speed,
+        )
+        speed_component = (
+            1.0
+            if self.config.drone_min_normalized_speed
+            <= normalized_speed
+            <= speed_max
+            else 0.0
+        )
+        anti_screen_component = 1.0 - float(np.clip(screen_decoy_score, 0.0, 1.0))
+        score = 0.35 * hit_component + 0.40 * speed_component + 0.25 * anti_screen_component
+        return float(np.clip(score, 0.0, 1.0))
+
+    @staticmethod
+    def _detection_aspect(detection: MotionDetection) -> float:
+        width = max(1e-9, detection.x2 - detection.x1)
+        height = max(1e-9, detection.y2 - detection.y1)
+        return float(width / height)
 
 
 def prepare_gray(
@@ -1464,12 +1909,23 @@ def analyze_gray_pair(
     temporal_rejected_count = 0
     unconfirmed_rejected_count = 0
     direction_rejected_count = 0
+    drone_track_rejected_count = 0
+    screen_decoy_rejected_count = 0
+    occlusion_recovered_count = 0
     if motion_tracker is not None:
-        track_filter_result = motion_tracker.filter_candidates(kept_candidates, frame_index)
+        track_filter_result = motion_tracker.filter_candidates(
+            kept_candidates,
+            frame_index,
+            image_width=image_width,
+            image_height=image_height,
+        )
         kept_candidates = track_filter_result.candidates
         temporal_rejected_count = track_filter_result.temporal_rejected_count
         unconfirmed_rejected_count = track_filter_result.unconfirmed_rejected_count
         direction_rejected_count = track_filter_result.direction_rejected_count
+        drone_track_rejected_count = track_filter_result.drone_track_rejected_count
+        screen_decoy_rejected_count = track_filter_result.screen_decoy_rejected_count
+        occlusion_recovered_count = track_filter_result.occlusion_recovered_count
 
     if build_mask:
         for _detection, contour in kept_candidates:
@@ -1499,6 +1955,9 @@ def analyze_gray_pair(
         temporal_rejected_count,
         unconfirmed_rejected_count,
         direction_rejected_count,
+        drone_track_rejected_count,
+        screen_decoy_rejected_count,
+        occlusion_recovered_count,
     )
 
 
@@ -1539,6 +1998,9 @@ def render_overlay(
     temporal_rejected_count: int = 0,
     unconfirmed_rejected_count: int = 0,
     direction_rejected_count: int = 0,
+    drone_track_rejected_count: int = 0,
+    screen_decoy_rejected_count: int = 0,
+    occlusion_recovered_count: int = 0,
     semantic_active: bool = False,
     semantic_rejected_count: int = 0,
     semantic_penalized_count: int = 0,
@@ -1584,6 +2046,13 @@ def render_overlay(
             label = f"{detection.semantic_label} penalty {detection.semantic_overlap:.2f}"
         if detection.track_id is not None:
             label = f"{label} t{detection.track_id} h{detection.track_hits}"
+            if detection.drone_score > 0.0 or detection.screen_decoy_score > 0.0:
+                label = (
+                    f"{label} d={detection.drone_score:.2f} "
+                    f"s={detection.screen_decoy_score:.2f}"
+                )
+            if detection.occlusion_recovered:
+                label = f"{label} recovered"
         label_y = max(18, y1 - 6)
         cv2.putText(
             output,
@@ -1633,7 +2102,9 @@ def render_overlay(
             output,
             (
                 f"Filter rejected temporal={temporal_rejected_count} "
-                f"unconfirmed={unconfirmed_rejected_count} direction={direction_rejected_count}"
+                f"unconfirmed={unconfirmed_rejected_count} direction={direction_rejected_count} "
+                f"drone={drone_track_rejected_count} screen={screen_decoy_rejected_count} "
+                f"recovered={occlusion_recovered_count}"
             ),
             (12, 84),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1688,6 +2159,20 @@ def serialize_config(config: MotionConfig) -> dict[str, Any]:
         "direction_min_hits": config.direction_min_hits,
         "direction_min_displacement": config.direction_min_displacement,
         "direction_cosine": config.direction_cosine,
+        "drone_track_filter": config.drone_track_filter,
+        "drone_min_track_hits": config.drone_min_track_hits,
+        "drone_min_normalized_speed": config.drone_min_normalized_speed,
+        "drone_max_normalized_speed": config.drone_max_normalized_speed,
+        "screen_decoy_rejection": config.screen_decoy_rejection,
+        "screen_min_track_hits": config.screen_min_track_hits,
+        "screen_max_area_cv": config.screen_max_area_cv,
+        "screen_max_aspect_cv": config.screen_max_aspect_cv,
+        "screen_min_path_smoothness": config.screen_min_path_smoothness,
+        "screen_min_perimeter_fraction": config.screen_min_perimeter_fraction,
+        "screen_perimeter_margin": config.screen_perimeter_margin,
+        "occlusion_recovery": config.occlusion_recovery,
+        "occlusion_max_frames": config.occlusion_max_frames,
+        "occlusion_gate_distance": config.occlusion_gate_distance,
     }
 
 
@@ -1852,18 +2337,37 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         direction_min_hits=args.direction_min_hits,
         direction_min_displacement=args.direction_min_displacement,
         direction_cosine=args.direction_cosine,
+        drone_track_filter=args.enable_drone_track_filter,
+        drone_min_track_hits=args.drone_min_track_hits,
+        drone_min_normalized_speed=args.drone_min_normalized_speed,
+        drone_max_normalized_speed=args.drone_max_normalized_speed,
+        screen_decoy_rejection=args.enable_screen_decoy_rejection,
+        screen_min_track_hits=args.screen_min_track_hits,
+        screen_max_area_cv=args.screen_max_area_cv,
+        screen_max_aspect_cv=args.screen_max_aspect_cv,
+        screen_min_path_smoothness=args.screen_min_path_smoothness,
+        screen_min_perimeter_fraction=args.screen_min_perimeter_fraction,
+        screen_perimeter_margin=args.screen_perimeter_margin,
+        occlusion_recovery=args.enable_occlusion_recovery,
+        occlusion_max_frames=args.occlusion_max_frames,
+        occlusion_gate_distance=args.occlusion_gate_distance,
     ).normalized()
     backend_info = resolve_backend(args.backend, int(args.cuda_device))
     cuda_processor = create_cuda_processor(backend_info)
     if backend_info.used == "cuda" and cuda_processor is None:
-        backend_info = BackendInfo(
-            requested=backend_info.requested,
+        backend_info = replace(
+            backend_info,
             used="cpu",
-            cuda_available=backend_info.cuda_available,
-            cuda_device_count=backend_info.cuda_device_count,
-            cuda_device=backend_info.cuda_device,
-            message="CUDA initialization failed; auto backend fell back to CPU.",
+            cuda_device=None,
+            message=(
+                f"{backend_info.message} CUDA initialization failed; "
+                "motion backend fell back to CPU."
+            ),
         )
+    backend_info = apply_semantic_device_override(
+        backend_info,
+        getattr(args, "semantic_device", None),
+    )
     roi_mask = load_roi_mask(args.roi_mask)
     motion_tracker = MotionTracker(config)
     semantic_config = SemanticConfig(
@@ -1876,7 +2380,7 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         confidence=args.semantic_conf,
         iou=args.semantic_iou,
         image_size=args.semantic_imgsz,
-        device=args.semantic_device,
+        device=backend_info.semantic_device,
         frame_stride=args.semantic_frame_stride,
         overlap_threshold=args.semantic_overlap_threshold,
         warmup=args.semantic_warmup,
@@ -2002,6 +2506,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
     total_temporal_rejected = 0
     total_unconfirmed_rejected = 0
     total_direction_rejected = 0
+    total_drone_track_rejected = 0
+    total_screen_decoy_rejected = 0
+    total_occlusion_recovered = 0
     rejected_frame_count = 0
     global_motion_detected_count = 0
     shake_estimated_count = 0
@@ -2036,6 +2543,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
             roi_rejected_count=total_roi_rejected,
             semantic_rejected_count=total_semantic_rejected,
             temporal_rejected_count=total_temporal_rejected,
+            drone_track_rejected_count=total_drone_track_rejected,
+            screen_decoy_rejected_count=total_screen_decoy_rejected,
+            occlusion_recovered_count=total_occlusion_recovered,
             shake_estimated_count=shake_estimated_count,
             shake_reused_count=shake_reused_count,
             semantic_inference_count=semantic_inference_count,
@@ -2101,6 +2611,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 temporal_rejected_count = 0
                 unconfirmed_rejected_count = 0
                 direction_rejected_count = 0
+                drone_track_rejected_count = 0
+                screen_decoy_rejected_count = 0
+                occlusion_recovered_count = 0
             else:
                 analysis = analyze_gray_pair(
                     previous_gray,
@@ -2139,6 +2652,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                 temporal_rejected_count = analysis.temporal_rejected_count
                 unconfirmed_rejected_count = analysis.unconfirmed_rejected_count
                 direction_rejected_count = analysis.direction_rejected_count
+                drone_track_rejected_count = analysis.drone_track_rejected_count
+                screen_decoy_rejected_count = analysis.screen_decoy_rejected_count
+                occlusion_recovered_count = analysis.occlusion_recovered_count
 
             if global_motion_rejected:
                 rejected_frame_count += 1
@@ -2171,6 +2687,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                         temporal_rejected_count=temporal_rejected_count,
                         unconfirmed_rejected_count=unconfirmed_rejected_count,
                         direction_rejected_count=direction_rejected_count,
+                        drone_track_rejected_count=drone_track_rejected_count,
+                        screen_decoy_rejected_count=screen_decoy_rejected_count,
+                        occlusion_recovered_count=occlusion_recovered_count,
                         semantic_active=semantic_detector is not None,
                         semantic_rejected_count=semantic_rejected_count,
                         semantic_penalized_count=semantic_penalized_count,
@@ -2186,6 +2705,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
             total_temporal_rejected += temporal_rejected_count
             total_unconfirmed_rejected += unconfirmed_rejected_count
             total_direction_rejected += direction_rejected_count
+            total_drone_track_rejected += drone_track_rejected_count
+            total_screen_decoy_rejected += screen_decoy_rejected_count
+            total_occlusion_recovered += occlusion_recovered_count
             if shake_estimated:
                 shake_estimated_count += 1
             if shake_reused:
@@ -2219,6 +2741,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
                     temporal_rejected_count=temporal_rejected_count,
                     unconfirmed_rejected_count=unconfirmed_rejected_count,
                     direction_rejected_count=direction_rejected_count,
+                    drone_track_rejected_count=drone_track_rejected_count,
+                    screen_decoy_rejected_count=screen_decoy_rejected_count,
+                    occlusion_recovered_count=occlusion_recovered_count,
                     semantic_detections=semantic_detections,
                     detections=detections,
                 )
@@ -2303,6 +2828,9 @@ def process_video(args: argparse.Namespace) -> dict[str, Any]:
         "temporal_rejected_count": total_temporal_rejected,
         "unconfirmed_rejected_count": total_unconfirmed_rejected,
         "direction_rejected_count": total_direction_rejected,
+        "drone_track_rejected_count": total_drone_track_rejected,
+        "screen_decoy_rejected_count": total_screen_decoy_rejected,
+        "occlusion_recovered_count": total_occlusion_recovered,
         "kept_detection_count": total_detections,
         "global_motion_rejected_frames": rejected_frame_count,
         "global_motion_detected_frames": global_motion_detected_count,
@@ -2363,7 +2891,10 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         "--backend",
         choices=sorted(PROCESSING_BACKENDS),
         default="auto" if not duplicate else default,
-        help="Processing backend for frame differencing. auto uses CUDA when available.",
+        help=(
+            "Unified processing backend. auto selects CUDA for OpenCV motion when available, "
+            "CUDA/MPS for semantic AI when available, and CPU fallbacks otherwise."
+        ),
     )
     parser.add_argument("--cuda-device", type=int, default=0 if not duplicate else default)
     parser.add_argument(
@@ -2418,6 +2949,54 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
         default=2.0 if not duplicate else default,
     )
     parser.add_argument("--direction-cosine", type=float, default=0.20 if not duplicate else default)
+    parser.add_argument(
+        "--enable-drone-track-filter",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Reject tracks that are too young or outside normalized drone-speed bounds.",
+    )
+    parser.add_argument("--drone-min-track-hits", type=int, default=3 if not duplicate else default)
+    parser.add_argument(
+        "--drone-min-normalized-speed",
+        type=float,
+        default=0.10 if not duplicate else default,
+        help="Minimum center speed divided by sqrt(box area) for drone-like motion.",
+    )
+    parser.add_argument(
+        "--drone-max-normalized-speed",
+        type=float,
+        default=30.0 if not duplicate else default,
+        help="Maximum center speed divided by sqrt(box area) for drone-like motion.",
+    )
+    parser.add_argument(
+        "--enable-screen-decoy-rejection",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Reject long-lived tracks with stable size/aspect and overly smooth paths.",
+    )
+    parser.add_argument("--screen-min-track-hits", type=int, default=8 if not duplicate else default)
+    parser.add_argument("--screen-max-area-cv", type=float, default=0.08 if not duplicate else default)
+    parser.add_argument("--screen-max-aspect-cv", type=float, default=0.10 if not duplicate else default)
+    parser.add_argument(
+        "--screen-min-path-smoothness",
+        type=float,
+        default=0.90 if not duplicate else default,
+    )
+    parser.add_argument(
+        "--screen-min-perimeter-fraction",
+        type=float,
+        default=0.0 if not duplicate else default,
+        help="Optional fraction of recent centers that must be near the frame perimeter.",
+    )
+    parser.add_argument("--screen-perimeter-margin", type=float, default=0.10 if not duplicate else default)
+    parser.add_argument(
+        "--enable-occlusion-recovery",
+        action="store_true",
+        default=False if not duplicate else default,
+        help="Keep tracks alive longer and match reappearing detections near predicted centers.",
+    )
+    parser.add_argument("--occlusion-max-frames", type=int, default=8 if not duplicate else default)
+    parser.add_argument("--occlusion-gate-distance", type=float, default=140.0 if not duplicate else default)
     parser.add_argument("--roi-mask", default=default, help="Path to normalized ROI mask JSON.")
     parser.add_argument(
         "--enable-semantic-filter",
@@ -2448,7 +3027,11 @@ def add_common_options(parser: argparse.ArgumentParser, duplicate: bool = False)
     parser.add_argument("--semantic-conf", type=float, default=0.05 if not duplicate else default)
     parser.add_argument("--semantic-iou", type=float, default=0.50 if not duplicate else default)
     parser.add_argument("--semantic-imgsz", type=int, default=960 if not duplicate else default)
-    parser.add_argument("--semantic-device", default=default, help="Ultralytics device, e.g. mps or cpu.")
+    parser.add_argument(
+        "--semantic-device",
+        default=default,
+        help="Advanced semantic-device override. Usually inherit from --backend. Examples: cuda, mps, cpu.",
+    )
     parser.add_argument("--semantic-frame-stride", type=int, default=2 if not duplicate else default)
     parser.add_argument(
         "--semantic-warmup",

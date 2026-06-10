@@ -80,6 +80,20 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "direction_min_hits": 3,
     "direction_min_displacement": 2.0,
     "direction_cosine": 0.20,
+    "drone_track_filter": False,
+    "drone_min_track_hits": 3,
+    "drone_min_normalized_speed": 0.10,
+    "drone_max_normalized_speed": 30.0,
+    "screen_decoy_rejection": False,
+    "screen_min_track_hits": 8,
+    "screen_max_area_cv": 0.08,
+    "screen_max_aspect_cv": 0.10,
+    "screen_min_path_smoothness": 0.90,
+    "screen_min_perimeter_fraction": 0.0,
+    "screen_perimeter_margin": 0.10,
+    "occlusion_recovery": False,
+    "occlusion_max_frames": 8,
+    "occlusion_gate_distance": 140.0,
     "roi_mask_enabled": False,
     "semantic_filter": False,
     "semantic_action": "reject",
@@ -89,7 +103,6 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "semantic_warmup": True,
     "semantic_motion_gate": False,
     "semantic_imgsz": 960,
-    "semantic_device": "mps",
     "semantic_model_repo": "devanshty/WingID",
     "semantic_model_file": "yolo11l.pt",
     "semantic_weights": "",
@@ -97,10 +110,9 @@ SETTING_DEFAULTS: dict[str, Any] = {
 SETTING_OPTIONS: dict[str, list[Any]] = {
     "blur_kernel": [1, 3, 5, 7, 9, 11],
     "morph_kernel": [1, 3, 5, 7, 9],
-    "processing_backend": ["auto", "cpu", "cuda"],
+    "processing_backend": ["auto", "cpu", "cuda", "mps"],
     "semantic_action": ["reject", "penalize"],
     "semantic_imgsz": [640, 960, 1280],
-    "semantic_device": ["mps", "cpu", ""],
 }
 SETTING_RANGES: dict[str, tuple[float, float]] = {
     "diff_threshold": (1, 100),
@@ -126,6 +138,17 @@ SETTING_RANGES: dict[str, tuple[float, float]] = {
     "direction_min_hits": (2, 10),
     "direction_min_displacement": (0.0, 30.0),
     "direction_cosine": (-1.0, 1.0),
+    "drone_min_track_hits": (1, 20),
+    "drone_min_normalized_speed": (0.0, 5.0),
+    "drone_max_normalized_speed": (0.1, 60.0),
+    "screen_min_track_hits": (2, 60),
+    "screen_max_area_cv": (0.0, 0.50),
+    "screen_max_aspect_cv": (0.0, 0.50),
+    "screen_min_path_smoothness": (0.0, 1.0),
+    "screen_min_perimeter_fraction": (0.0, 1.0),
+    "screen_perimeter_margin": (0.0, 0.50),
+    "occlusion_max_frames": (0, 60),
+    "occlusion_gate_distance": (5.0, 500.0),
     "semantic_conf": (0.01, 0.90),
     "semantic_overlap_threshold": (0.01, 1.0),
     "semantic_frame_stride": (1, 20),
@@ -280,11 +303,24 @@ if "last_summary_path" not in st.session_state:
     st.session_state["last_summary_path"] = ""
 if "last_run_root" not in st.session_state:
     st.session_state["last_run_root"] = ""
+if "profile_panel_open" not in st.session_state:
+    st.session_state["profile_panel_open"] = False
 initialize_settings_profile()
 
 with st.sidebar:
-    profile_box = st.expander("Parameter profile", expanded=False)
-    with profile_box:
+    profile_panel_open = bool(st.session_state.get("profile_panel_open", False))
+    profile_button_label = f"{'v' if profile_panel_open else '>'} Parameter profile"
+    if st.button(
+        profile_button_label,
+        key="profile_panel_toggle",
+        use_container_width=True,
+        help="Show or hide import/export controls for saved detector parameters.",
+    ):
+        st.session_state["profile_panel_open"] = not profile_panel_open
+        st.rerun()
+
+    profile_download_slot = None
+    if st.session_state.get("profile_panel_open", False):
         profile_message = st.session_state.pop("settings_profile_message", "")
         if profile_message:
             st.success(profile_message)
@@ -373,12 +409,13 @@ with st.sidebar:
     st.divider()
     st.caption("Performance / outputs")
     cuda_devices = cuda_device_count()
+    backend_options = ["auto", "cpu", "cuda", "mps"]
     processing_backend = st.selectbox(
         "Processing backend",
-        ["auto", "cpu", "cuda"],
-        index=select_index("processing_backend", ["auto", "cpu", "cuda"]),
+        backend_options,
+        index=select_index("processing_backend", backend_options),
         key=setting_key("processing_backend"),
-        help="auto uses CUDA for frame differencing when OpenCV reports a CUDA device, otherwise CPU.",
+        help="Unified backend for motion and AI. auto chooses CUDA for motion when OpenCV supports it, CUDA/MPS for AI when PyTorch supports it, and CPU otherwise.",
     )
     cuda_device_default = int(min(setting_value("cuda_device"), max(0, cuda_devices - 1)))
     cuda_device = st.number_input(
@@ -388,8 +425,8 @@ with st.sidebar:
         value=cuda_device_default,
         step=1,
         key=setting_key("cuda_device"),
-        disabled=processing_backend == "cpu" or cuda_devices == 0,
-        help=f"Detected CUDA devices: {cuda_devices}.",
+        disabled=processing_backend not in {"auto", "cuda"} or cuda_devices == 0,
+        help=f"OpenCV CUDA device index for motion processing. Detected OpenCV CUDA devices: {cuda_devices}.",
     )
     write_overlay_video = st.checkbox(
         "Write overlay video",
@@ -535,7 +572,32 @@ with st.sidebar:
         key=setting_key("direction_consistency"),
         help="Rejects tracks that jitter back and forth instead of moving consistently.",
     )
-    track_tuning_enabled = temporal_filter or track_confirmation or direction_consistency
+    drone_track_filter = st.checkbox(
+        "Track-level drone gate",
+        value=setting_value("drone_track_filter"),
+        key=setting_key("drone_track_filter"),
+        help="Rejects tracks until they are old enough and moving in a configured drone-like speed range.",
+    )
+    screen_decoy_rejection = st.checkbox(
+        "Screen overlay rejection",
+        value=setting_value("screen_decoy_rejection"),
+        key=setting_key("screen_decoy_rejection"),
+        help="Rejects long-lived tracks with nearly constant size/aspect and very smooth paths, which is typical for PNG/video overlays.",
+    )
+    occlusion_recovery = st.checkbox(
+        "Occlusion recovery",
+        value=setting_value("occlusion_recovery"),
+        key=setting_key("occlusion_recovery"),
+        help="Keeps a track alive through short disappearances and rematches near the predicted center.",
+    )
+    track_tuning_enabled = (
+        temporal_filter
+        or track_confirmation
+        or direction_consistency
+        or drone_track_filter
+        or screen_decoy_rejection
+        or occlusion_recovery
+    )
     temporal_window_frames = st.slider(
         "Persistence window",
         1,
@@ -616,6 +678,116 @@ with st.sidebar:
         disabled=not direction_consistency,
         help="Allowed direction similarity. Lower is more tolerant; higher rejects more jitter.",
     )
+    drone_min_track_hits = st.slider(
+        "Drone gate min hits",
+        1,
+        20,
+        setting_value("drone_min_track_hits"),
+        1,
+        key=setting_key("drone_min_track_hits"),
+        disabled=not drone_track_filter,
+        help="Minimum matched detections before a track can be considered a drone candidate.",
+    )
+    drone_min_normalized_speed = st.slider(
+        "Drone min normalized speed",
+        0.0,
+        5.0,
+        setting_value("drone_min_normalized_speed"),
+        0.05,
+        key=setting_key("drone_min_normalized_speed"),
+        disabled=not drone_track_filter,
+        help="Minimum center speed divided by sqrt(box area). Raises the bar against static or drifting noise.",
+    )
+    drone_max_normalized_speed = st.slider(
+        "Drone max normalized speed",
+        0.1,
+        60.0,
+        setting_value("drone_max_normalized_speed"),
+        0.5,
+        key=setting_key("drone_max_normalized_speed"),
+        disabled=not drone_track_filter,
+        help="Maximum center speed divided by sqrt(box area). Helps reject impossible jumps and bad track matches.",
+    )
+    screen_min_track_hits = st.slider(
+        "Screen min track hits",
+        2,
+        60,
+        setting_value("screen_min_track_hits"),
+        1,
+        key=setting_key("screen_min_track_hits"),
+        disabled=not screen_decoy_rejection,
+        help="Number of observations required before screen-overlay rejection can remove a track.",
+    )
+    screen_max_area_cv = st.slider(
+        "Screen max area CV",
+        0.0,
+        0.50,
+        setting_value("screen_max_area_cv"),
+        0.01,
+        key=setting_key("screen_max_area_cv"),
+        disabled=not screen_decoy_rejection,
+        help="Maximum allowed relative box-area variation for a screen-like constant-size track.",
+    )
+    screen_max_aspect_cv = st.slider(
+        "Screen max aspect CV",
+        0.0,
+        0.50,
+        setting_value("screen_max_aspect_cv"),
+        0.01,
+        key=setting_key("screen_max_aspect_cv"),
+        disabled=not screen_decoy_rejection,
+        help="Maximum allowed relative aspect-ratio variation for a screen-like constant-shape track.",
+    )
+    screen_min_path_smoothness = st.slider(
+        "Screen min smoothness",
+        0.0,
+        1.0,
+        setting_value("screen_min_path_smoothness"),
+        0.01,
+        key=setting_key("screen_min_path_smoothness"),
+        disabled=not screen_decoy_rejection,
+        help="Straight/smooth path score required for screen-overlay rejection. 1.0 is nearly a perfect straight path.",
+    )
+    screen_min_perimeter_fraction = st.slider(
+        "Screen min perimeter fraction",
+        0.0,
+        1.0,
+        setting_value("screen_min_perimeter_fraction"),
+        0.05,
+        key=setting_key("screen_min_perimeter_fraction"),
+        disabled=not screen_decoy_rejection,
+        help="Optional requirement that recent track centers stay near frame edges. Leave at 0 to reject smooth constant-size overlays anywhere.",
+    )
+    screen_perimeter_margin = st.slider(
+        "Screen perimeter margin",
+        0.0,
+        0.50,
+        setting_value("screen_perimeter_margin"),
+        0.01,
+        key=setting_key("screen_perimeter_margin"),
+        disabled=not screen_decoy_rejection,
+        help="Frame-edge band used by perimeter fraction.",
+    )
+    occlusion_max_frames = st.slider(
+        "Occlusion max frames",
+        0,
+        60,
+        setting_value("occlusion_max_frames"),
+        1,
+        key=setting_key("occlusion_max_frames"),
+        disabled=not occlusion_recovery,
+        help="How long a track can disappear before it is deleted.",
+    )
+    occlusion_gate_distance = st.slider(
+        "Occlusion gate distance",
+        5.0,
+        500.0,
+        setting_value("occlusion_gate_distance"),
+        5.0,
+        key=setting_key("occlusion_gate_distance"),
+        disabled=not occlusion_recovery,
+        help="Maximum pixel distance from predicted center when rematching a reappearing object.",
+    )
     st.divider()
     roi_mask_enabled = st.checkbox(
         "Use current ROI mask",
@@ -690,14 +862,6 @@ with st.sidebar:
         disabled=not semantic_filter,
         help="Input size for the person detector. Higher can catch smaller people but is slower.",
     )
-    semantic_device = st.selectbox(
-        "Person AI device",
-        ["mps", "cpu", ""],
-        index=select_index("semantic_device", ["mps", "cpu", ""]),
-        key=setting_key("semantic_device"),
-        disabled=not semantic_filter,
-        help="Inference device. Use mps on Apple Silicon, cpu as fallback.",
-    )
     with st.expander("Human model"):
         semantic_model_repo = st.text_input(
             "Model repo",
@@ -757,6 +921,20 @@ with st.sidebar:
         "direction_min_hits": int(direction_min_hits),
         "direction_min_displacement": float(direction_min_displacement),
         "direction_cosine": float(direction_cosine),
+        "drone_track_filter": bool(drone_track_filter),
+        "drone_min_track_hits": int(drone_min_track_hits),
+        "drone_min_normalized_speed": float(drone_min_normalized_speed),
+        "drone_max_normalized_speed": float(drone_max_normalized_speed),
+        "screen_decoy_rejection": bool(screen_decoy_rejection),
+        "screen_min_track_hits": int(screen_min_track_hits),
+        "screen_max_area_cv": float(screen_max_area_cv),
+        "screen_max_aspect_cv": float(screen_max_aspect_cv),
+        "screen_min_path_smoothness": float(screen_min_path_smoothness),
+        "screen_min_perimeter_fraction": float(screen_min_perimeter_fraction),
+        "screen_perimeter_margin": float(screen_perimeter_margin),
+        "occlusion_recovery": bool(occlusion_recovery),
+        "occlusion_max_frames": int(occlusion_max_frames),
+        "occlusion_gate_distance": float(occlusion_gate_distance),
         "roi_mask_enabled": bool(roi_mask_enabled),
         "semantic_filter": bool(semantic_filter),
         "semantic_action": semantic_action,
@@ -766,13 +944,12 @@ with st.sidebar:
         "semantic_warmup": bool(semantic_warmup),
         "semantic_motion_gate": bool(semantic_motion_gate),
         "semantic_imgsz": int(semantic_imgsz),
-        "semantic_device": semantic_device,
         "semantic_model_repo": semantic_model_repo,
         "semantic_model_file": semantic_model_file,
         "semantic_weights": semantic_weights,
     }
     st.session_state["settings_profile_values"] = dict(current_settings)
-    with profile_download_slot.container():
+    if profile_download_slot is not None:
         profile_payload = settings_profile_payload(current_settings)
         st.download_button(
             "Export current parameters JSON",
@@ -1002,7 +1179,10 @@ def render_progress_event(event: dict, progress_bar, status_placeholder) -> None
         f"raw={event.get('raw_detection_count', 0)} "
         f"kept={event.get('kept_detection_count', 0)} "
         f"semantic rejected={event.get('semantic_rejected_count', 0)} "
-        f"ROI rejected={event.get('roi_rejected_count', 0)}"
+        f"ROI rejected={event.get('roi_rejected_count', 0)} "
+        f"drone gate={event.get('drone_track_rejected_count', 0)} "
+        f"screen={event.get('screen_decoy_rejected_count', 0)} "
+        f"recovered={event.get('occlusion_recovered_count', 0)}"
     )
     engine_counts = (
         f"shake estimated={event.get('shake_estimated_count', 0)} "
@@ -1159,6 +1339,28 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         str(float(direction_min_displacement)),
         "--direction-cosine",
         str(float(direction_cosine)),
+        "--drone-min-track-hits",
+        str(int(drone_min_track_hits)),
+        "--drone-min-normalized-speed",
+        str(float(drone_min_normalized_speed)),
+        "--drone-max-normalized-speed",
+        str(float(drone_max_normalized_speed)),
+        "--screen-min-track-hits",
+        str(int(screen_min_track_hits)),
+        "--screen-max-area-cv",
+        str(float(screen_max_area_cv)),
+        "--screen-max-aspect-cv",
+        str(float(screen_max_aspect_cv)),
+        "--screen-min-path-smoothness",
+        str(float(screen_min_path_smoothness)),
+        "--screen-min-perimeter-fraction",
+        str(float(screen_min_perimeter_fraction)),
+        "--screen-perimeter-margin",
+        str(float(screen_perimeter_margin)),
+        "--occlusion-max-frames",
+        str(int(occlusion_max_frames)),
+        "--occlusion-gate-distance",
+        str(float(occlusion_gate_distance)),
         "--out-dir",
         str(out_dir),
     ]
@@ -1187,6 +1389,12 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
         args.append("--enable-track-confirmation")
     if direction_consistency:
         args.append("--enable-direction-consistency")
+    if drone_track_filter:
+        args.append("--enable-drone-track-filter")
+    if screen_decoy_rejection:
+        args.append("--enable-screen-decoy-rejection")
+    if occlusion_recovery:
+        args.append("--enable-occlusion-recovery")
     if roi_mask_path is not None:
         args.extend(["--roi-mask", str(roi_mask_path)])
     if semantic_filter:
@@ -1211,8 +1419,6 @@ def common_cli_args(out_dir: Path, roi_mask_path: Path | None = None) -> list[st
                 str(float(semantic_overlap_threshold)),
             ]
         )
-        if semantic_device:
-            args.extend(["--semantic-device", semantic_device])
         if semantic_weights.strip():
             args.extend(["--semantic-weights", semantic_weights.strip()])
         if semantic_warmup:
@@ -1283,10 +1489,13 @@ def render_outputs(summary: dict) -> None:
     roi_cols[1].metric("Kept detections", summary.get("kept_detection_count", summary["detection_count"]))
     roi_cols[2].metric("ROI rejected", summary.get("roi_rejected_count", 0))
     roi_cols[3].metric("ROI penalized", summary.get("roi_penalized_count", 0))
-    filter_cols = st.columns(3)
+    filter_cols = st.columns(6)
     filter_cols[0].metric("Temporal rejected", summary.get("temporal_rejected_count", 0))
     filter_cols[1].metric("Unconfirmed rejected", summary.get("unconfirmed_rejected_count", 0))
     filter_cols[2].metric("Direction rejected", summary.get("direction_rejected_count", 0))
+    filter_cols[3].metric("Drone gate rejected", summary.get("drone_track_rejected_count", 0))
+    filter_cols[4].metric("Screen rejected", summary.get("screen_decoy_rejected_count", 0))
+    filter_cols[5].metric("Occlusion recovered", summary.get("occlusion_recovered_count", 0))
     semantic_cols = st.columns(4)
     semantic_cols[0].metric("Semantic objects", summary.get("semantic_detection_count", 0))
     semantic_cols[1].metric("Semantic rejected", summary.get("semantic_rejected_count", 0))
@@ -1301,7 +1510,8 @@ def render_outputs(summary: dict) -> None:
     if backend_summary:
         st.caption(
             f"Backend requested={backend_summary.get('requested')} "
-            f"used={backend_summary.get('used')} "
+            f"motion={backend_summary.get('motion_backend', backend_summary.get('used'))} "
+            f"semantic={backend_summary.get('semantic_device', 'cpu')} "
             f"cuda_devices={backend_summary.get('cuda_device_count')} "
             f"{backend_summary.get('message', '')}"
         )
@@ -1316,7 +1526,8 @@ def render_outputs(summary: dict) -> None:
         st.caption(
             f"Semantic labels={','.join(semantic_summary.get('labels', []))} "
             f"action={semantic_summary.get('action')} conf={semantic_summary.get('confidence')} "
-            f"stride={semantic_summary.get('frame_stride')} model={semantic_summary.get('model_repo')}"
+            f"stride={semantic_summary.get('frame_stride')} device={semantic_summary.get('device')} "
+            f"model={semantic_summary.get('model_repo')}"
         )
     output_summary = summary.get("outputs", {})
     st.caption(
